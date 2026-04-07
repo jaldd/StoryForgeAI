@@ -15,17 +15,7 @@
     <dependencies>
         <dependency>
             <groupId>ai.storyforge</groupId>
-            <artifactId>domain</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>ai.storyforge</groupId>
             <artifactId>application</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>ai.storyforge</groupId>
-            <artifactId>infrastructure</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
@@ -37,14 +27,4 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
     </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <version>${spring-boot.version}</version>
-            </plugin>
-        </plugins>
-    </build>
 </project>
