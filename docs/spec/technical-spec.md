@@ -34,6 +34,11 @@
 
 ## 1.4 核心创新点
 
+> 可行性说明（必须先读）：
+> - 5 个创新点中，只有"隐式故事板"与"元叙事约束求解器"适合在当前版本进入实现排期。
+> - "反事实推理"与"交互式叙事韧性"研发风险高、评测成本高，当前阶段仅保留为研究项，不进入 MVP 与前两迭代。
+> - 任何创新点上线前，必须先通过基线能力（意图识别、三层记忆、工具调用、流式输出）验收。
+
 本项目在传统 AI 写作助手基础上，引入五大创新技术，显著提升叙事质量和用户控制力：
 
 ### 创新点 1：角色驱动的情节生成（Character-Driven Plotting）
@@ -183,6 +188,13 @@ class ConstraintSolver {
 | 关系数据库 | PostgreSQL | 15+ | JSONB 存储工作记忆、摘要 |
 | 通信协议 | REST + SSE | - | 流式输出支持 |
 | 工具协议 | MCP (JSON-RPC over stdio) | - | 外部工具集成 |
+
+### 2.1.1 MVP 技术边界（强约束）
+
+- MVP 只支持 **单模型提供商（智谱 OpenAI 兼容）**，多模型 fallback 推迟到迭代 3。
+- MVP 只实现 **1 个内置工具（CharacterArcPlanner）**，其余工具先定义接口和测试桩。
+- MVP 只开放 **CLI + SSE API 二选一**（建议先 CLI），避免前期 UI 分散精力。
+- 长期记忆在 MVP 可先用 PostgreSQL + pgvector 代替 Milvus（本地开发更轻，后续可平滑迁移）。
 
 ### 2.2 架构原则
 
@@ -557,23 +569,23 @@ public interface ModelGateway {
 ```yaml
 model:
   providers:
-    - name: glm-4.7-flash
+    - name: glm-4-flash-primary
       endpoint: https://open.bigmodel.cn/api/paas/v4
       model: glm-4-flash
       maxTokens: 4096
       temperature: 0.7
       costPer1kTokens: 0.0001  # USD
       
-    - name: glm-4.5-flash
+    - name: glm-4-flash-fallback
       endpoint: https://open.bigmodel.cn/api/paas/v4
       model: glm-4-flash
       maxTokens: 4096
-      temperature: 0.7
+      temperature: 0.5
       costPer1kTokens: 0.00008
       
   routing:
-    default: glm-4.7-flash
-    fallback: [glm-4.5-flash]
+    default: glm-4-flash-primary
+    fallback: [glm-4-flash-fallback]
     
   budget:
     dailyLimitUsd: 1.0
@@ -639,8 +651,12 @@ model:
 
 | 方法 | 说明 |
 |------|------|
+| `initialize` | MCP 会话初始化（能力协商） |
 | `tools/list` | 列出所有可用工具 |
 | `tools/call` | 调用指定工具 |
+| `ping` | 健康检查（可选） |
+
+> 说明：统一使用 `tools/call` 命名，避免与历史草案中的 `tool.call` 混用。
 
 ---
 
@@ -783,13 +799,20 @@ try {
 
 ## 7. 验收标准
 
+### 7.0 分阶段验收口径（防止目标漂移）
+
+- **MVP 验收（迭代 1）**：仅验收单模型 + 无长期记忆 + 1 个工具 + 可流式返回。
+- **阶段 2 验收（迭代 2）**：新增三层记忆与 3 个核心工具的集成验收。
+- **阶段 3 验收（迭代 3）**：新增 MCP 与多模型 fallback 验收。
+- 严禁把阶段 2/3 指标提前作为 MVP 阻塞条件。
+
 ### 7.1 功能验收
 
 - [ ] 用户能通过命令行与 Agent 对话，完成至少 3 轮交互
 - [ ] Agent 能正确识别 5 种意图（准确率 > 80%）
 - [ ] Agent 能调用 CharacterArcPlanner 并输出弧光分析
-- [ ] Agent 能检测到"角色瞬移"类逻辑漏洞
-- [ ] Agent 能根据上次续写内容，自动更新角色位置和伏笔列表
+- [ ] （阶段 2）Agent 能检测到"角色瞬移"类逻辑漏洞
+- [ ] （阶段 2）Agent 能根据上次续写内容，自动更新角色位置和伏笔列表
 - [ ] 流式输出正常，无卡顿
 - [ ] 日志中包含 traceId 和每次模型调用的 token 费用
 
@@ -816,6 +839,7 @@ try {
 - 意图识别（规则匹配）
 - CharacterArcPlanner 工具（进程内调用）
 - CLI 界面 + 流式输出
+- 统一请求/响应协议（含 traceId、projectId、intent、cost）
 
 ### 迭代 2：记忆系统（2-3周）
 
@@ -825,6 +849,7 @@ try {
 - MemoryManager 三层结构
 - PlotGapDetector + StyleTransfer
 - Milvus 集成 + 章节分块索引
+- 一致性回归测试集（角色位置、时间线、伏笔回收）
 
 ### 迭代 3：MCP + 多模型（2周）
 

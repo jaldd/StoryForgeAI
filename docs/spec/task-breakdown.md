@@ -28,11 +28,13 @@
 - 创建 Maven 多模块项目
 - 配置父 POM
 - 创建 5 个子模块：domain, application, infrastructure, api, cli
+- 为各模块创建最小可编译代码（占位类与基础包结构）
 
 **验收标准**:
 - [ ] 项目结构符合 DDD 分层架构
 - [ ] Maven 构建成功
 - [ ] 模块依赖关系正确
+- [ ] `api` 模块可启动（最小 Spring Boot 应用）
 
 ---
 

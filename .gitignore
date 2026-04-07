@@ -27,3 +27,5 @@ replay_pid*
 **/.DS_Store
 */.DS_Store
 /.DS_Store
+/.m2repo
+.vscode/
