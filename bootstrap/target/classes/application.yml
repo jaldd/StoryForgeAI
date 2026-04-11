@@ -1,12 +1,55 @@
 spring:
   application:
     name: storyforge
-  
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+  datasource:
+    url: jdbc:h2:mem:storyforge;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+  h2:
+    console:
+      enabled: true
+
 server:
   port: 8080
+
+model:
+  providers:
+    - name: glm-4.5-flash
+      endpoint: https://open.bigmodel.cn/api/paas/v4
+      model: glm-4.5-flash
+      apikey: ${GLM_API_KEY:demo}
+      maxTokens: 4096
+      temperature: 0.7
+      topP: 0.95
+#    - name: langchain4j-demo
+#      endpoint: http://langchain4j.dev/demo/openai/v1
+#      model: gpt-4o-mini
+#      apikey: demo
+#      maxTokens: 4096
+#      temperature: 0.7
 
 management:
   endpoints:
     web:
       exposure:
         include: health,info
+
+app:
+  redis:
+    enabled: false
+
+storyforge:
+  project:
+    default-project-id: 550e8400-e29b-41d4-a716-446655440000
+    default-title: 默认小说项目
+    default-author: 作者
+    documents-path: ./documents

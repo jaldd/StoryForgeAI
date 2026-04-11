@@ -27,14 +27,16 @@
 **任务描述**:
 - 创建 Maven 多模块项目
 - 配置父 POM
-- 创建 5 个子模块：domain, application, infrastructure, api, cli
+- 创建 6 个子模块：domain, application, infrastructure, api, cli, bootstrap
+- 创建前端项目（frontend/）
 - 为各模块创建最小可编译代码（占位类与基础包结构）
 
 **验收标准**:
 - [ ] 项目结构符合 DDD 分层架构
 - [ ] Maven 构建成功
-- [ ] 模块依赖关系正确
-- [ ] `api` 模块可启动（最小 Spring Boot 应用）
+- [ ] 模块依赖关系正确（api/cli 不依赖 infrastructure，由 bootstrap 装配）
+- [ ] `bootstrap` 模块可启动（最小 Spring Boot 应用）
+- [ ] 前端项目可启动（npm run dev）
 
 ---
 
@@ -45,32 +47,35 @@
 **依赖**: TASK-001
 
 **任务描述**:
-- 配置 Spring Boot 3.2+
-- 配置 LangChain4j 0.35+
-- 配置 Milvus SDK
+- 配置 Spring Boot 3.3.4
+- 配置 LangChain4j BOM 1.0.0-beta3
+- 配置 pgvector
 - 配置 Redis 和 PostgreSQL 驱动
+- 配置各子模块 pom.xml（去掉硬编码版本号，由父 POM 统一管理）
 
 **验收标准**:
 - [ ] 所有依赖版本正确
 - [ ] 无依赖冲突
+- [ ] 子模块 pom 不含硬编码版本号
 
 ---
 
-#### TASK-003: 配置 Docker Compose
+#### TASK-003: 配置内存存储（MVP 简化方案）
 
 **优先级**: P0  
-**预估工作量**: 2小时  
+**预估工作量**: 1小时  
 **依赖**: 无
 
 **任务描述**:
-- 创建 docker-compose.yml
-- 配置 Redis 服务
-- 配置 Milvus 服务
-- 配置 PostgreSQL 服务
+- 配置 H2 内存数据库（替代 PostgreSQL）
+- 使用内存 Map 存储短期记忆（替代 Redis）
+- 使用内存列表存储向量（替代 Milvus）
+- Docker Compose 推迟到迭代 2
 
 **验收标准**:
-- [ ] Docker Compose 启动成功
-- [ ] 所有服务正常运行
+- [ ] H2 数据库正常工作
+- [ ] 内存存储组件正常工作
+- [ ] 无需外部依赖即可启动
 
 ---
 
@@ -323,19 +328,20 @@
 
 ---
 
-#### TASK-017: 实现 CLI 界面
+#### TASK-017: 实现前端调试页面
 
 **优先级**: P1  
 **预估工作量**: 3小时  
 **依赖**: TASK-016
 
 **任务描述**:
-- 实现命令行界面
+- 实现前端聊天界面（React + TypeScript + Vite）
+- 实现 SSE 流式输出显示
+- 配置 Vite 代理到后端 API
 - 实现用户输入处理
-- 实现流式输出显示
 
 **验收标准**:
-- [ ] CLI 界面友好
+- [ ] 前端页面正常显示
 - [ ] 能完成至少 3 轮交互
 - [ ] 流式输出正常
 
@@ -387,7 +393,7 @@
 - 准备迭代 2
 
 **验收标准**:
-- [ ] 用户能通过 CLI 与 Agent 对话
+- [ ] 用户能通过前端页面与 Agent 对话
 - [ ] Agent 能调用 CharacterArcPlanner
 - [ ] 流式输出正常
 
@@ -395,7 +401,27 @@
 
 ## 迭代 2：记忆系统（2-3周）
 
-**目标**: 三层记忆 + 3 个核心工具
+**目标**: 三层记忆 + 3 个核心工具 + 中间件集成
+
+### 2.0 中间件配置
+
+#### TASK-020: 配置 Docker Compose
+
+**优先级**: P0  
+**预估工作量**: 2小时  
+**依赖**: 无
+
+**任务描述**:
+- 创建 docker-compose.yml
+- 配置 Redis 服务
+- 配置 Milvus 服务（或 pgvector）
+- 配置 PostgreSQL 服务
+
+**验收标准**:
+- [ ] Docker Compose 启动成功
+- [ ] 所有服务正常运行
+
+---
 
 ### 2.1 短期记忆实现
 
@@ -403,7 +429,7 @@
 
 **优先级**: P0  
 **预估工作量**: 4小时  
-**依赖**: TASK-007
+**依赖**: TASK-020
 
 **任务描述**:
 - 实现 ShortTermMemoryRepositoryImpl

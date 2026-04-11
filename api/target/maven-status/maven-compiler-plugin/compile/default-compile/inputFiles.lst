@@ -1,1 +1,3 @@
 /usr/local/workspace/github/StoryForgeAI/api/src/main/java/ai/storyforge/api/StoryForgeApiApplication.java
+/usr/local/workspace/github/StoryForgeAI/api/src/main/java/ai/storyforge/api/controller/ChatController.java
+/usr/local/workspace/github/StoryForgeAI/api/src/main/java/ai/storyforge/api/controller/ProjectController.java

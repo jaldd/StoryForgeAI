@@ -1,1 +1,14 @@
 /usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/ApplicationMarker.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/config/ProjectProperties.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/dto/ChatRequest.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/dto/ChatResponse.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/dto/DocumentDto.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/dto/ProjectDto.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/port/inbound/ProjectUseCase.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/port/inbound/WritingAgentUseCase.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/port/outbound/EmbeddingClient.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/port/outbound/ModelGateway.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/port/outbound/VectorStore.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/service/DocumentLoaderService.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/service/ProjectService.java
+/usr/local/workspace/github/StoryForgeAI/application/src/main/java/ai/storyforge/application/service/WritingAgentService.java

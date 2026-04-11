@@ -1,6 +1,14 @@
 spring:
   application:
     name: storyforge-api
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
 
 server:
   port: 8080
+
+app:
+  redis:
+    enabled: false

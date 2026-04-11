@@ -1,1 +1,14 @@
+ai/storyforge/infrastructure/llm/ZhipuModelAdapter.class
+ai/storyforge/infrastructure/persistence/JpaDocumentRepository.class
+ai/storyforge/infrastructure/persistence/NovelProjectRepositoryImpl.class
+ai/storyforge/infrastructure/llm/GlmModelAdapter.class
+ai/storyforge/infrastructure/config/ModelProperties.class
 ai/storyforge/infrastructure/InfrastructureMarker.class
+ai/storyforge/infrastructure/config/ModelProperties$Provider.class
+ai/storyforge/infrastructure/llm/GlmModelAdapter$1.class
+ai/storyforge/infrastructure/config/LlmConfig.class
+ai/storyforge/infrastructure/persistence/InMemoryDocumentRepository.class
+ai/storyforge/infrastructure/config/RepositoryConfig.class
+ai/storyforge/infrastructure/persistence/JpaNovelProjectRepository.class
+ai/storyforge/infrastructure/config/ZhipuConfig.class
+ai/storyforge/infrastructure/config/RedisConfig.class

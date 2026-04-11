@@ -1,0 +1,293 @@
+.app {
+  height: 100vh;
+  display: flex;
+  background: #f5f7fa;
+}
+
+.sidebar {
+  width: 300px;
+  background: #fff;
+  border-right: 1px solid #e0e0e0;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid #e0e0e0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.project-info h2 {
+  font-size: 1.1rem;
+  color: #16213e;
+  margin: 0 0 4px 0;
+}
+
+.project-meta {
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.reload-btn {
+  background: none;
+  border: none;
+  font-size: 1.25rem;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.reload-btn:hover {
+  background: #f0f0f0;
+}
+
+.document-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.document-section {
+  margin-bottom: 20px;
+}
+
+.document-section h3 {
+  font-size: 0.85rem;
+  color: #666;
+  margin: 0 0 8px 0;
+  padding-left: 4px;
+}
+
+.document-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-bottom: 2px;
+}
+
+.document-item:hover {
+  background: #f5f7fa;
+}
+
+.document-item.selected {
+  background: #e8f0fe;
+}
+
+.doc-icon {
+  font-size: 1rem;
+}
+
+.doc-name {
+  font-size: 0.9rem;
+  color: #333;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty-docs {
+  text-align: center;
+  color: #999;
+  padding: 20px 10px;
+}
+
+.empty-docs p {
+  margin: 8px 0;
+}
+
+.empty-docs .hint {
+  font-size: 0.8rem;
+  color: #bbb;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 16px;
+  width: 100%;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0 16px 0;
+  border-bottom: 1px solid #e0e0e0;
+  margin-bottom: 16px;
+}
+
+.toggle-sidebar {
+  background: none;
+  border: none;
+  font-size: 1.25rem;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.toggle-sidebar:hover {
+  background: #e8f0fe;
+}
+
+.header-title {
+  flex: 1;
+}
+
+.header-title h1 {
+  font-size: 1.5rem;
+  color: #16213e;
+  margin: 0 0 4px 0;
+}
+
+.subtitle {
+  font-size: 0.875rem;
+  color: #666;
+}
+
+.document-preview {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+}
+
+.preview-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.preview-header h3 {
+  font-size: 1rem;
+  color: #16213e;
+  margin: 0;
+}
+
+.close-preview {
+  background: none;
+  border: none;
+  font-size: 1.25rem;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.close-preview:hover {
+  background: #f0f0f0;
+}
+
+.preview-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.preview-content pre {
+  margin: 0;
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: #333;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.empty {
+  text-align: center;
+  color: #999;
+  margin-top: 80px;
+}
+
+.empty .hint {
+  font-size: 0.85rem;
+  margin-top: 8px;
+  color: #bbb;
+}
+
+.message {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.message.user {
+  background: #e8f0fe;
+}
+
+.message.assistant {
+  border: 1px solid #e0e0e0;
+}
+
+.avatar {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+}
+
+.content {
+  flex: 1;
+  white-space: pre-wrap;
+  line-height: 1.6;
+}
+
+.input-area {
+  display: flex;
+  gap: 8px;
+  padding: 12px 0 0 0;
+  border-top: 1px solid #e0e0e0;
+}
+
+.input-area textarea {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  resize: none;
+  font-family: inherit;
+  outline: none;
+}
+
+.input-area textarea:focus {
+  border-color: #4a90d9;
+}
+
+.input-area button {
+  padding: 10px 20px;
+  background: #16213e;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  white-space: nowrap;
+}
+
+.input-area button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}

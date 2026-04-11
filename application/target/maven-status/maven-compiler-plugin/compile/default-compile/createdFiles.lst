@@ -1,1 +1,14 @@
+ai/storyforge/application/service/WritingAgentService.class
+ai/storyforge/application/port/inbound/WritingAgentUseCase.class
+ai/storyforge/application/port/outbound/EmbeddingClient.class
+ai/storyforge/application/dto/ChatResponse.class
+ai/storyforge/application/dto/ChatRequest.class
+ai/storyforge/application/dto/DocumentDto.class
+ai/storyforge/application/port/outbound/ModelGateway.class
+ai/storyforge/application/config/ProjectProperties.class
 ai/storyforge/application/ApplicationMarker.class
+ai/storyforge/application/service/ProjectService.class
+ai/storyforge/application/dto/ProjectDto.class
+ai/storyforge/application/port/outbound/VectorStore.class
+ai/storyforge/application/port/inbound/ProjectUseCase.class
+ai/storyforge/application/service/DocumentLoaderService.class

@@ -18,17 +18,19 @@
         <dependency>
             <groupId>ai.storyforge</groupId>
             <artifactId>api</artifactId>
-            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>ai.storyforge</groupId>
             <artifactId>infrastructure</artifactId>
-            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>ai.storyforge</groupId>
             <artifactId>cli</artifactId>
-            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
         </dependency>
     </dependencies>
 
@@ -37,7 +39,6 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <version>${spring-boot.version}</version>
                 <executions>
                     <execution>
                         <goals>

@@ -1,1 +1,11 @@
 /usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/DomainMarker.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/event/DomainEvent.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/Document.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/DocumentType.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/NovelProject.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/vo/DocumentId.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/vo/NovelProjectId.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/repository/DocumentRepository.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/repository/NovelProjectRepository.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/service/CharacterArcAnalyzer.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/service/PlotGapAnalyzer.java

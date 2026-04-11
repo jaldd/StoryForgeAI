@@ -1,1 +1,12 @@
 /usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/InfrastructureMarker.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/config/LlmConfig.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/config/ModelProperties.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/config/RedisConfig.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/config/RepositoryConfig.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/config/ZhipuConfig.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/llm/GlmModelAdapter.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/llm/ZhipuModelAdapter.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/persistence/InMemoryDocumentRepository.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/persistence/JpaDocumentRepository.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/persistence/JpaNovelProjectRepository.java
+/usr/local/workspace/github/StoryForgeAI/infrastructure/src/main/java/ai/storyforge/infrastructure/persistence/NovelProjectRepositoryImpl.java

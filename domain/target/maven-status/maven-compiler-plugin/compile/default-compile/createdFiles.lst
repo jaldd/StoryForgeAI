@@ -1,1 +1,11 @@
+ai/storyforge/domain/model/vo/NovelProjectId.class
+ai/storyforge/domain/model/Document.class
+ai/storyforge/domain/service/CharacterArcAnalyzer.class
+ai/storyforge/domain/service/PlotGapAnalyzer.class
 ai/storyforge/domain/DomainMarker.class
+ai/storyforge/domain/model/vo/DocumentId.class
+ai/storyforge/domain/model/DocumentType.class
+ai/storyforge/domain/repository/DocumentRepository.class
+ai/storyforge/domain/model/NovelProject.class
+ai/storyforge/domain/event/DomainEvent.class
+ai/storyforge/domain/repository/NovelProjectRepository.class
