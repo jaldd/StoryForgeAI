@@ -7,9 +7,10 @@ import java.util.Arrays;
 
 public class BasicChat {
     public static void main(String[] args) {
+        String appkey="";
         // 初始化客户端
         ZhipuAiClient client = ZhipuAiClient.builder().ofZHIPU()
-                .apiKey("6a713f5530214103baff03397d9e4302.KbEvvEckg9np0pJ4")
+                .apiKey(appkey)
                 .build();
 
 //        // 创建聊天完成请求
