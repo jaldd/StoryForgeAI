@@ -13,6 +13,7 @@ ai/storyforge/application/dto/OptimizationResultDto.class
 ai/storyforge/application/config/ProjectProperties.class
 ai/storyforge/application/ApplicationMarker.class
 ai/storyforge/application/service/ProjectService.class
+ai/storyforge/application/config/ProjectProperties$Llm.class
 ai/storyforge/application/dto/ProjectDto.class
 ai/storyforge/application/port/outbound/VectorStore.class
 ai/storyforge/application/service/markdown/MarkdownConversionStrategy.class

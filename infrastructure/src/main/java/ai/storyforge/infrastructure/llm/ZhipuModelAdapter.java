@@ -1,5 +1,6 @@
 package ai.storyforge.infrastructure.llm;
 
+import ai.storyforge.application.config.ProjectProperties;
 import ai.storyforge.application.port.outbound.ModelGateway;
 import ai.z.openapi.ZhipuAiClient;
 import ai.z.openapi.service.model.*;
@@ -15,9 +16,11 @@ import java.util.Arrays;
 public class ZhipuModelAdapter implements ModelGateway {
 
     private final ZhipuAiClient zhipuAiClient;
+    private final ProjectProperties projectProperties;
 
-    public ZhipuModelAdapter(ZhipuAiClient zhipuAiClient) {
+    public ZhipuModelAdapter(ZhipuAiClient zhipuAiClient, ProjectProperties projectProperties) {
         this.zhipuAiClient = zhipuAiClient;
+        this.projectProperties = projectProperties;
     }
 
     @Override
@@ -31,7 +34,7 @@ public class ZhipuModelAdapter implements ModelGateway {
                                 .build()
                 ))
                 .maxTokens(4096)
-                .temperature(0.7f)
+                .temperature(projectProperties.getLlm().getTemperature())
                 .build();
 
         ChatCompletionResponse response = zhipuAiClient.chat().createChatCompletion(request);
@@ -64,7 +67,7 @@ public class ZhipuModelAdapter implements ModelGateway {
                 ))
                 .stream(true)
                 .maxTokens(4096)
-                .temperature(0.7f)
+                .temperature(projectProperties.getLlm().getTemperature())
                 .build();
 
         ChatCompletionResponse response = zhipuAiClient.chat().createChatCompletion(request);

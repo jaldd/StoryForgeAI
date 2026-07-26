@@ -53,4 +53,26 @@ public class ProjectProperties {
     public void setMarkdownConversionStrategy(String markdownConversionStrategy) {
         this.markdownConversionStrategy = markdownConversionStrategy;
     }
+
+    private Llm llm = new Llm();
+
+    public Llm getLlm() {
+        return llm;
+    }
+
+    public void setLlm(Llm llm) {
+        this.llm = llm;
+    }
+
+    public static class Llm {
+        private Float temperature = 0.7f;
+
+        public Float getTemperature() {
+            return temperature;
+        }
+
+        public void setTemperature(Float temperature) {
+            this.temperature = temperature;
+        }
+    }
 }

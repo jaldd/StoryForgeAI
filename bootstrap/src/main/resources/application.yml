@@ -54,3 +54,5 @@ storyforge:
     default-author: 作者
     documents-path: ./../StoryForgeAI/修仙不如陪她看云-新
     markdown-conversion-strategy: mcp  # 可选值: markitdown-mcp, llm, simple, mcp
+    llm:
+      temperature: 0.7
