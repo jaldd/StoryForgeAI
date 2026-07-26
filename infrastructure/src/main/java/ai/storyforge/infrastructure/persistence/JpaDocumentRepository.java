@@ -14,7 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
 import java.util.Optional;
 
-//@Repository
+@Repository
 @Transactional
 public class JpaDocumentRepository implements DocumentRepository {
 

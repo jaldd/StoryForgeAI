@@ -1,5 +1,6 @@
 /usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/DomainMarker.java
 /usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/event/DomainEvent.java
+/usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/exception/DocumentNotFoundException.java
 /usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/Document.java
 /usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/DocumentType.java
 /usr/local/workspace/github/StoryForgeAI/domain/src/main/java/ai/storyforge/domain/model/NovelProject.java

@@ -98,4 +98,9 @@ public class ZhipuModelAdapter implements ModelGateway {
 
         return sink.asFlux();
     }
+
+    @Override
+    public String generateContent(String prompt) {
+        return chat(prompt);
+    }
 }

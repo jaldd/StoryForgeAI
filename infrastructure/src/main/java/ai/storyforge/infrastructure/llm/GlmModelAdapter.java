@@ -57,4 +57,9 @@ public class GlmModelAdapter implements ModelGateway {
 
         return sink.asFlux();
     }
+
+    @Override
+    public String generateContent(String prompt) {
+        return chatModel.chat(prompt);
+    }
 }

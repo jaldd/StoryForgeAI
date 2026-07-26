@@ -1,6 +1,7 @@
 package ai.storyforge.api.controller;
 
 import ai.storyforge.application.dto.DocumentDto;
+import ai.storyforge.application.dto.OptimizationResultDto;
 import ai.storyforge.application.dto.ProjectDto;
 import ai.storyforge.application.port.inbound.ProjectUseCase;
 import org.springframework.web.bind.annotation.*;
@@ -33,17 +34,29 @@ public class ProjectController {
     }
 
     @GetMapping("/default/documents/{documentId}")
-    public DocumentDto getDocument(@PathVariable String documentId) {
+    public DocumentDto getDocument(@PathVariable("documentId") String documentId) {
         return projectUseCase.getDocument(documentId);
     }
 
     @GetMapping("/default/chapters/{chapterNumber}")
-    public DocumentDto getChapter(@PathVariable int chapterNumber) {
+    public DocumentDto getChapter(@PathVariable("chapterNumber") int chapterNumber) {
         return projectUseCase.getChapter(chapterNumber);
     }
 
     @PostMapping("/default/reload")
     public void reloadDocuments() {
         projectUseCase.reloadDocuments();
+    }
+
+    @PostMapping("/default/documents/{documentId}/optimize")
+    public OptimizationResultDto optimizeDocument(@PathVariable("documentId") String documentId) {
+        return projectUseCase.optimizeDocument(documentId);
+    }
+
+    @PostMapping("/default/documents/{documentId}/apply-optimization")
+    public void applyOptimization(
+            @PathVariable("documentId") String documentId,
+            @RequestBody String optimizedContent) {
+        projectUseCase.applyOptimization(documentId, optimizedContent);
     }
 }

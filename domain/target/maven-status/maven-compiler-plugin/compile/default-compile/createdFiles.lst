@@ -1,3 +1,4 @@
+ai/storyforge/domain/exception/DocumentNotFoundException.class
 ai/storyforge/domain/model/vo/NovelProjectId.class
 ai/storyforge/domain/model/Document.class
 ai/storyforge/domain/service/CharacterArcAnalyzer.class

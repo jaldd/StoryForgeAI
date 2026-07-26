@@ -2,6 +2,7 @@ package ai.storyforge.application.port.inbound;
 
 import ai.storyforge.application.dto.DocumentDto;
 import ai.storyforge.application.dto.ProjectDto;
+import ai.storyforge.application.dto.OptimizationResultDto;
 import java.util.List;
 
 public interface ProjectUseCase {
@@ -11,4 +12,6 @@ public interface ProjectUseCase {
     DocumentDto getDocument(String documentId);
     DocumentDto getChapter(int chapterNumber);
     void reloadDocuments();
+    OptimizationResultDto optimizeDocument(String documentId);
+    void applyOptimization(String documentId, String optimizedContent);
 }

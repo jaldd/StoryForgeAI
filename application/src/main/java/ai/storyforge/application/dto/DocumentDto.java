@@ -12,6 +12,7 @@ public record DocumentDto(
     String content,
     Integer wordCount,
     String filePath,
+    String directoryPath,
     LocalDateTime createdAt,
     LocalDateTime updatedAt
 ) {}

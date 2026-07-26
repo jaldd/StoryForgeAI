@@ -24,3 +24,4 @@ public class RepositoryConfig {
         return jpaDocumentRepository;
     }
 }
+

@@ -6,12 +6,14 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 @ConfigurationProperties(prefix = "storyforge.project")
 public class ProjectProperties {
+    
+    private String defaultProjectId;
+    private String defaultTitle;
+    private String defaultAuthor;
+    private String documentsPath;
+    private String markdownConversionStrategy;
 
-    private String defaultProjectId = "550e8400-e29b-41d4-a716-446655440000";
-    private String defaultTitle = "默认小说项目";
-    private String defaultAuthor = "作者";
-    private String documentsPath = "./documents";
-
+    // Getters and setters
     public String getDefaultProjectId() {
         return defaultProjectId;
     }
@@ -42,5 +44,13 @@ public class ProjectProperties {
 
     public void setDocumentsPath(String documentsPath) {
         this.documentsPath = documentsPath;
+    }
+
+    public String getMarkdownConversionStrategy() {
+        return markdownConversionStrategy;
+    }
+
+    public void setMarkdownConversionStrategy(String markdownConversionStrategy) {
+        this.markdownConversionStrategy = markdownConversionStrategy;
     }
 }

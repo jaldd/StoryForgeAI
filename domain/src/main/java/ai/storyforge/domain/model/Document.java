@@ -33,6 +33,8 @@ public class Document {
 
     private String filePath;
 
+    private String directoryPath;
+
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;
@@ -92,11 +94,17 @@ public class Document {
     public String getContent() { return content; }
     public Integer getWordCount() { return wordCount; }
     public String getFilePath() { return filePath; }
+    public String getDirectoryPath() { return directoryPath; }
     public LocalDateTime getCreatedAt() { return createdAt; }
     public LocalDateTime getUpdatedAt() { return updatedAt; }
 
     public void setFilePath(String filePath) {
         this.filePath = filePath;
+        this.updatedAt = LocalDateTime.now();
+    }
+
+    public void setDirectoryPath(String directoryPath) {
+        this.directoryPath = directoryPath;
         this.updatedAt = LocalDateTime.now();
     }
 

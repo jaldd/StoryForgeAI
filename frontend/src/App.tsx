@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
 import './App.css'
 
 interface ChatMessage {
@@ -15,6 +16,14 @@ interface Document {
   content?: string
   wordCount?: number
   filePath?: string
+  directoryPath?: string
+}
+
+interface DirectoryNode {
+  name: string
+  path: string
+  children: DirectoryNode[]
+  documents: Document[]
 }
 
 interface Project {
@@ -22,6 +31,14 @@ interface Project {
   title: string
   author: string
   documentCount: number
+}
+
+interface OptimizationResult {
+  documentId: string
+  originalContent: string
+  optimizedContent: string
+  suggestions: string
+  hasChanges: boolean
 }
 
 function App() {
@@ -32,6 +49,9 @@ function App() {
   const [project, setProject] = useState<Project | null>(null)
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set())
+  const [optimizationResult, setOptimizationResult] = useState<OptimizationResult | null>(null)
+  const [optimizing, setOptimizing] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const currentContentRef = useRef<string>('')
 
@@ -46,7 +66,7 @@ function App() {
 
   const loadProject = async () => {
     try {
-      const response = await fetch('/api/projects/default')
+      const response = await fetch(`/api/projects/default`)
       if (response.ok) {
         const data = await response.json()
         setProject(data)
@@ -58,7 +78,7 @@ function App() {
 
   const loadDocuments = async () => {
     try {
-      const response = await fetch('/api/projects/default/documents')
+      const response = await fetch(`/api/projects/default/documents`)
       if (response.ok) {
         const data = await response.json()
         setDocuments(data)
@@ -70,7 +90,7 @@ function App() {
 
   const reloadDocuments = async () => {
     try {
-      await fetch('/api/projects/default/reload', { method: 'POST' })
+      await fetch(`/api/projects/default/reload`, { method: 'POST' })
       loadDocuments()
       loadProject()
     } catch (error) {
@@ -87,6 +107,46 @@ function App() {
       }
     } catch (error) {
       console.error('Failed to load document:', error)
+    }
+  }
+
+  const optimizeDocument = async (docId: string) => {
+    try {
+      setOptimizing(true)
+      const response = await fetch(`/api/projects/default/documents/${docId}/optimize`, { method: 'POST' })
+      if (response.ok) {
+        const data = await response.json()
+        setOptimizationResult(data)
+      }
+    } catch (error) {
+      console.error('Failed to optimize document:', error)
+    } finally {
+      setOptimizing(false)
+    }
+  }
+
+  const applyOptimization = async () => {
+    if (!optimizationResult || !selectedDocument) return
+    
+    try {
+      const response = await fetch(
+        `/api/projects/default/documents/${optimizationResult.documentId}/apply-optimization`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: optimizationResult.optimizedContent,
+        }
+      )
+      
+      if (response.ok) {
+        setOptimizationResult(null)
+        loadDocument(selectedDocument.documentId)
+        loadDocuments()
+      }
+    } catch (error) {
+      console.error('Failed to apply optimization:', error)
     }
   }
 
@@ -158,20 +218,113 @@ function App() {
     }
   }
 
-  const getDocumentTypeName = (type: string) => {
-    switch (type) {
-      case 'CHAPTER': return '章节'
-      case 'CHARACTER': return '角色'
-      case 'WORLD': return '世界观'
-      case 'OUTLINE': return '大纲'
-      default: return '笔记'
+  const buildDirectoryTree = (docs: Document[]): DirectoryNode => {
+    const root: DirectoryNode = { name: '', path: '', children: [], documents: [] }
+    
+    docs.forEach(doc => {
+      const dirPath = doc.directoryPath || ''
+      const parts = dirPath.split('/').filter(p => p)
+      
+      let current = root
+      
+      parts.forEach(part => {
+        let child = current.children.find(c => c.name === part)
+        if (!child) {
+          child = { name: part, path: current.path ? `${current.path}/${part}` : part, children: [], documents: [] }
+          current.children.push(child)
+        }
+        current = child
+      })
+      
+      current.documents.push(doc)
+    })
+    
+    const sortDirectory = (node: DirectoryNode) => {
+      node.children.sort((a, b) => a.name.localeCompare(b.name))
+      node.documents.sort((a, b) => a.name.localeCompare(b.name))
+      node.children.forEach(sortDirectory)
     }
+    sortDirectory(root)
+    
+    return root
   }
 
-  const chapters = documents.filter(d => d.type === 'CHAPTER').sort((a, b) => (a.chapterNumber || 0) - (b.chapterNumber || 0))
-  const characters = documents.filter(d => d.type === 'CHARACTER')
-  const worlds = documents.filter(d => d.type === 'WORLD')
-  const others = documents.filter(d => !['CHAPTER', 'CHARACTER', 'WORLD'].includes(d.type))
+  const toggleDirectory = (path: string) => {
+    setExpandedDirectories(prev => {
+      const newSet = new Set(prev)
+      if (newSet.has(path)) {
+        newSet.delete(path)
+      } else {
+        newSet.add(path)
+      }
+      return newSet
+    })
+  }
+
+  const renderDirectoryTree = (node: DirectoryNode, level: number = 0) => {
+    const isExpanded = expandedDirectories.has(node.path)
+    
+    return (
+      <div key={node.path || 'root'} className="directory-node">
+        {node.path && (
+          <div 
+            className="directory-header" 
+            style={{ paddingLeft: `${level * 16 + 8}px` }}
+            onClick={() => toggleDirectory(node.path)}
+          >
+            <span className="directory-toggle">
+              {(node.children.length > 0 || node.documents.length > 0) ? (isExpanded ? '▼' : '▶') : ''}
+            </span>
+            <span className="directory-icon">📁</span>
+            <span className="directory-name">{node.name}</span>
+          </div>
+        )}
+        
+        {(node.path === '' || isExpanded) && (
+          <div className="directory-content">
+            {node.children.map(child => renderDirectoryTree(child, level + (node.path ? 1 : 0)))}
+            {node.documents.map(doc => (
+              <div 
+                key={doc.documentId}
+                className={`document-item ${selectedDocument?.documentId === doc.documentId ? 'selected' : ''}`}
+                style={{ paddingLeft: `${(level + (node.path ? 1 : 0)) * 16 + 8}px` }}
+              >
+                <div className="document-info" onClick={() => loadDocument(doc.documentId)}>
+                  <span className="doc-icon">{getDocumentIcon(doc.type)}</span>
+                  <span className="doc-name">
+                    {doc.type === 'CHAPTER' && doc.chapterNumber ? `第${doc.chapterNumber}章` : ''} {doc.title || doc.name}
+                  </span>
+                </div>
+                <button 
+                  className="optimize-btn" 
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    optimizeDocument(doc.documentId)
+                  }}
+                  title="优化文档"
+                  disabled={optimizing}
+                >
+                  ✨
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // const getDocumentTypeName = (type: string) => {
+  //   switch (type) {
+  //     case 'CHAPTER': return '章节'
+  //     case 'CHARACTER': return '角色'
+  //     case 'WORLD': return '世界观'
+  //     case 'OUTLINE': return '大纲'
+  //     default: return '笔记'
+  //   }
+  // }
+
+  const directoryTree = buildDirectoryTree(documents)
 
   return (
     <div className="app">
@@ -192,76 +345,12 @@ function App() {
           </div>
 
           <div className="document-list">
-            {chapters.length > 0 && (
-              <div className="document-section">
-                <h3>📖 章节</h3>
-                {chapters.map(doc => (
-                  <div 
-                    key={doc.documentId}
-                    className={`document-item ${selectedDocument?.documentId === doc.documentId ? 'selected' : ''}`}
-                    onClick={() => loadDocument(doc.documentId)}
-                  >
-                    <span className="doc-icon">{getDocumentIcon(doc.type)}</span>
-                    <span className="doc-name">
-                      {doc.chapterNumber ? `第${doc.chapterNumber}章` : ''} {doc.title || doc.name}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {characters.length > 0 && (
-              <div className="document-section">
-                <h3>👤 角色</h3>
-                {characters.map(doc => (
-                  <div 
-                    key={doc.documentId}
-                    className={`document-item ${selectedDocument?.documentId === doc.documentId ? 'selected' : ''}`}
-                    onClick={() => loadDocument(doc.documentId)}
-                  >
-                    <span className="doc-icon">{getDocumentIcon(doc.type)}</span>
-                    <span className="doc-name">{doc.name}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {worlds.length > 0 && (
-              <div className="document-section">
-                <h3>🌍 世界观</h3>
-                {worlds.map(doc => (
-                  <div 
-                    key={doc.documentId}
-                    className={`document-item ${selectedDocument?.documentId === doc.documentId ? 'selected' : ''}`}
-                    onClick={() => loadDocument(doc.documentId)}
-                  >
-                    <span className="doc-icon">{getDocumentIcon(doc.type)}</span>
-                    <span className="doc-name">{doc.name}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {others.length > 0 && (
-              <div className="document-section">
-                <h3>📝 其他</h3>
-                {others.map(doc => (
-                  <div 
-                    key={doc.documentId}
-                    className={`document-item ${selectedDocument?.documentId === doc.documentId ? 'selected' : ''}`}
-                    onClick={() => loadDocument(doc.documentId)}
-                  >
-                    <span className="doc-icon">{getDocumentIcon(doc.type)}</span>
-                    <span className="doc-name">{doc.name}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {documents.length === 0 && (
+            {documents.length > 0 ? (
+              renderDirectoryTree(directoryTree)
+            ) : (
               <div className="empty-docs">
                 <p>暂无文档</p>
-                <p className="hint">将你的小说文档放到 ./documents 目录</p>
+                <p className="hint">将你的小说文档放到 ./../novel/documents 目录</p>
                 <p className="hint">然后点击 🔄 重新加载</p>
               </div>
             )}
@@ -296,7 +385,9 @@ function App() {
               </button>
             </div>
             <div className="preview-content">
-              <pre>{selectedDocument.content}</pre>
+              <ReactMarkdown>
+                {selectedDocument.content || ''}
+              </ReactMarkdown>
             </div>
           </div>
         )}
@@ -331,6 +422,58 @@ function App() {
           </button>
         </div>
       </main>
+
+      {optimizationResult && (
+        <div className="optimization-dialog">
+          <div className="dialog-content">
+            <div className="dialog-header">
+              <h3>文档优化结果</h3>
+              <button 
+                className="close-dialog" 
+                onClick={() => setOptimizationResult(null)}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="dialog-body">
+              <div className="optimization-section">
+                <h4>优化建议</h4>
+                <div className="suggestions">
+                  {optimizationResult.suggestions}
+                </div>
+              </div>
+              {optimizationResult.hasChanges && (
+                <div className="optimization-section">
+                  <h4>格式转换</h4>
+                  <p>文档已转换为标准Markdown格式</p>
+                </div>
+              )}
+            </div>
+            <div className="dialog-footer">
+              <button 
+                className="btn-secondary" 
+                onClick={() => setOptimizationResult(null)}
+              >
+                取消
+              </button>
+              <button 
+                className="btn-primary" 
+                onClick={applyOptimization}
+              >
+                应用
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {optimizing && (
+        <div className="loading-overlay">
+          <div className="loading-spinner">
+            <p>优化中...</p>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -52,4 +52,5 @@ storyforge:
     default-project-id: 550e8400-e29b-41d4-a716-446655440000
     default-title: 默认小说项目
     default-author: 作者
-    documents-path: ./documents
+    documents-path: ./../StoryForgeAI/修仙不如陪她看云-新
+    markdown-conversion-strategy: mcp  # 可选值: markitdown-mcp, llm, simple, mcp
