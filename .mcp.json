@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "novel-fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/usr/local/workspace/github/StoryForgeAI/docs/修仙不如陪她看云"]
+    }
+  }
+}
