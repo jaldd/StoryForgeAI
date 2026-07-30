@@ -27,6 +27,8 @@ replay_pid*
 py/
 venv/
 
+# 向量数据库本地存储（运行时生成，可由源数据重建）
+chroma_db/
 
 .DS_Store
 **/.DS_Store
