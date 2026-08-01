@@ -17,7 +17,6 @@
         <module>application</module>
         <module>infrastructure</module>
         <module>api</module>
-        <module>cli</module>
         <module>bootstrap</module>
     </modules>
 
@@ -72,11 +71,6 @@
             <dependency>
                 <groupId>ai.storyforge</groupId>
                 <artifactId>api</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>ai.storyforge</groupId>
-                <artifactId>cli</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
