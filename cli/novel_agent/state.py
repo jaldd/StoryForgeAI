@@ -22,6 +22,9 @@ class PipelineState:
     feedback: str = ""        # Reviewer 审稿意见
     final_chapter: str = ""   # 最终定稿
 
+    # -- 重写输入 --
+    source_content: str = ""   # 重写模式：已有内容（writer 作为参考自由重写）
+
     # -- 控制字段 --
     round: int = 0                 # 当前轮次，防死循环
     next_agent: str = "director"   # 下一步派给谁

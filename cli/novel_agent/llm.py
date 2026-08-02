@@ -69,6 +69,7 @@ class LLMClient:
         system = clean_text(system)
         user = clean_text(user)
         last_err = ""
+        print("  ⏳ 等待模型响应...")
         for attempt in range(1, max_retries + 1):
             try:
                 resp = self.client.chat.completions.create(

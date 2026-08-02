@@ -11,6 +11,7 @@ def test_settings_path_resolution(tmp_settings, tmp_path):
     assert tmp_settings.doc_path == novel                       # RAG 索引源 = 小说根
     assert tmp_settings.chapter_path == novel / "正文/AI生成"
     assert tmp_settings.exemplar_full == novel / "文风基准/1.txt"
+    assert tmp_settings.instruction_full == novel / "写作指令.md"
     assert tmp_settings.runs_path == novel / ".agent" / "runs"
     assert tmp_settings.chroma_path == novel / ".agent" / "chroma_db"
     assert tmp_settings.working_memory_path == novel / ".agent" / "runs" / "working_memory.json"
@@ -65,3 +66,4 @@ def test_defaults():
     assert s.chunk_size == 300 and s.chunk_overlap == 80
     assert s.chapter_subdir == "正文/AI生成"
     assert s.index_exclude == "正文"
+    assert s.instruction_subpath == "写作指令.md"

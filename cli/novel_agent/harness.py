@@ -47,19 +47,61 @@ def replay(
     return d
 
 
+def _extract_score_fields(result: str) -> Dict[str, Any]:
+    """从截断/不规范文本里正则提取分数与各文本字段（最后兜底）。"""
+    score: Dict[str, Any] = {}
+    for key in ("连贯性", "人物一致性", "剧情合理性", "标题评分"):
+        m = re.search(rf'"{key}"\s*:\s*"?(\d+)', result)
+        if m:
+            score[key] = int(m.group(1))
+    for key in ("理由", "建议标题", "标题理由"):
+        m = re.search(rf'"{key}"\s*:\s*"?(.*?)(?:["\n}}]|$)', result, re.S)
+        if m:
+            score[key] = m.group(1).strip()
+    return score
+
+
 def _parse_score(result: str) -> Dict[str, Any]:
-    """容错解析评委 JSON。"""
+    """容错解析评委 JSON；截断时尝试补 } 或正则提取分数。"""
+    # 1) 直接解析
     try:
         return json.loads(result)
     except json.JSONDecodeError:
         pass
+    # 2) 提取第一个 { 到最后一个 } 之间
     m = re.search(r"\{.*\}", result, re.S)
     if m:
         try:
             return json.loads(m.group())
         except json.JSONDecodeError:
             pass
+    # 3) 截断兜底：有 { 但没结尾 }，逐个补 } 再试
+    start = result.find("{")
+    if start != -1:
+        snippet = result[start:]
+        for _ in range(3):
+            snippet += "}"
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                pass
+        # 4) 补 } 仍失败：正则提取打分字段
+        fields = _extract_score_fields(result)
+        if fields:
+            return fields
     return {"error": "评委未返回可解析 JSON", "raw": result[:200]}
+
+
+def _eval_system_prompt(instruction: str) -> str:
+    """构造评委 system prompt：非空 instruction 时前置写作规则，避免把故意的设计当 bug 扣分。"""
+    if not instruction.strip():
+        return EVALUATOR_RUBRIC
+    return (
+        "【写作规则】（评判时必须遵守这些设定，违反规则的不是bug）\n"
+        f"{instruction}\n\n"
+        "如果正文中男主不出现名字、女主名字不出现等符合上述规则的，\n不扣分。\n\n"
+        f"{EVALUATOR_RUBRIC}"
+    )
 
 
 def evaluate(
@@ -67,8 +109,13 @@ def evaluate(
     settings: Optional[Settings] = None,
     llm: Optional[LLMClient] = None,
     out: Callable[[str], None] = print,
+    instruction: str = "",
 ) -> Dict[str, Any]:
-    """用 LLM 当评委，按 rubric 给 final_chapter 打三维评分。返回评分 dict。"""
+    """用 LLM 当评委，按 rubric 给 final_chapter 打三维评分。
+
+    instruction：写作指令全文，前置进 system prompt 当作"写作规则"，
+    避免评委把故意的设计（如男主前4章不取名）当 bug 扣分。
+    """
     settings = settings or get_settings()
     if llm is None:
         llm = LLMClient(settings=settings)
@@ -76,19 +123,32 @@ def evaluate(
 
     out("    [evaluate·评委打分中...]")
     result = llm.chat(
-        EVALUATOR_RUBRIC,
+        _eval_system_prompt(instruction),
         f"请评分以下稿件：\n\n{chapter}",
-        max_tokens=1024,
+        max_tokens=2048,
         temperature=0.2,
     )
+
+    if not result or not result.strip():
+        out("(评测模型未返回内容)")
+        return {"error": "评测模型未返回内容"}
+
     score = _parse_score(result)
+    if "error" in score:
+        out(f"评测解析失败，原始返回前500字：\n{result[:500]}")
+        return score
 
     out("=== LLM 评测报告 ===")
-    for k in ("连贯性", "人物一致性", "剧情合理性"):
+    for k in ("连贯性", "人物一致性", "剧情合理性", "标题评分"):
         if k in score:
             out(f"  {k}: {score[k]}/5")
     if "理由" in score:
         out(f"  理由: {score['理由']}")
+    suggestion = str(score.get("建议标题", "")).strip()
+    if suggestion and suggestion != "保留":
+        out(f"  建议标题: {suggestion}（仅建议，不自动改）")
+    if "标题理由" in score:
+        out(f"  标题理由: {score['标题理由']}")
     return score
 
 

@@ -40,6 +40,8 @@ def classify_type(path: str) -> str:
     - 人物 -> character
     - 总纲/伏笔/时间线/写作指令/每章/进度表/日常素材/防崩 -> setting
     - 文风基准 -> exemplar
+    - 正文/章节 -> chapter（前文参考；rebuild 时正文已被 NOVEL_INDEX_EXCLUDE 跳过，
+      仅 index add 手动加的正文走这条，否则 writer 的前文检索查不到）
     - 其他 -> other
     """
     p = path.lower()
@@ -50,6 +52,8 @@ def classify_type(path: str) -> str:
         return "setting"
     if "文风基准" in p:
         return "exemplar"
+    if "正文" in p or "章节" in p:
+        return "chapter"
     return "other"
 
 
@@ -198,6 +202,52 @@ class RAGStore:
         if progress:
             progress(f"✅ 已索引 {total} 块到 Chroma（存于 {self.settings.chroma_path}）")
         return total
+
+    # -- 单文件增删（手动操作，不受 NOVEL_INDEX_EXCLUDE 限制）--
+    def _resolve_source(self, file_path: str) -> str:
+        """文件路径 -> source 用的绝对路径：相对路径按 NOVEL_DIR 解析，绝对路径原样。"""
+        p = Path(file_path).expanduser()
+        if not p.is_absolute():
+            p = self.settings.novel_path / p
+        return str(p)
+
+    def add_document(self, file_path: str, progress=print) -> int:
+        """手动加单个文件进向量库：读 -> 分块 -> 向量化 -> upsert。
+
+        不检查 NOVEL_INDEX_EXCLUDE（用户手动加什么都行，常用于精修后的单章正文）。
+        先删该文件旧块再 upsert，故精修后重跑也安全（块数变化不留孤儿块）。
+        id 用 "{文件名}_{块序号}"，metadata.source 存绝对路径。返回索引块数。
+        """
+        src = self._resolve_source(file_path)
+        path = Path(src)
+        if not path.is_file():
+            raise FileNotFoundError(src)
+        text = path.read_text(encoding="utf-8")
+        collection = self._collection_obj()
+        # 先清掉该文件旧块，避免精修后块数变化留下孤儿
+        collection.delete(where={"source": src})
+        fname = path.name
+        chunks = [c for c in chunk_text(text, self.settings.chunk_size, self.settings.chunk_overlap)
+                  if c.strip()]
+        if not chunks:
+            if progress:
+                progress(f"⚠️ {fname} 无有效内容，已清空旧块")
+            return 0
+        ids = [f"{fname}_{i}" for i in range(len(chunks))]
+        metas = [{"source": src, "type": classify_type(src)} for _ in chunks]
+        collection.upsert(ids=ids, documents=chunks, metadatas=metas)
+        if progress:
+            progress(f"✅ 已索引 {fname}：{len(chunks)} 块（type={classify_type(src)}）")
+        return len(chunks)
+
+    def remove_document(self, file_path: str) -> int:
+        """删该文件在向量库里的所有块（按 source 绝对路径匹配）。返回删除的块数。"""
+        src = self._resolve_source(file_path)
+        collection = self._collection_obj()
+        before = collection.get(where={"source": src}) or {}
+        n = len(before.get("ids", []) or [])
+        collection.delete(where={"source": src})
+        return n
 
     # -- 检索 --
     def retrieve(

@@ -11,6 +11,7 @@ NOVEL_DIR=/path/to/your/novel
 # 小说内相对路径（可选，按需改）：
 # NOVEL_CHAPTER_SUBDIR=正文/AI生成
 # NOVEL_EXEMPLAR=文风基准/1.txt
+# NOVEL_INSTRUCTION=写作指令.md
 
 # ---- Agent 运行时（可选；不设则默认放 <NOVEL_DIR>/.agent/ 下）----
 # NOVEL_RUNS_DIR=
