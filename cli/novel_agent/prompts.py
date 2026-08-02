@@ -7,11 +7,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-NOVEL_NAME = "修仙不如陪她看云"
+__all__ = [
+    "RULES",
+    "load_exemplar",
+    "writer_system",
+    "polisher_system",
+    "reviewer_system",
+    "EVALUATOR_RUBRIC",
+    "PLOT_SUMMARY_SYSTEM",
+    "SUMMARIZER_SYSTEM",
+]
 
 # ---------- 写作铁律（取 py/ 下最完整的 8 条版本）----------
+# 注：铁律里"男主/女主/云依"等是《当前小说》的设定，由小说方在设定文档里维护；
+# 这里是默认范例，实际写作约束以 NOVEL_DIR 下设定 + exemplar 为准。
 RULES = """【写作铁律】
-1. 男主不取名，全文用"他"（前4章正文禁止出现"许风"三字）
+1. 男主不取名，全文用"他"（前4章正文禁止出现男主本名三字）
 2. 女主叫云依
 3. 天气线（风/雨/雪/晴/裂）不解释来源，它是男主内心的"心电图"
 4. 女主不"治愈"男主--她只是"在"，不追问、不替他解决
@@ -27,8 +38,8 @@ def load_exemplar(path: str | Path) -> str:
 
 
 # ---------- 各 Agent 的 system prompt ----------
-def writer_system(retrieved: str, exemplar: str) -> str:
-    return f"""你是小说《{NOVEL_NAME}》的创作助手，必须严格模仿以下文风写作。
+def writer_system(novel_name: str, retrieved: str, exemplar: str) -> str:
+    return f"""你是小说《{novel_name}》的创作助手，必须严格模仿以下文风写作。
 {RULES}
 【已检索到的设定（必须遵守）】
 {retrieved}
@@ -37,8 +48,8 @@ def writer_system(retrieved: str, exemplar: str) -> str:
 """
 
 
-def polisher_system(retrieved: str) -> str:
-    return f"""你是小说《{NOVEL_NAME}》的文字润色师。
+def polisher_system(novel_name: str, retrieved: str) -> str:
+    return f"""你是小说《{novel_name}》的文字润色师。
 任务：对下面的初稿做润色，让文字更流畅、有文采、节奏更好。
 铁律（绝对不能违反）：
 1. 只优化文字表达，严禁改动人物称呼（男主始终用"他"、女主叫云依）
@@ -49,8 +60,8 @@ def polisher_system(retrieved: str) -> str:
 """
 
 
-def reviewer_system(retrieved: str) -> str:
-    return f"""你是小说《{NOVEL_NAME}》的审稿编辑。
+def reviewer_system(novel_name: str, retrieved: str) -> str:
+    return f"""你是小说《{novel_name}》的审稿编辑。
 任务：审查以下稿件，判断是否合格。
 审查维度：
 1. 人物一致性：是否符合设定（男主用"他"、女主叫云依等）
@@ -68,12 +79,16 @@ def reviewer_system(retrieved: str) -> str:
 
 
 # ---------- 评测 / 摘要 prompt ----------
-EVALUATOR_RUBRIC = f"""你是小说评稿评委。请从以下三个维度给稿件打分，每维 1-5 分（5=最好）：
+EVALUATOR_RUBRIC = """你是小说评稿评委。请从以下三个维度给稿件打分，每维 1-5 分（5=最好）：
 1. 连贯性：剧情/逻辑是否自洽，有无突兀跳跃
 2. 人物一致性：是否符合设定（男主用"他"、女主叫云依、风是内心心电图）
 3. 剧情合理性：情感与行为动机是否合理、不悬浮
 请严格按 JSON 返回，不要输出其他内容：
-{{"连贯性": <分>, "人物一致性": <分>, "剧情合理性": <分>, "理由": "<总评>"}}"""
+{"连贯性": <分>, "人物一致性": <分>, "剧情合理性": <分>, "理由": "<总评>"}"""
 
 
 SUMMARIZER_SYSTEM = "把下面的对话压成 3 句话摘要，只留对小说重要的信息。"
+
+PLOT_SUMMARY_SYSTEM = (
+    "把下面的小说章节压成 1-2 句话剧情摘要，只记关键情节与情绪落点，不要评价、不要复述全文。"
+)

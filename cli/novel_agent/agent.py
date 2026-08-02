@@ -69,6 +69,7 @@ class NovelAgent:
         self.rag = rag
         self.exemplar = exemplar
         self.settings = settings or get_settings()
+        self.novel_name = self.settings.novel_name
         self.working_memory = working_memory
         self.max_reviews = self.settings.max_reviews if max_reviews is None else max_reviews
         self.max_rounds = self.settings.max_rounds if max_rounds is None else max_rounds
@@ -81,8 +82,8 @@ class NovelAgent:
         }
 
     # ---------- RAG 检索辅助 ----------
-    def _retrieve(self, task: str, char_k: int, chap_k: int) -> str:
-        """按类型检索人物 + 前文，拼成带出处的字符串。RAG 不可用时返回空。"""
+    def _retrieve(self, task: str, char_k: int, chap_k: int, setting_k: int = 0) -> str:
+        """按类型检索人物 + 设定 + 前文，拼成带出处的字符串。RAG 不可用时返回空。"""
         if self.rag is None:
             return ""
         parts: List[str] = []
@@ -90,6 +91,9 @@ class NovelAgent:
             if char_k:
                 for txt, src in self.rag.retrieve(task, top_k=char_k, doc_type="character"):
                     parts.append(f"【人物·出自 {src}】\n{txt}")
+            if setting_k:
+                for txt, src in self.rag.retrieve(task, top_k=setting_k, doc_type="setting"):
+                    parts.append(f"【设定·出自 {src}】\n{txt}")
             if chap_k:
                 for txt, src in self.rag.retrieve(task, top_k=chap_k, doc_type="chapter"):
                     parts.append(f"【前文·出自 {src}】\n{txt}")
@@ -114,8 +118,8 @@ class NovelAgent:
 
     def _writer(self, state: PipelineState) -> None:
         """写手：查设定 + 调模型产出初稿。"""
-        retrieved = self._retrieve(state.task, char_k=3, chap_k=3)
-        system = writer_system(retrieved, self.exemplar) + self._working_context()
+        retrieved = self._retrieve(state.task, char_k=3, chap_k=0, setting_k=3)
+        system = writer_system(self.novel_name, retrieved, self.exemplar) + self._working_context()
 
         feedback_hint = ""
         if state.feedback and "不通过" in state.feedback:
@@ -135,8 +139,8 @@ class NovelAgent:
 
     def _polisher(self, state: PipelineState) -> None:
         """润色师：查设定兜底，基于初稿润色。"""
-        retrieved = self._retrieve(state.task, char_k=2, chap_k=2)
-        system = polisher_system(retrieved)
+        retrieved = self._retrieve(state.task, char_k=2, chap_k=0)
+        system = polisher_system(self.novel_name, retrieved)
         state.polished = self.llm.chat(
             system,
             f"以下是初稿，请润色：\n\n{state.draft}",
@@ -159,7 +163,7 @@ class NovelAgent:
             return
 
         retrieved = self._retrieve(state.task, char_k=2, chap_k=0)
-        system = reviewer_system(retrieved)
+        system = reviewer_system(self.novel_name, retrieved)
         result = self.llm.chat(
             system,
             f"请审查以下稿件：\n\n{state.polished}",

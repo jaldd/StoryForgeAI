@@ -78,7 +78,7 @@ class LongTermMemory:
         """把溢出的旧消息丢给 LLM 压成摘要，返回摘要文本（由调用方决定是否存）。"""
         text = "\n".join(str(m) for m in old_messages)
         return llm.chat(
-            SUMMARIZER_SYSTEM, text, max_tokens=300, temperature=0.3
+            SUMMARIZER_SYSTEM, text, max_tokens=1024, temperature=0.3
         )
 
     def add_summary(self, text: str) -> None:

@@ -1,0 +1,20 @@
+# ---- LLM（火山方舟 OpenAI 兼容 coding 网关）----
+ARK_API_KEY=你的火山密钥
+# 模型（不设则默认 glm-5.2；推理模型，短输出 max_tokens 需 ≥1024）
+CLAUDE_MODEL=glm-5.2
+
+# ---- 小说（仓库外，不硬编码）----
+# 小说显示名：用于 prompt（如 "我的小说"）。不设默认"本小说"。
+NOVEL_NAME=本小说
+# 小说内容根目录：含设定(.md)/文风基准/正文。必须在仓库外。
+NOVEL_DIR=/path/to/your/novel
+# 小说内相对路径（可选，按需改）：
+# NOVEL_CHAPTER_SUBDIR=正文/AI生成
+# NOVEL_EXEMPLAR=文风基准/1.txt
+
+# ---- Agent 运行时（可选；不设则默认放 <NOVEL_DIR>/.agent/ 下）----
+# NOVEL_RUNS_DIR=
+# NOVEL_CHROMA_DIR=
+
+# ---- 仓库根（可选；仅用于找 .env，不设则用当前工作目录）----
+# STORYFORGE_ROOT=/usr/local/workspace/github/StoryForgeAI

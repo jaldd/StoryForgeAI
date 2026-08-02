@@ -61,7 +61,7 @@ class LLMClient:
         system: str,
         user: str,
         *,
-        max_tokens: int = 800,
+        max_tokens: int = 1024,
         temperature: float = 0.9,
         max_retries: int = 5,
     ) -> str:

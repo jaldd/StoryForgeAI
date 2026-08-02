@@ -35,22 +35,42 @@ def chunk_text(text: str, size: int = 300, overlap: int = 80) -> List[str]:
 
 
 def classify_type(path: str) -> str:
-    """根据出处路径给块打类型标签，供检索时 where 过滤。"""
+    """根据出处路径给块打类型标签，供检索时 where 过滤。
+
+    - 人物 -> character
+    - 总纲/伏笔/时间线/写作指令/每章/进度表/日常素材/防崩 -> setting
+    - 文风基准 -> exemplar
+    - 其他 -> other
+    """
     p = path.lower()
-    if "人物" in p or "大方向共识备忘" in p:
+    if "人物" in p:
         return "character"
-    if "每章" in p or "正文" in p or "章节" in p:
-        return "chapter"
+    if ("总纲" in p or "伏笔" in p or "时间线" in p or "写作指令" in p
+            or "每章" in p or "进度表" in p or "日常素材" in p or "防崩" in p):
+        return "setting"
+    if "文风基准" in p:
+        return "exemplar"
     return "other"
 
 
-def load_documents(doc_dir: Path) -> List[Tuple[str, str]]:
-    """递归读出目录下所有 .md/.txt，返回 [(相对路径, 全文)]。"""
+def load_documents(doc_dir: Path, exclude: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    """递归读出目录下所有 .md/.txt，返回 [(路径, 全文)]。
+
+    exclude：目录名列表，命中任一祖先目录即整目录跳过
+    （如 ["正文"] 跳过 300 章正文，只索引设定/文风基准）。
+    """
+    exclude = exclude or []
     docs: List[Tuple[str, str]] = []
     for path in glob.glob(f"{doc_dir}/**/*", recursive=True):
-        if path.endswith(".md") or path.endswith(".txt"):
-            with open(path, encoding="utf-8") as f:
-                docs.append((path, f.read()))
+        if not (path.endswith(".md") or path.endswith(".txt")):
+            continue
+        if exclude:
+            # 相对 doc_dir 的祖先目录段，命中 exclude 任一段则跳过整个目录
+            rel_parts = Path(path).relative_to(doc_dir).parts[:-1]
+            if any(part in exclude for part in rel_parts):
+                continue
+        with open(path, encoding="utf-8") as f:
+            docs.append((path, f.read()))
     return docs
 
 
@@ -79,7 +99,14 @@ class VolcanoEmbedding:
                 resp.raise_for_status()
                 if self.sleep:
                     time.sleep(self.sleep)
-                return resp.json()["data"][0]["embedding"]
+                # 火山 multimodal embedding 返回 {"data": {"embedding": [...]}}
+                # （单条时是 dict；部分批量场景可能是 list，两种都兼容）
+                data = resp.json().get("data")
+                if isinstance(data, dict):
+                    return data["embedding"]
+                if isinstance(data, list):
+                    return data[0]["embedding"]
+                raise RuntimeError(f"未知的 embedding 响应结构：{resp.text[:200]}")
             except Exception as e:
                 last_err = e
                 time.sleep(0.5 * (2 ** attempt))  # 指数退避
@@ -145,8 +172,9 @@ class RAGStore:
     # -- 建库 --
     def build_all_chunks(self) -> List[Tuple[str, str]]:
         """把所有文档切成带出处的小块，返回 [(文本, 出处路径)]。"""
+        exclude = [s.strip() for s in self.settings.index_exclude.split(",") if s.strip()]
         all_chunks: List[Tuple[str, str]] = []
-        for path, text in load_documents(self.settings.doc_path):
+        for path, text in load_documents(self.settings.doc_path, exclude=exclude):
             for piece in chunk_text(text, self.settings.chunk_size, self.settings.chunk_overlap):
                 if piece.strip():
                     all_chunks.append((piece, path))
