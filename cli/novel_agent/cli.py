@@ -3,6 +3,7 @@
 命令：
   写第N章：标题     走完整流程（查设定->草稿->润色->审稿->存文件->打分）
   精修 <文件路径>   精修已有正文（润色->审稿->存回->更新索引，不写新场景）
+  改 <文件路径>     局部精修（列出段落->选段->只润色选区->diff 确认->逐字节存回）
   index            查看向量库；index rebuild 全量重建；index add/remove <路径> 单文件增删
   replay <run_id>  回放某次写作过程
   eval <run_id>    对某次写作打分
@@ -12,10 +13,11 @@
 """
 from __future__ import annotations
 
+import datetime
 import difflib
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 try:  # macOS 自带；启用后 input() 支持上下键切换历史命令
     import readline
@@ -27,7 +29,8 @@ from .config import Settings, get_settings
 from .harness import compare, evaluate, replay, run_tests
 from .llm import LLMClient
 from .memory import WorkingMemory
-from .prompts import load_exemplar, PLOT_SUMMARY_SYSTEM
+from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
+from .prompts import exemplar_info, load_exemplar, PLOT_SUMMARY_SYSTEM
 from .rag import RAGStore
 from .state import PipelineState
 from .storage import (
@@ -47,6 +50,13 @@ def _load_instruction(settings: Settings) -> str:
     """读写作指令全文（NOVEL_INSTRUCTION）；不存在则返回空串。"""
     if settings.instruction_subpath and settings.instruction_full.is_file():
         return settings.instruction_full.read_text(encoding="utf-8")
+    return ""
+
+
+def _load_rules(settings: Settings) -> str:
+    """读写作铁律全文（NOVEL_RULES，0.2 外置到 NOVEL_DIR 下「写作铁律.md」）；不存在则返回空串。"""
+    if settings.rules_subpath and settings.rules_full.is_file():
+        return settings.rules_full.read_text(encoding="utf-8")
     return ""
 
 
@@ -70,11 +80,13 @@ def _is_better(llm, original: str, refined: str) -> bool:
 
 
 def _build_agent(settings: Settings):
-    """构造 NovelAgent：加载文风金标准 + 写作指令 + 工作记忆，RAG 惰性。"""
+    """构造 NovelAgent：加载文风金标准 + 写作指令 + 写作铁律 + 工作记忆，RAG 惰性。"""
     exemplar = ""
-    if settings.exemplar_subpath and settings.exemplar_full.is_file():
+    # 0.5：exemplar 支持目录级（目录下全部 *.txt/*.md 按序拼接，超限截断）
+    if settings.exemplar_subpath and settings.exemplar_full.exists():
         exemplar = load_exemplar(settings.exemplar_full)
     instruction = _load_instruction(settings)
+    rules = _load_rules(settings)
     wm = load_working_memory(settings)
     agent = NovelAgent(
         llm=LLMClient(settings=settings),
@@ -83,6 +95,7 @@ def _build_agent(settings: Settings):
         instruction=instruction,
         settings=settings,
         working_memory=wm,
+        rules=rules,
     )
     return agent, wm
 
@@ -112,6 +125,12 @@ def _do_write(task: str, settings: Settings) -> None:
     if state.final_chapter:
         print("📖 保存章节 + 生成剧情摘要...")
         chapter_file = save_chapter(state.final_chapter, task, record["run_id"], settings)
+        # 0.3：写完自动入库（新章立即进 RAG，后续章节检索得到前文，不靠手动 index add）
+        print("📚 更新向量库...")
+        try:
+            agent.rag.add_document(str(chapter_file))
+        except Exception as e:
+            print(f"(索引更新失败：{e})")
         num, _ = parse_chapter_task(task)
         # 生成剧情摘要存入工作记忆，让后续章节记得前文（P1 连续性）
         try:
@@ -134,7 +153,8 @@ def _do_write(task: str, settings: Settings) -> None:
     print(f"共 {state.round} 轮，审稿：{state.feedback}")
 
     print("\n=== 最终章节 ===")
-    print(state.final_chapter or "(空)")
+    # 0.1：弃稿/未定稿时明确提示未保存，而非只打印"(空)"
+    print(state.final_chapter if state.final_chapter else "（本章未定稿，未保存）")
 
     # 自动评测打分（失败不阻断）
     print("\n--- 自动评测 ---")
@@ -288,6 +308,169 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
     _refine_postprocess(path, content, state, record, settings, agent, file_path, action="重写")
 
 
+def _span_text(blocks: List[Block], span: Tuple[int, int]) -> str:
+    """区间覆盖的全部块的 body 拼接（块间空行），与 agent.partial_refine 的选区一致。"""
+    index_of = {b.no: i for i, b in enumerate(blocks) if b.no is not None}
+    lo, hi = span
+    return "\n\n".join(b.body for b in blocks[index_of[lo]:index_of[hi] + 1])
+
+
+def _do_partial(args: List[str], settings: Settings) -> None:
+    """改 <文件路径>：列出段落 -> 选段 -> 逐区间局部润色 -> diff 确认 -> 逐字节存回。
+
+    只改选区，选区外字节逐字节不变；确认 y 前不落盘。
+    任一环节 Ctrl-C/Ctrl-D（含 LLM 生成中途）视为取消，文件不动（R1）。
+    """
+    if not args:
+        print("用法：改 <文件路径>（相对 NOVEL_DIR 或绝对路径）")
+        return
+    try:
+        settings.require_novel_dir()
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+    try:
+        _do_partial_flow(args, settings)
+    except (KeyboardInterrupt, EOFError):
+        # R1：整体兜底（覆盖 LLM 生成中途的 Ctrl-C），取消时文件必然未动
+        print("\n已取消，文件未改动。")
+
+
+def _do_partial_flow(args: List[str], settings: Settings) -> None:
+    """_do_partial 主体（参数与目录校验之后）。"""
+    file_path = " ".join(args)  # 容忍路径含空格（同精修/重写）
+    print("🔧 构建 Agent...")
+    agent, _ = _build_agent(settings)
+    abs_path = agent.rag._resolve_source(file_path)
+    path = Path(abs_path)
+    if not path.is_file():
+        print(f"❌ 找不到文件：{file_path}")
+        return
+
+    # 逐字节保真：读 bytes 手动 decode（不用 read_text，防 universal newline 破坏 \r\n/BOM）
+    text = path.read_bytes().decode("utf-8")
+    if not text.strip():
+        print(f"⚠️ 文件为空，跳过：{file_path}")
+        return
+
+    blocks = split_paragraphs(text)
+    paras = [b for b in blocks if b.no is not None]
+    print(f"\n共 {len(blocks)} 个块，{len(paras)} 段可编号：")
+    for b in blocks:
+        line = preview_line(b)
+        if line:
+            print(line)
+    if not paras:
+        print("无可选段落。")
+        return
+    max_no = max(b.no for b in paras)
+
+    # ---- 选段（非法重输；空回车/q 取消）----
+    while True:
+        try:
+            spec = input("\n选段（如 3 / 3-5 / 3,7；回车或 q 取消）：").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已取消。")
+            return
+        if not spec or spec.lower() == "q":
+            print("已取消。")
+            return
+        try:
+            spans = parse_selection(spec, max_no)
+            break
+        except ValueError as e:
+            print(f"❌ {e}")
+
+    old_texts = [_span_text(blocks, s) for s in spans]
+    total_paras = sum(hi - lo + 1 for lo, hi in spans)
+    total_chars = sum(len(t) for t in old_texts)
+    span_labels = "、".join(
+        f"第{lo}段" if lo == hi else f"第{lo}-{hi}段" for lo, hi in spans
+    )
+    print(f"\n已选 {total_paras} 段（{span_labels}），共 {total_chars} 字。")
+
+    # ---- 逐区间调用 LLM ----
+    task = f"局部精修：{path.name}"
+    results = agent.partial_refine(blocks, spans, task)
+    if any(r is None for r in results):
+        print("❌ 模型未返回内容，未改动。")
+        return
+
+    # 长度突变警告（D6：>3×/⅓ 警告不拦截；len(old)>=50 前置避免短选区噪音）
+    for (lo, hi), old, new in zip(spans, old_texts, results):
+        if len(old) >= 50 and (len(new) > 3 * len(old) or len(new) < len(old) / 3):
+            print(f"  ⚠️ 第{lo}-{hi}段长度异常：{len(old)} 字 -> {len(new)} 字"
+                  "（疑似返回整章/内容坍缩），请仔细核对 diff。")
+
+    # ---- diff（多区间按区间分段展示，R2）----
+    print("\n=== 局部精修差异（选区原文 -> 改后）===")
+    for (lo, hi), old, new in zip(spans, old_texts, results):
+        tag = f"第{lo}段" if lo == hi else f"第{lo}-{hi}段"
+        print(f"\n--- {tag} ---")
+        if new == old:
+            print("（无变化）")
+            continue
+        diff_text = "".join(difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile="原文", tofile="改后", n=1,
+        ))
+        print(diff_text if diff_text else "（无变化）")
+
+    # ---- 确认存回 ----
+    try:
+        answer = input("\n确认存回？(y/n)：").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n已取消。")
+        return
+    if answer != "y":
+        print("已放弃，原文件未改动。")
+        return
+
+    new_content = apply_replacements(text, blocks, spans, results)
+    # 逐字节保真：write_bytes（不用 write_text，防 \n 翻译成 os.linesep）
+    path.write_bytes(new_content.encode("utf-8"))
+    print(f"✅ 已存回：{path}")
+
+    # ---- P1 run 留痕（确认 y 之后才落盘，取消不留痕，见 design.md §5.6）----
+    run_id = "partial_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    record = {
+        # replay 直读的必需键（harness.replay 无缺键容错，缺任一 KeyError）
+        "run_id": run_id,
+        "task": task,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "config": {
+            "mode": "partial-refine",
+            "model": settings.model,
+            "temperature": 0.6,
+            "max_tokens": 4096,
+        },
+        "initial_state": {"task": task},
+        "steps": [],  # 局部精修不走状态机，replay 打印「共 0 步」
+        "final_state": {"final_chapter": new_content},  # 回填后全文
+        # partial 特有：mode/文件路径/选区区间/各区间原文改后/确认结果
+        "mode": "partial-refine",
+        "file": str(path),
+        "spans": [[lo, hi] for lo, hi in spans],
+        "changes": [
+            {"span": [lo, hi], "old": old, "new": new}
+            for (lo, hi), old, new in zip(spans, old_texts, results)
+        ],
+        "confirmed": True,
+    }
+    try:
+        run_file = save_run(record, settings)
+        print(f"📝 运行日志：{run_file}")
+    except Exception as e:
+        print(f"(运行日志写入失败：{e})")
+
+    print("📚 更新向量库...")
+    try:
+        agent.rag.add_document(file_path)
+    except Exception as e:
+        print(f"(索引更新失败：{e})")
+
+
 def _do_index(args: List[str], settings: Settings) -> None:
     """index 子命令：无参=状态+帮助；rebuild=全量重建；add/remove <路径>=单文件增删。"""
     try:
@@ -347,6 +530,10 @@ def _do_status(settings: Settings) -> None:
     if settings.chapter_path.exists():
         chapters = list(settings.chapter_path.glob("*.md"))
         print(f"已生成章节文件：{len(chapters)} 个 @ {settings.chapter_path}")
+    # 0.5：文风基准语料清单（文件数/总字数，截断前的真实体量）
+    if settings.exemplar_subpath and settings.exemplar_full.exists():
+        files, chars = exemplar_info(settings.exemplar_full)
+        print(f"文风基准：{files} 个文件，共 {chars} 字 @ {settings.exemplar_full}")
 
 
 def _do_replay(args: List[str], settings: Settings) -> None:
@@ -394,6 +581,7 @@ def _print_help() -> None:
     print("  写第N章：标题     走完整流程写一章（查设定->草稿->润色->审稿->存文件->打分）")
     print("  精修 <文件路径>   精修已有正文（润色->审稿->存回->更新索引，不写新场景）")
     print("  重写 <文件路径>   重写已有正文（writer参考原文重写->润色->审稿->存回，能大幅扩写）")
+    print("  改 <文件路径>     局部精修（列出段落->选段 3/3-5/3,7->只润色选区->diff 确认->逐字节存回）")
     print("  index            查看向量库；index rebuild 全量重建；index add/remove <路径> 单文件增删")
     print("  replay <run_id>  回放某次写作过程")
     print("  eval <run_id>    对某次写作打分")
@@ -445,6 +633,8 @@ def main() -> None:
                 _do_refine(args, settings)
             elif cmd == "重写":
                 _do_rewrite(args, settings)
+            elif cmd == "改":
+                _do_partial(args, settings)
             elif cmd == "index":
                 _do_index(args, settings)
             elif cmd in ("状态", "status"):

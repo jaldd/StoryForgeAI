@@ -12,6 +12,8 @@ NOVEL_DIR=/path/to/your/novel
 # NOVEL_CHAPTER_SUBDIR=正文/AI生成
 # NOVEL_EXEMPLAR=文风基准/1.txt
 # NOVEL_INSTRUCTION=写作指令.md
+# 写作铁律（0.2 外置）：注入 writer/polisher/reviewer 的硬性约束全文。
+# NOVEL_RULES=写作铁律.md
 
 # ---- Agent 运行时（可选；不设则默认放 <NOVEL_DIR>/.agent/ 下）----
 # NOVEL_RUNS_DIR=

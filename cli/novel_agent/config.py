@@ -44,8 +44,9 @@ class Settings:
 
     # --- 小说内相对路径（相对 novel_dir）---
     chapter_subdir: str = "正文/AI生成"   # NOVEL_CHAPTER_SUBDIR
-    exemplar_subpath: str = "文风基准/1.txt"  # NOVEL_EXEMPLAR（相对 novel_dir；留空则不用范例）
+    exemplar_subpath: str = "文风基准"    # NOVEL_EXEMPLAR（目录或单文件，相对 novel_dir；留空则不用范例）
     instruction_subpath: str = "写作指令.md"  # NOVEL_INSTRUCTION（相对 novel_dir；留空则不加载写作指令全文）
+    rules_subpath: str = "写作铁律.md"       # NOVEL_RULES（相对 novel_dir；留空则不加载铁律）
     index_exclude: str = "正文"          # NOVEL_INDEX_EXCLUDE：建索引时跳过的目录名（逗号分隔），默认排除正文（300章太慢）
 
     # --- Agent 运行时（默认放 novel_dir/.agent，可覆盖到别处）---
@@ -96,6 +97,11 @@ class Settings:
         return self.novel_path / self.instruction_subpath if self.instruction_subpath else self.novel_path
 
     @property
+    def rules_full(self) -> Path:
+        """写作铁律文件（novel_dir 内的相对路径，0.2 外置铁律）。"""
+        return self.novel_path / self.rules_subpath if self.rules_subpath else self.novel_path
+
+    @property
     def runs_path(self) -> Path:
         """run 日志目录：显式 runs_dir 优先，否则 <novel_dir>/.agent/runs。"""
         if self.runs_dir:
@@ -143,8 +149,9 @@ def get_settings() -> Settings:
         novel_name=os.environ.get("NOVEL_NAME", "本小说"),
         novel_dir=os.environ.get("NOVEL_DIR", ""),
         chapter_subdir=os.environ.get("NOVEL_CHAPTER_SUBDIR", "正文/AI生成"),
-        exemplar_subpath=os.environ.get("NOVEL_EXEMPLAR", "文风基准/1.txt"),
+        exemplar_subpath=os.environ.get("NOVEL_EXEMPLAR", "文风基准"),
         instruction_subpath=os.environ.get("NOVEL_INSTRUCTION", "写作指令.md"),
+        rules_subpath=os.environ.get("NOVEL_RULES", "写作铁律.md"),
         index_exclude=os.environ.get("NOVEL_INDEX_EXCLUDE", "正文"),
         runs_dir=os.environ.get("NOVEL_RUNS_DIR", ""),
         chroma_dir=os.environ.get("NOVEL_CHROMA_DIR", ""),

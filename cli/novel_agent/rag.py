@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -18,6 +19,7 @@ from .config import Settings, get_settings
 __all__ = ["RAGStore", "chunk_text", "classify_type", "load_documents"]
 
 COLLECTION_NAME = "novel_kb"
+MANIFEST_NAME = "rebuild_manifest.json"  # 0.6：rebuild 块 id 清单，存 chroma_path 下
 
 
 # ---------- 纯函数（不依赖 settings / 联网，可单测）----------
@@ -137,7 +139,7 @@ class RAGStore:
     用法：
         store = RAGStore()
         store.build_index()                 # 首次建库
-        hits = store.retrieve("云依是谁")   # 检索
+        hits = store.retrieve("主角是谁")   # 检索
     测试：
         store = RAGStore(embed_fn=FakeEF(), client=FakeChroma())
     """
@@ -184,21 +186,59 @@ class RAGStore:
                     all_chunks.append((piece, path))
         return all_chunks
 
+    # -- rebuild manifest（0.6 陈块精确清理）--
+    def _load_manifest(self) -> List[str]:
+        """上次 rebuild 写入的块 id 清单；文件不存在/损坏返回 []（不阻断本次 rebuild）。"""
+        p = self.settings.chroma_path / MANIFEST_NAME
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            ids = data.get("ids", [])
+            return [i for i in ids if isinstance(i, str)]
+        except (OSError, ValueError):
+            return []
+
+    def _save_manifest(self, ids: List[str]) -> None:
+        """记录本次 rebuild 写入的块 id，供下次精确清理；写失败不阻断。"""
+        p = self.settings.chroma_path / MANIFEST_NAME
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                json.dumps({"ids": ids, "count": len(ids)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     def build_index(self, batch_size: int = 50, progress=print) -> int:
-        """把所有切块向量化并存入 Chroma（持久化）。返回索引块数。"""
+        """把所有切块向量化并存入 Chroma（持久化）。返回索引块数。
+
+        0.6 陈块精确清理：rebuild 只负责自己写入的 c* 块（manifest 记录 id
+        清单，存 chroma_path 下），下次 rebuild 先按清单精确删旧块再 upsert。
+        不碰 index add 写入的章节块（id 形如 {文件名}_{i}，两套 id 不冲突）。
+        """
         collection = self._collection_obj()
+        old_ids = self._load_manifest()
+        if old_ids:
+            collection.delete(ids=old_ids)
+            if progress:
+                progress(f"  已按 manifest 精确清理上次 rebuild 的 {len(old_ids)} 块陈块")
         chunks = self.build_all_chunks()
         total = len(chunks)
         done = 0
+        new_ids: List[str] = []
         for start in range(0, total, batch_size):
             batch = chunks[start:start + batch_size]
             docs = [text for text, _ in batch]
             metas = [{"source": src, "type": classify_type(src)} for _, src in batch]
             ids = [f"c{start + j}" for j in range(len(batch))]
+            new_ids.extend(ids)
             collection.upsert(ids=ids, documents=docs, metadatas=metas)
             done += len(batch)
             if progress:
                 progress(f"  已索引 {done}/{total}")
+        self._save_manifest(new_ids)
         if progress:
             progress(f"✅ 已索引 {total} 块到 Chroma（存于 {self.settings.chroma_path}）")
         return total

@@ -1,9 +1,9 @@
-"""MultiAgent 编排：director -> writer -> polisher -> reviewer 状态机。
+"""MultiAgent 编排：writer -> polisher -> reviewer 状态机。
 
 从 py/multiagent_novel.py 迁移，生产化：
 - 去模块级全局（client/EXEMPLAR/rag._collection），改为 NovelAgent 持有依赖
 - writer/polisher/reviewer 注入 LLMClient/RAGStore/exemplar，可测试
-- WorkingMemory 注入：writer 把"当前写作状态"塞进上下文，实现跨章连续性（P1）
+- WorkingMemory 注入：writer/polisher/reviewer 把"当前写作状态"塞进上下文，实现跨章连续性
 - run() 返回 (state, record)，落盘交给 storage（T8），不在本模块写文件
 """
 from __future__ import annotations
@@ -16,7 +16,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .config import Settings, get_settings
 from .llm import LLMClient
 from .memory import WorkingMemory
+from .partial import Block, build_context_pair
 from .prompts import (
+    COMPARE_SYSTEM,
+    PARTIAL_REFINE_SUFFIX,
+    PLOT_SUMMARY_SYSTEM,
+    partial_refine_user,
     polisher_system,
     reviewer_system,
     writer_system,
@@ -38,13 +43,16 @@ def _review_result(data: dict) -> Tuple[bool, str]:
     return passed, reason
 
 
-def parse_review(text: str) -> Tuple[bool, str]:
+def parse_review(text: str) -> Tuple[Optional[bool], str]:
     """解析审稿 JSON，返回 (是否通过, 原因)。容错 LLM 不规范输出。
 
     1) 直接 json.loads；
     2) 失败则取第一个 { 到最后一个 } 之间再解析；
     3) JSON 截断（没结尾 }）：补 } 再试；
-    4) 都失败才兜底。
+    4) 都失败：文本含"不通过"/"false" 保守判不通过；否则返回 None（不可解析）。
+
+    None 意味着不静默过审（0.1）：判定权上交--REPL 走人工确认，
+    未来批量模式注入恒"弃"的 confirm 即 fail-closed，见 specs/stage0-batch。
     """
     # 1) 直接解析
     try:
@@ -68,10 +76,10 @@ def parse_review(text: str) -> Tuple[bool, str]:
                 return _review_result(json.loads(snippet))
             except json.JSONDecodeError:
                 pass
-    # 4) 最终兜底
+    # 4) 最终兜底：不再默认通过（fail-open 是 0.1 要消灭的行为）
     if "不通过" in text or "false" in text.lower():
         return False, text[:200]
-    return True, "（解析失败，默认通过）"
+    return None, "（审稿结果不可解析）"
 
 
 def _strip_polisher_meta(text: str) -> str:
@@ -98,6 +106,24 @@ def _strip_polisher_meta(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _strip_code_fence(text: str) -> str:
+    """剥掉 LLM 偶尔给整段输出套的 ``` 围栏（含 ```markdown 等语言标记）。
+
+    非 ``` 开头原样返回；只有开头围栏没有结尾的取首行之后全部。
+    """
+    s = text.strip()
+    if not s.startswith("```"):
+        return text
+    first_nl = s.find("\n")
+    if first_nl == -1:
+        return ""
+    body = s[first_nl + 1:]
+    stripped = body.rstrip()
+    if stripped.endswith("```"):
+        body = stripped[:-3]
+    return body.strip()
+
+
 class NovelAgent:
     """小说创作 Agent：四角色状态机编排。
 
@@ -114,16 +140,23 @@ class NovelAgent:
         working_memory: Optional[WorkingMemory] = None,
         max_reviews: Optional[int] = None,
         max_rounds: Optional[int] = None,
+        review_confirm: Optional[Callable[[str], str]] = None,
+        rules: str = "",
     ):
         self.llm = llm
         self.rag = rag
         self.exemplar = exemplar
         self.instruction = instruction
+        # 0.2：写作铁律全文（NOVEL_DIR 下「写作铁律.md」），注入 writer/polisher/reviewer。
+        self.rules = rules
         self.settings = settings or get_settings()
         self.novel_name = self.settings.novel_name
         self.working_memory = working_memory
         self.max_reviews = self.settings.max_reviews if max_reviews is None else max_reviews
         self.max_rounds = self.settings.max_rounds if max_rounds is None else max_rounds
+        # 0.1：审稿结果不可解析时的人工确认函数（prompt -> 应答）。
+        # None = REPL 交互 input；未来批量模式注入恒"弃"（返回"n"）即 fail-closed。
+        self.review_confirm = review_confirm
         # reviewer 打回目标：run 走 writer，refine 走 polisher（无 writer）
         self._reject_target = "writer"
 
@@ -186,7 +219,7 @@ class NovelAgent:
         """写手：查设定 + 调模型产出初稿。"""
         print("  ✍️  写作中（约30秒）...")
         retrieved = self._retrieve(state.task)
-        system = writer_system(self.novel_name, retrieved, self.exemplar, self.instruction) + self._working_context()
+        system = writer_system(self.novel_name, retrieved, self.exemplar, self.instruction, self.rules) + self._working_context()
 
         feedback_hint = ""
         if state.feedback and "不通过" in state.feedback:
@@ -202,7 +235,7 @@ class NovelAgent:
             )
         else:
             user_msg = (
-                f"写一段新章节：{state.task}。约200字，不要解释风代表什么。"
+                f"写一段新章节：{state.task}。约200字。"
                 f"\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
                 f"{feedback_hint}"
             )
@@ -229,7 +262,7 @@ class NovelAgent:
         print("  🔧 润色中（约30秒）...")
         retrieved = self._retrieve(state.task)
         system = polisher_system(
-            self.novel_name, retrieved, self.instruction
+            self.novel_name, retrieved, self.instruction, rules=self.rules
         )
         # 防止 GLM 把 --- 当结束标记截断，预处理换掉，润色后换回
         draft_safe = state.draft.replace("\n---\n", "\n【场景分隔】\n")
@@ -262,9 +295,41 @@ class NovelAgent:
         state.log.append(f"[polisher] 完成，{len(state.polished)} 字")
         state.next_agent = "reviewer"
 
+    def _confirm_unparseable(self, state: PipelineState, raw: str) -> bool:
+        """审稿结果不可解析时的人工确认：True=存（定稿），False=弃（不定稿不存盘）。
+
+        - 显著警告（控制台 + state.log 双留痕，含原始返回前 200 字）；
+        - review_confirm 注入时用它应答；未注入走 REPL input（EOF/Ctrl-C 视为弃，保守）。
+        """
+        print("  ⚠️  审稿结果不可解析（非 JSON），无法机器判定，不静默过审！")
+        if raw:
+            print(f"      原始返回前200字：{raw[:200]}")
+        state.log.append(f"[reviewer] ⚠️ 审稿结果不可解析，原始返回前200字：{raw[:200]}")
+        prompt = "  人工确认：本稿是否定稿保存？(存=y / 弃=n)："
+        try:
+            if self.review_confirm is not None:
+                answer = str(self.review_confirm(prompt))
+            else:
+                answer = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer.strip().lower().startswith("y"):
+            state.feedback = "审稿通过（审稿结果不可解析，人工确认存稿）"
+            state.log.append("[reviewer] 人工确认：存（定稿）")
+            return True
+        state.feedback = "审稿不通过（审稿结果不可解析，人工确认弃稿，本章未定稿）"
+        state.log.append("[reviewer] 人工确认：弃（本章未定稿，不存盘）")
+        return False
+
     def _reviewer(self, state: PipelineState) -> None:
-        """审稿人：通过则定稿，不通过则打回 writer。"""
+        """审稿人：通过则定稿，不通过则打回 writer。
+
+        审稿返回不可解析（parse_review 为 None）时不静默过审（0.1）：
+        显著警告 + 人工确认存/弃--存则定稿留痕，弃则流程结束不定稿
+        （final_chapter 保持空，cli 侧自然不保存章节，fail-closed）。
+        """
         if state.review_count >= self.max_reviews:
+            print(f"  ⚠️  审稿打回已达上限 {self.max_reviews} 次，强制定稿（逃生门，防死循环）")
             state.feedback = f"审稿通过（已达打回上限 {self.max_reviews} 次，强制定稿）"
             state.final_chapter = state.polished
             state.log.append(f"[reviewer] {state.feedback}")
@@ -273,7 +338,7 @@ class NovelAgent:
 
         print("  🔍 审稿中（约10秒）...")
         retrieved = self._retrieve(state.task, with_prior=False)
-        system = reviewer_system(self.novel_name, retrieved, self.instruction)
+        system = reviewer_system(self.novel_name, retrieved, self.instruction, self.rules)
         result = self.llm.chat(
             system,
             f"请审查以下稿件：\n\n{state.polished}",
@@ -281,8 +346,17 @@ class NovelAgent:
             temperature=0.2,
         )
         passed, reason = parse_review(result)
-        if "解析失败" in reason and result:
-            state.log.append(f"[reviewer] 解析失败，原始返回前200字：{result[:200]}")
+
+        if passed is None:
+            # 0.1：不可解析不静默过审，交人工确认（存/弃），不走打回循环
+            if self._confirm_unparseable(state, result or ""):
+                state.final_chapter = state.polished
+                print(f"  ✅ {state.feedback}")
+                state.log.append(f"[reviewer] {state.feedback}")
+            else:
+                print(f"  🗑️ {state.feedback}")
+            state.next_agent = "done"
+            return
 
         if passed:
             state.feedback = f"审稿通过：{reason}"
@@ -430,3 +504,42 @@ class NovelAgent:
         steps: List[dict] = []
         self._run_loop(state, rewrite_agents, steps)
         return state, self._record(run_id, task, temperature, state, steps)
+
+    def partial_refine(
+        self,
+        blocks: List[Block],
+        spans: List[Tuple[int, int]],
+        task: str,
+        run_id: Optional[str] = None,
+    ) -> List[Optional[str]]:
+        """局部精修：对每个编号区间独立调一次 LLM 润色，返回各区间的改写文本。
+
+        - system = polisher_system(...) + PARTIAL_REFINE_SUFFIX；user = 三段式标记
+          （上文 / 待润色片段 / 下文，见 prompts.partial_refine_user）。
+        - 检索复用 _retrieve(task)（task 形如「局部精修：<文件名>」）。
+        - 输出过 _strip_polisher_meta + 剥代码围栏；空回记为失败（该区间为 None 项）。
+        - 不走 _run_loop 状态机；KeyboardInterrupt 等异常向上传播，由 cli 捕获视为取消。
+        """
+        index_of = {b.no: i for i, b in enumerate(blocks) if b.no is not None}
+        retrieved = self._retrieve(task)
+        system = polisher_system(
+            self.novel_name, retrieved, self.instruction, rules=self.rules
+        ) + PARTIAL_REFINE_SUFFIX
+
+        results: List[Optional[str]] = []
+        for lo, hi in spans:
+            first_i, last_i = index_of[lo], index_of[hi]
+            # 选区 = 区间覆盖的全部块（含区间内夹的 sep 等）的 body，块间空行连接
+            selection = "\n\n".join(b.body for b in blocks[first_i:last_i + 1])
+            before, after = build_context_pair(blocks, (lo, hi))
+            label = f"第{lo}段" if lo == hi else f"第{lo}-{hi}段"
+            print(f"  🔧 局部润色中（{label}，约30秒）...")
+            raw = self.llm.chat(
+                system,
+                partial_refine_user(before, selection, after),
+                max_tokens=4096,
+                temperature=0.6,
+            )
+            text = _strip_code_fence(_strip_polisher_meta(raw or ""))
+            results.append(text if text.strip() else None)
+        return results

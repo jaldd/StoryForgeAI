@@ -1,40 +1,101 @@
-"""写作铁律、文风金标准、各 Agent 的 system prompt。
+"""文风金标准、写作指令/铁律注入、各 Agent 的 system prompt。
 
 集中管理，消除 py/ 下 multiagent_novel / agent_tools / agent_memory_integrated
 三处重复的提示词。本模块不依赖 config，便于单测。
+
+铁律外置（0.2）：写作铁律不再硬编码在本模块，由小说方在 NOVEL_DIR 下
+维护「写作铁律.md」，cli 加载后全文注入各 system prompt（见 _rules_block）。
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 __all__ = [
-    "RULES",
+    "EXEMPLAR_MAX_CHARS",
     "load_exemplar",
+    "exemplar_info",
     "writer_system",
     "polisher_system",
     "reviewer_system",
     "EVALUATOR_RUBRIC",
     "PLOT_SUMMARY_SYSTEM",
+    "COMPARE_SYSTEM",
     "SUMMARIZER_SYSTEM",
+    "PARTIAL_REFINE_SUFFIX",
+    "partial_refine_user",
 ]
 
-# ---------- 写作铁律（取 py/ 下最完整的 8 条版本）----------
-# 注：铁律里"男主/女主/云依"等是《当前小说》的设定，由小说方在设定文档里维护；
-# 这里是默认范例，实际写作约束以 NOVEL_DIR 下设定 + exemplar 为准。
-RULES = """【写作铁律】
-1. 男主不取名，全文用"他"（前4章正文禁止出现男主本名三字）
-2. 女主叫云依
-3. 天气线（风/雨/雪/晴/裂）不解释来源，它是男主内心的"心电图"
-4. 女主不"治愈"男主--她只是"在"，不追问、不替他解决
-5. 男主的"修仙"是错的（逃避、玄学）
-6. 男性朋友不交心，只在场
-7. 所有心动和第一次都是彼此的
-8. 温柔不抑郁--即使写痛，也要有光"""
+# exemplar 注入上限（0.5）：中文 1 字≈1 token 的保守近似，不引入 tokenizer（见 design.md D4）。
+EXEMPLAR_MAX_CHARS = 30000
 
 
-def load_exemplar(path: str | Path) -> str:
-    """读文风金标准文件（写作时照搬其短句/留白/克制风格）。"""
-    return Path(path).read_text(encoding="utf-8")
+def _exemplar_files(path: str | Path) -> list[Path]:
+    """exemplar 路径 -> 语料文件清单：单文件就它自己；目录取排序后的 *.txt/*.md。"""
+    p = Path(path)
+    if p.is_file():
+        return [p]
+    if p.is_dir():
+        return sorted(
+            q for q in p.iterdir()
+            if q.is_file() and q.suffix.lower() in (".txt", ".md")
+        )
+    return []
+
+
+def load_exemplar(
+    path: str | Path,
+    max_chars: int = EXEMPLAR_MAX_CHARS,
+    progress=print,
+) -> str:
+    """读文风金标准语料（0.5 目录化；写作时照搬其短句/留白/克制风格）。
+
+    - 路径是单文件 -> 读它；是目录 -> 按文件名排序读入全部 *.txt/*.md，\\n\\n 拼接；
+    - 不存在 -> 空串；单个文件读失败 -> progress 提示后跳过，不阻断；
+    - 累计超出 max_chars 按文件序截断（不抽样，排序靠前的基准优先保住），progress 打日志。
+    """
+    files = _exemplar_files(path)
+    if not files:
+        return ""
+    texts: list[str] = []
+    for f in files:
+        try:
+            texts.append(f.read_text(encoding="utf-8"))
+        except OSError as e:
+            progress(f"(跳过不可读的文风基准文件：{f.name}（{e}）)")
+    full = "\n\n".join(texts)
+    if len(full) <= max_chars:
+        return full
+    # 超限：按文件序装到满为止（分隔符计入预算）
+    parts: list[str] = []
+    kept = 0
+    for t in texts:
+        used = sum(len(p) for p in parts) + 2 * len(parts)
+        budget = max_chars - used
+        if len(t) <= budget:
+            parts.append(t)
+            kept += 1
+        else:
+            if budget > 0:
+                parts.append(t[:budget])
+            break
+    result = "\n\n".join(parts)[:max_chars]
+    progress(
+        f"⚠️ 文风基准语料共 {len(full)} 字，超过注入上限 {max_chars} 字，"
+        f"按序保留前 {kept} 个文件（共 {len(texts)} 个），其余截断不注入"
+    )
+    return result
+
+
+def exemplar_info(path: str | Path) -> tuple[int, int]:
+    """文风基准语料清单：(文件数, 总字数)，供状态命令展示；不存在返回 (0, 0)。"""
+    files = _exemplar_files(path)
+    total = 0
+    for f in files:
+        try:
+            total += len(f.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return len(files), total
 
 
 def _instruction_block(instruction: str) -> str:
@@ -42,42 +103,47 @@ def _instruction_block(instruction: str) -> str:
     return f"【写作指令】（必须遵守）\n{instruction}\n" if instruction.strip() else ""
 
 
+def _rules_block(rules: str) -> str:
+    """写作铁律块（0.2 外置到 NOVEL_DIR 下「写作铁律.md」，全文注入）；空则返回空串不占位。"""
+    return f"【写作铁律】（绝对不能违反）\n{rules}\n" if rules.strip() else ""
+
+
 # ---------- 各 Agent 的 system prompt ----------
-def writer_system(novel_name: str, retrieved: str, exemplar: str, instruction: str = "") -> str:
+def writer_system(novel_name: str, retrieved: str, exemplar: str, instruction: str = "", rules: str = "") -> str:
     return f"""你是小说《{novel_name}》的创作助手，必须严格模仿以下文风写作。
-{RULES}
-{_instruction_block(instruction)}{retrieved}
+{_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
 【风格范例】
 {exemplar}
 """
 
 
-def polisher_system(novel_name: str, retrieved: str, instruction: str = "", target_words: int = 1500) -> str:
+def polisher_system(novel_name: str, retrieved: str, instruction: str = "", target_words: int = 1500, rules: str = "") -> str:
     return f"""你是小说《{novel_name}》的文字润色师。
 任务：对下面的初稿做润色，让文字更流畅、有文采、节奏更好。
 如果初稿太短或内容不够，可以适当扩写补充细节，但不要改变核心情节。
+目标篇幅：约{target_words}字。初稿明显不足时扩写补充细节；已达标则不必硬凑。
 铁律（绝对不能违反）：
-1. 只优化文字表达，严禁改动人物称呼（男主始终用"他"、女主叫云依）
-2. 严禁改动剧情、伏笔、天气线（风/雨/雪/晴/裂）的隐喻含义
+1. 只优化文字表达，严禁改动人物称呼与人物设定
+2. 严禁改动剧情、伏笔与既有意象的隐喻含义
 3. 初稿里守住的设定，润色后必须原样保留
+{_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
 只返回润色后的正文，不要加任何标题、说明、注释。不要写"润色后正文"，不要写"润色说明"，直接返回正文内容。
-{_instruction_block(instruction)}{retrieved}
 """
 
 
-def reviewer_system(novel_name: str, retrieved: str, instruction: str = "") -> str:
+def reviewer_system(novel_name: str, retrieved: str, instruction: str = "", rules: str = "") -> str:
     return f"""你是小说《{novel_name}》的审稿编辑。
 任务：审查以下稿件，判断是否合格。
 审查维度：
-1. 人物一致性：是否符合设定（男主用"他"、女主叫云依等）
+1. 人物一致性：是否符合设定（人物称呼、人设等）
 2. 文风一致性：是否短句为主、克制留白、不解释因果
 3. 剧情连贯性：逻辑是否自洽
 4. 时间线一致性：时间/季节/昼夜是否合理
-5. 环境一致性：场景/天气线是否连贯
+5. 环境一致性：场景/意象是否连贯
 6. 伏笔一致性：有没有矛盾或遗漏
 
 
-{_instruction_block(instruction)}{retrieved}
+{_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
 
 只返回纯 JSON，格式如下，不要加任何其他文字、不要用 ```json 包裹：
 {{"pass": true/false, "reason": "总评（不超过30字）", "issues": ["问题1", "问题2", "问题3"]}}
@@ -88,7 +154,7 @@ def reviewer_system(novel_name: str, retrieved: str, instruction: str = "") -> s
 # ---------- 评测 / 摘要 prompt ----------
 EVALUATOR_RUBRIC = """你是小说评稿评委。请从以下维度给稿件打分，每维 1-5 分（5=最好）：
 1. 连贯性：剧情/逻辑是否自洽，有无突兀跳跃
-2. 人物一致性：是否符合设定（男主用"他"、女主叫云依、风是内心心电图）
+2. 人物一致性：是否符合设定
 3. 剧情合理性：情感与行为动机是否合理、不悬浮
 4. 标题评分：章节标题是否贴切、有味道
 理由不超过100字，简洁说明即可。只返回 JSON，不要 markdown 包裹、不要加任何其他文字：
@@ -100,3 +166,36 @@ SUMMARIZER_SYSTEM = "把下面的对话压成 3 句话摘要，只留对小说�
 PLOT_SUMMARY_SYSTEM = (
     "把下面的小说章节压成 1-2 句话剧情摘要，只记关键情节与情绪落点，不要评价、不要复述全文。"
 )
+
+
+# ---------- 版本对比 prompt（0.8 从 cli._is_better 收编） ----------
+COMPARE_SYSTEM = (
+    "你是小说编辑。对比两段文字，判断第二段（润色后）是否比第一段（原文）更好。"
+    "只返回纯 JSON：{\"better\": true/false}"
+)
+
+
+# ---------- 局部精修（partial-refine）prompt ----------
+# 追加在 polisher_system 之后：只润色片段本身，上下文仅供理解。
+# 不复制 polisher 的铁律文案（铁律外迁重构时此处零成本跟随，见 design.md §5.2）。
+PARTIAL_REFINE_SUFFIX = """【局部精修特别说明】
+接下来只对一个片段做局部润色：
+1. 只润色给出的片段，情节不动，只改文字表达
+2. 只返回改写后的片段本身，不要补写上下文，不要返回整章
+3. 不要加任何标题、说明、注释，不要用代码围栏包裹返回结果
+4. 上文、下文仅供理解语境，不要改写它们，也不要把它们包含在返回结果里
+"""
+
+
+def partial_refine_user(before: str, selection: str, after: str) -> str:
+    """局部精修的 user prompt：三段式标记（上文/待润色片段/下文）。
+
+    before/after 为空串时对应占位段不出现（文件首段无上文、末段无下文）。
+    """
+    parts = []
+    if before:
+        parts.append(f"【上文（勿改写，勿返回）】\n{before}")
+    parts.append(f"【待润色片段（只返回这段的改写结果）】\n{selection}")
+    if after:
+        parts.append(f"【下文（勿改写，勿返回）】\n{after}")
+    return "\n\n".join(parts)

@@ -1,4 +1,5 @@
 """rag 模块纯函数测试（不联网、不依赖 Chroma）。"""
+import json
 from pathlib import Path
 
 from novel_agent.rag import chunk_text, classify_type, load_documents
@@ -124,7 +125,7 @@ def _store(tmp_path):
 def test_add_remove_document(tmp_path):
     """add 分块入库（id=文件名_序号，source=绝对路径），remove 按 source 清空。"""
     novel, store = _store(tmp_path)
-    (novel / "人物.md").write_text("云依是女主。" * 200, encoding="utf-8")  # 多块
+    (novel / "人物.md").write_text("林晚是女主。" * 200, encoding="utf-8")  # 多块
     n = store.add_document("人物.md", progress=None)
     assert n > 1
     coll = store._collection_obj()
@@ -171,3 +172,63 @@ def test_add_document_missing_file(tmp_path):
         assert False, "应抛错"
     except FileNotFoundError:
         pass
+
+
+# ---------- build_index manifest（0.6 rebuild 陈块精确清理）----------
+def test_rebuild_first_time_writes_manifest(tmp_path):
+    """首建（无 manifest）：不清理直接写块，结束时落 manifest 供下次精确清理。"""
+    novel, store = _store(tmp_path)
+    (novel / "人物.md").write_text("林晚是女主。" * 100, encoding="utf-8")
+    total = store.build_index(progress=None)
+    coll = store._collection_obj()
+    assert coll.count() == total
+    assert all(i.startswith("c") for i in coll.data)  # rebuild 块 id 为 c*
+    manifest = novel / ".agent" / "chroma_db" / "rebuild_manifest.json"
+    assert manifest.exists()
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    assert data["count"] == total and len(data["ids"]) == total
+
+
+def test_rebuild_removes_stale_blocks_after_file_deleted(tmp_path):
+    """删设定文件后 rebuild：该文件的所有陈块清零，不留孤儿。"""
+    novel, store = _store(tmp_path)
+    (novel / "人物.md").write_text("甲" * 1000, encoding="utf-8")
+    (novel / "总纲.md").write_text("乙" * 500, encoding="utf-8")
+    store.build_index(progress=None)
+    coll = store._collection_obj()
+    assert coll.count() > 0
+    src = str(novel / "人物.md")
+    (novel / "人物.md").unlink()
+    store.build_index(progress=None)
+    assert [v for v in coll.data.values() if v["metadata"]["source"] == src] == []
+    assert all("人物" not in v["metadata"]["source"] for v in coll.data.values())
+
+
+def test_rebuild_keeps_chapter_blocks(tmp_path):
+    """rebuild 只清自己的 c* 块，index add 写入的章节块原样保留。"""
+    novel, store = _store(tmp_path)
+    (novel / "人物.md").write_text("甲" * 800, encoding="utf-8")
+    store.build_index(progress=None)
+    zh = novel / "正文"
+    zh.mkdir()
+    (zh / "001.md").write_text("章节正文。" * 100, encoding="utf-8")
+    n_ch = store.add_document("正文/001.md", progress=None)
+    before = {i for i, v in store._collection_obj().data.items()
+              if v["metadata"]["type"] == "chapter"}
+    assert len(before) == n_ch
+    store.build_index(progress=None)  # 再 rebuild
+    after = {i for i, v in store._collection_obj().data.items()
+             if v["metadata"]["type"] == "chapter"}
+    assert after == before  # 章节块一个不少
+
+
+def test_rebuild_corrupt_manifest_not_fatal(tmp_path):
+    """manifest 损坏：当作无清单处理，rebuild 照常完成。"""
+    novel, store = _store(tmp_path)
+    (novel / "总纲.md").write_text("乙" * 300, encoding="utf-8")
+    m = novel / ".agent" / "chroma_db" / "rebuild_manifest.json"
+    m.parent.mkdir(parents=True)
+    m.write_text("{不是合法JSON", encoding="utf-8")
+    total = store.build_index(progress=None)
+    assert total > 0
+    assert store._collection_obj().count() == total

@@ -55,3 +55,7 @@ dist/
 .pytest_cache/
 .env
 .env.local
+
+# CLI 测试依赖（pip install --target 产物，可随时重建，勿提交）
+cli/.deps/
+cli/pytest_out.txt

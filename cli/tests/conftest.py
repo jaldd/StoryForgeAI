@@ -31,18 +31,34 @@ class FakeLLM(LLMClient):
         if "审查" in user:
             return '{"pass": true, "reason": "通过"}'
         if "润色" in user:
-            return "【润色稿】风起了，云依没说话。"
-        return "【初稿】风起了，他站在路口。云依没说话。"
+            return "【润色稿】风起了，林晚没说话。"
+        return "【初稿】风起了，他站在路口。林晚没说话。"
 
 
 class FakeRag:
     """假 RAG：retrieve 永远返回固定设定，不联网不依赖 Chroma。"""
 
+    def __init__(self, settings=None):
+        self.settings = settings
+        self.add_calls: List[str] = []  # 记录 add_document 调用（供 cli 测试断言）
+
     def retrieve(self, query, top_k=5, doc_type=None):
-        return [("云依是在场的女主，不追问。", "docs/人物.md")] * min(top_k, 1)
+        return [("林晚是在场的女主，不追问。", "docs/人物.md")] * min(top_k, 1)
 
     def search_knowledge(self, query, top_k=5):
-        return "【出自 docs/人物.md】\n云依是在场的女主。"
+        return "【出自 docs/人物.md】\n林晚是在场的女主。"
+
+    def _resolve_source(self, file_path: str) -> str:
+        """同真实 RAGStore：相对路径按 novel_dir 解析，绝对路径原样。"""
+        p = Path(file_path).expanduser()
+        if not p.is_absolute() and self.settings is not None:
+            p = self.settings.novel_path / p
+        return str(p)
+
+    def add_document(self, file_path: str, progress=None) -> int:
+        """记录调用并返回 0（不做真实索引）。"""
+        self.add_calls.append(file_path)
+        return 0
 
 
 @pytest.fixture

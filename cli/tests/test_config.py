@@ -10,11 +10,23 @@ def test_settings_path_resolution(tmp_settings, tmp_path):
     assert tmp_settings.novel_path == novel
     assert tmp_settings.doc_path == novel                       # RAG 索引源 = 小说根
     assert tmp_settings.chapter_path == novel / "正文/AI生成"
-    assert tmp_settings.exemplar_full == novel / "文风基准/1.txt"
+    assert tmp_settings.exemplar_full == novel / "文风基准"    # 0.5 目录级语料
     assert tmp_settings.instruction_full == novel / "写作指令.md"
+    assert tmp_settings.rules_full == novel / "写作铁律.md"      # 0.2 铁律外置
     assert tmp_settings.runs_path == novel / ".agent" / "runs"
     assert tmp_settings.chroma_path == novel / ".agent" / "chroma_db"
     assert tmp_settings.working_memory_path == novel / ".agent" / "runs" / "working_memory.json"
+
+
+def test_rules_subpath_empty(tmp_settings):
+    """rules_subpath 留空时 rules_full 退回 novel_path（不指向文件，_load_rules 返回空）。"""
+    s = Settings(
+        ark_api_key="k",
+        repo_root=tmp_settings.repo_root,
+        novel_dir=tmp_settings.novel_dir,
+        rules_subpath="",
+    )
+    assert s.rules_full == s.novel_path
 
 
 def test_runtime_dir_override(tmp_path):
