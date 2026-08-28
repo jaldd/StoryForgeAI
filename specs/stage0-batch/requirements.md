@@ -1,0 +1,93 @@
+# 需求规格：阶段 0 小项批（stage0-batch）
+
+> Feature: `stage0-batch`
+> 来源：`specs/ROADMAP.md` 条目 0.1 / 0.2 / 0.3 / 0.5 / 0.6（0.4 已完成、0.7/0.8 另行立项）
+> 状态：**已复核，可开工**
+> 遵循 `.specify/memory/constitution.md`。
+
+---
+
+## 1. 背景与目标
+
+五个独立小项，均为阶段 0「修硬伤+快赢」清账项，共同点：不动架构、不动 LLM 技术栈（宪法 §2）、每项可独立验收。
+
+- **0.1 审稿解析失败静默放行 -> 交给人**：`parse_review` 四级解析全失败时返回 `True`（fail-open），审稿返回散文时稿件静默过审。
+- **0.2 铁律硬编码 -> 外置到 NOVEL_DIR**：`prompts.py` 的 `RULES` 及 polisher/reviewer system prompt 硬编码具体小说铁律，违反宪法 §1 小说解耦。
+- **0.3 写完自动入库**：`_do_write` 存章节后不进 Chroma，AI 写的章节互相看不见。
+- **0.5 exemplar 语料目录化**：只接单文件路径，多基准文件时其余金标准从未参与；注入无 token 上限。
+- **0.6 rebuild 陈块清理**：rebuild 只 upsert 不清旧块，设定删除/改名/缩块后陈块残留仍可检索。
+
+## 2. 用户故事
+
+```
+作为小说作者，我想：
+
+0.1 审稿返回乱七八糟的散文时，Agent 大声警告并问我"这稿存还是弃"，
+    而不是悄悄替我判定"通过"；连打回太多次被迫强制定稿时，也有显著警告和日志。
+
+0.2 换一本书写时，只要在小说目录里换一份《写作铁律.md》，
+    writer/polisher/reviewer 的约束就全部跟着换，代码一行不用改。
+
+0.3 写完第 N 章后，写第 N+1 章时 Agent 能检索到第 N 章的真实正文做前文参考。
+
+0.5 文风基准目录里放多少个基准文件都生效（超量按序截断并提示），
+    "状态"命令能看到基准文件数与总字数。
+
+0.6 我删掉某个设定文件后 rebuild，向量库里不会再检索出这个已删除文件的陈旧块；
+    而章节块不受影响。
+```
+
+## 3. 功能列表（P0 全部，本批无 P1/P2）
+
+- [ ] **0.1**：审稿结果四级解析全失败时不默认通过；REPL 显著警告 + `input` 人工确认存/弃；强制定稿逃生门保留且带警告 + run 日志留痕；确认行为可注入（为未来批量模式 fail-closed 留接口）。
+- [ ] **0.2**：铁律从 `NOVEL_DIR` 下文件读取（路径可 env 配置 `NOVEL_RULES`），注入 writer/polisher/reviewer 三处 system prompt；writer 指令里散落的小说硬规则一并收编；CLI 仓库 grep 不到具体小说人物名。
+- [ ] **0.3**：`_do_write` 存盘后自动 `rag.add_document`；章节块元数据 `type=chapter`。
+- [ ] **0.5**：exemplar 加载器升级为目录级（兼容单文件）；注入带字符上限（超限按文件序截断并留日志）；语料清单（文件数/总字数）进 `状态` 命令。
+- [ ] **0.6**：rebuild 维护 manifest（本次写入的 id 清单，存 `NOVEL_CHROMA_DIR` 下）；下次 rebuild 先精确删这份清单再 upsert；不影响章节块（`{文件名}_{i}` id 通道）。
+
+## 4. 验收标准（EARS 式，直接引用 ROADMAP 各条验收）
+
+### 0.1（ROADMAP 0.1）
+
+- **A1** 当审稿返回非 JSON 且不含「不通过」字样时，系统不默认通过，`parse_review` 返回「不可解析」标记（`None`）。
+- **A2** 当审稿结果不可解析且处于 REPL 交互模式时，系统打印显著警告（含原始返回前 200 字）并调用人工确认（存=y / 弃=n）。
+- **A3** 当人工确认「存」时，稿件定稿，feedback 与 run 日志注明「人工确认存稿」。
+- **A4** 当人工确认「弃」时，稿件不定稿、不保存章节文件（fail-closed），run 日志留痕。
+- **A5** 当审稿打回次数达到 `max_reviews` 强制定稿时，系统打印显著警告且 run 日志留痕（原有逃生门行为不变）。
+- **A6** 当以注入的确认函数返回「弃」运行时（模拟未来批量模式），流程同样不定稿--fail-closed 接口就位。
+
+### 0.2（ROADMAP 0.2）
+
+- **A7** 当 `NOVEL_DIR` 下存在铁律文件（默认 `写作铁律.md`，`NOVEL_RULES` 可配）时，writer/polisher/reviewer 的 system prompt 含该文件全文内容。
+- **A8** 当铁律文件不存在时，三处 system prompt 不出现铁律占位块，流程照常。
+- **A9** 新建只含铁律文件的空小说目录写一章，prompt 中铁律内容逐字来自文件而非代码。
+- **A10** CLI 仓库（cli/ 下）grep 不到具体小说人物名（验收基准：`云依` 零命中；测试 fixture 改用虚构名）。
+- **A11** writer 指令中的长度控制（「约200字」）保持代码内不动（归 0.8）。
+
+### 0.3（ROADMAP 0.3）
+
+- **A12** 当写作流程定稿并保存章节后，系统自动对该章节文件调用 `rag.add_document`，向量库块数 +N（N=该章切块数，至少 1）。
+- **A13** 章节块元数据 `type=chapter`（既有 `classify_type` 逻辑覆盖，需回归确认）。
+- **A14** 写第 N+1 章时，前文检索能命中第 N 章（`retrieve(..., doc_type="chapter")`）。
+
+### 0.5（ROADMAP 0.5）
+
+- **A15** 当 exemplar 路径为目录且含 2 个以上基准文件时，加载器全部读入（按文件名排序拼接）。
+- **A16** 当路径为单个文件时，行为与旧版一致（单文件兼容）。
+- **A17** 当语料总量超出注入上限时，按文件顺序截断并打印日志（含原总字数与上限）。
+- **A18** `状态` 命令输出基准文件数与总字数。
+
+### 0.6（ROADMAP 0.6）
+
+- **A19** 当 rebuild 执行时，系统先按上次 manifest 精确删除上次 rebuild 写入的 id，再 upsert 本次切块。
+- **A20** 删一个设定文件后 rebuild，该文件 source 的块数为 0。
+- **A21** rebuild 前后，章节块（`add_document` 写入的 `{文件名}_{i}` 块）数量与内容不变。
+- **A22** manifest 存于 `NOVEL_CHROMA_DIR` 下；首次 rebuild（无 manifest）不清理、不报错。
+
+## 5. 边界（明确不做）
+
+- 不修已知存量失败 3 个（`test_strip_polisher_meta`、`test_runtime_dir_override`、`test_defaults`）。
+- 不动 `specs/ROADMAP.md`、`.specify/`、`openspec/`、Java 侧任何目录。
+- 不动 `.claude/skills/novel-style-check/SKILL.md`（含旧小说名，归 ROADMAP 1.2 词表外置）。
+- 不实现真正的批量/无人值守模式（只留 fail-closed 注入位）。
+- `harness.py` 中硬编码的人物名规则断言（`run_tests`）不在本批范围（归 1.2），仅记录上报。
