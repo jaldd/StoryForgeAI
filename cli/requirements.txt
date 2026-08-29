@@ -1,0 +1,5 @@
+# CLI 运行时依赖（rag.py 的 chromadb/requests 为惰性导入，但写章功能必需）
+openai
+python-dotenv
+requests
+chromadb

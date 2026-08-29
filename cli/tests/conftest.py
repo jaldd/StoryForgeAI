@@ -7,10 +7,24 @@ from typing import List, Optional
 
 import pytest
 
-from novel_agent.config import Settings
+from novel_agent.config import Settings, get_settings
 from novel_agent.llm import LLMClient
 from novel_agent.rag import RAGStore
 from novel_agent.storage import save_run
+
+
+@pytest.fixture(autouse=True)
+def _no_real_env(monkeypatch):
+    """隔离开发者本地 cli/.env（0.7 实配后出现）。
+
+    get_settings() 会 load_dotenv() 读工作目录下的真实 .env（含 CLAUDE_MODEL/
+    NOVEL_DIR 等），使测试结果依赖个人配置。测试进程内替换为 no-op，并用例
+    前后清缓存，保证 get_settings 只吃各测试自己 setenv 的值。
+    """
+    monkeypatch.setattr("novel_agent.config.load_dotenv", lambda *a, **kw: False)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 class FakeLLM(LLMClient):

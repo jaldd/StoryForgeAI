@@ -78,6 +78,56 @@ def test_load_exemplar_skips_unreadable_file(tmp_path, monkeypatch):
     assert any("跳过" in m for m in logs)
 
 
+# ---------- 0.5b 精选清单（00-使用说明.md：说明全文注入 + 清单选样文） ----------
+def test_manifest_selects_subset_in_list_order(tmp_path):
+    """有清单：说明全文作首块 + 清单内样文（清单序即注入序）；说明不算样文。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    (d / "2.txt").write_text("乙", encoding="utf-8")
+    (d / "3.txt").write_text("丙", encoding="utf-8")
+    manifest = "## 使用说明\n给人看的喂法指导。\n\n## 注入清单\n- 3.txt（对话范本）\n- 1.txt\n"
+    (d / "00-使用说明.md").write_text(manifest, encoding="utf-8")
+    assert load_exemplar(d, progress=_quiet) == manifest + "\n\n丙\n\n甲"  # 清单序：3 先于 1
+    assert exemplar_info(d) == (2, len(manifest) + 2)
+
+
+def test_manifest_missing_or_no_list_falls_back_all(tmp_path):
+    """无说明文件 -> 全量样文（0.5 现状）；有说明无清单节 -> 说明 + 全量样文。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    (d / "2.txt").write_text("乙", encoding="utf-8")
+    assert load_exemplar(d, progress=_quiet) == "甲\n\n乙"  # 无说明文件
+
+    manifest = "## 使用说明\n只有备注没有清单"
+    (d / "00-使用说明.md").write_text(manifest, encoding="utf-8")
+    assert load_exemplar(d, progress=_quiet) == manifest + "\n\n甲\n\n乙"  # 说明 + 全量
+    assert exemplar_info(d) == (2, len(manifest) + 2)  # 甲+乙 各 1 字，分隔符不计
+
+
+def test_manifest_unknown_name_warns_and_skips(tmp_path):
+    """清单引用不存在的文件：progress 提示后跳过，其余正常注入。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    manifest = "## 注入清单\n- 1.txt\n- 不存在.txt\n"
+    (d / "00-使用说明.md").write_text(manifest, encoding="utf-8")
+    logs: list[str] = []
+    assert load_exemplar(d, progress=logs.append) == manifest + "\n\n甲"
+    assert any("不存在.txt" in m and "跳过" in m for m in logs)
+
+
+def test_manifest_all_miss_falls_back_all(tmp_path):
+    """清单全落空 -> 说明 + 全量样文兜底（不给空语料）。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    manifest = "## 注入清单\n- 忘了写什么.txt\n"
+    (d / "00-使用说明.md").write_text(manifest, encoding="utf-8")
+    assert load_exemplar(d, progress=_quiet) == manifest + "\n\n甲"
+
+
 # ---------- exemplar_info ----------
 def test_exemplar_info_counts(tmp_path):
     """清单返回 (文件数, 总字数)；路径不存在返回 (0, 0)。"""

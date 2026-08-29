@@ -8,10 +8,12 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 __all__ = [
     "EXEMPLAR_MAX_CHARS",
+    "EXEMPLAR_MANIFEST_NAME",
     "load_exemplar",
     "exemplar_info",
     "writer_system",
@@ -27,6 +29,60 @@ __all__ = [
 
 # exemplar 注入上限（0.5）：中文 1 字≈1 token 的保守近似，不引入 tokenizer（见 design.md D4）。
 EXEMPLAR_MAX_CHARS = 30000
+
+# 精选清单载体（0.5b 人工精选）：文风基准目录下的约定文件，人写、机器照单执行。
+# 「## 注入清单」节内列表项每行一个样文文件名（可带行尾备注）；说明全文本身作首块注入。
+EXEMPLAR_MANIFEST_NAME = "00-使用说明.md"
+
+# 清单行 -> 文件名：须为列表项（- 或 * 开头），取文件名 token（截到空白/全半角括号/冒号逗号）
+_MANIFEST_LINE_RE = re.compile(r"^[-*]\s+([^\s（()：:，,]+)")
+
+
+def _parse_manifest_names(text: str) -> list[str]:
+    """从使用说明文本解析注入清单文件名（按书写顺序）；无「注入清单」节返回空。"""
+    names: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            in_section = "注入清单" in stripped
+            continue
+        if not in_section:
+            continue
+        m = _MANIFEST_LINE_RE.match(stripped)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def _exemplar_corpus(path: str | Path, progress=print) -> tuple[str | None, list[Path]]:
+    """目录级语料：(使用说明全文 or None, 样文文件清单[经精选清单过滤，清单序即注入序])。
+
+    - 单文件路径返回 (None, [它自己])；
+    - 目录：无说明文件 -> (None, 全量样文)；「## 注入清单」节缺失/全落空 -> 说明全文 + 全量样文；
+    - 说明文件本身是喂法指导（见其「推荐喂法」节），作为语料首块注入，不算样文。
+    """
+    files = _exemplar_files(path)
+    p = Path(path)
+    if not p.is_dir():
+        return None, files
+    files = [f for f in files if f.name != EXEMPLAR_MANIFEST_NAME]
+    try:
+        manifest_text = (p / EXEMPLAR_MANIFEST_NAME).read_text(encoding="utf-8")
+    except OSError:
+        return None, files
+    names = _parse_manifest_names(manifest_text)
+    if not names:
+        return manifest_text, files
+    by_name = {f.name: f for f in files}
+    selected: list[Path] = []
+    for n in names:
+        f = by_name.get(n)
+        if f is None:
+            progress(f"(注入清单引用的语料不存在，跳过：{n})")
+        elif f not in selected:
+            selected.append(f)
+    return manifest_text, selected or files
 
 
 def _exemplar_files(path: str | Path) -> list[Path]:
@@ -47,16 +103,19 @@ def load_exemplar(
     max_chars: int = EXEMPLAR_MAX_CHARS,
     progress=print,
 ) -> str:
-    """读文风金标准语料（0.5 目录化；写作时照搬其短句/留白/克制风格）。
+    """读文风金标准语料（0.5 目录化 + 0.5b 精选清单 + 说明全文注入）。
 
-    - 路径是单文件 -> 读它；是目录 -> 按文件名排序读入全部 *.txt/*.md，\\n\\n 拼接；
+    - 路径是单文件 -> 读它；是目录 -> 使用说明全文作首块 + 按注入清单选定的样文，\\n\\n 拼接
+      （无清单则全量样文；说明的「推荐喂法」节即此设计）；
     - 不存在 -> 空串；单个文件读失败 -> progress 提示后跳过，不阻断；
-    - 累计超出 max_chars 按文件序截断（不抽样，排序靠前的基准优先保住），progress 打日志。
+    - 累计超出 max_chars 按序截断（不抽样，靠前的基准优先保住），progress 打日志。
     """
-    files = _exemplar_files(path)
-    if not files:
+    manifest_text, files = _exemplar_corpus(path, progress)
+    if not files and manifest_text is None:
         return ""
     texts: list[str] = []
+    if manifest_text is not None:
+        texts.append(manifest_text)  # 使用说明优先：模型先知道学什么/不学什么
     for f in files:
         try:
             texts.append(f.read_text(encoding="utf-8"))
@@ -87,9 +146,13 @@ def load_exemplar(
 
 
 def exemplar_info(path: str | Path) -> tuple[int, int]:
-    """文风基准语料清单：(文件数, 总字数)，供状态命令展示；不存在返回 (0, 0)。"""
-    files = _exemplar_files(path)
-    total = 0
+    """文风基准有效语料的 (文件数, 总字数)，供状态命令展示。
+
+    与 load_exemplar 同源（_exemplar_corpus），字数含使用说明本身（它也注入）。
+    不存在返回 (0, 0)。
+    """
+    manifest_text, files = _exemplar_corpus(path, progress=lambda *_a, **_kw: None)
+    total = len(manifest_text) if manifest_text is not None else 0
     for f in files:
         try:
             total += len(f.read_text(encoding="utf-8"))
