@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 __all__ = [
     "EXEMPLAR_MAX_CHARS",
     "EXEMPLAR_MANIFEST_NAME",
     "load_exemplar",
     "exemplar_info",
+    "EXEMPLAR_ROUTER_SYSTEM",
+    "exemplar_router_user",
     "writer_system",
     "polisher_system",
     "reviewer_system",
@@ -36,6 +39,10 @@ EXEMPLAR_MAX_CHARS = 30000
 # 精选清单载体（0.5b 人工精选）：文风基准目录下的约定文件，人写、机器照单执行。
 # 「## 注入清单」节内列表项每行一个样文文件名（可带行尾备注）；说明全文本身作首块注入。
 EXEMPLAR_MANIFEST_NAME = "00-使用说明.md"
+
+# 样文标签文件（exemplar-routing）：路由元数据而非语料，不算样文、不注入
+# （config.exemplar_tags_subpath 的默认文件名；若自定义名，请放文风基准目录外，免被当样文）。
+EXEMPLAR_TAGS_FILENAME = "样文标签.md"
 
 # 清单行 -> 文件名：须为列表项（- 或 * 开头），取文件名 token（截到空白/全半角括号/冒号逗号）
 _MANIFEST_LINE_RE = re.compile(r"^[-*]\s+([^\s（()：:，,]+)")
@@ -69,7 +76,10 @@ def _exemplar_corpus(path: str | Path, progress=print) -> tuple[str | None, list
     p = Path(path)
     if not p.is_dir():
         return None, files
-    files = [f for f in files if f.name != EXEMPLAR_MANIFEST_NAME]
+    files = [
+        f for f in files
+        if f.name not in (EXEMPLAR_MANIFEST_NAME, EXEMPLAR_TAGS_FILENAME)
+    ]
     try:
         manifest_text = (p / EXEMPLAR_MANIFEST_NAME).read_text(encoding="utf-8")
     except OSError:
@@ -105,15 +115,29 @@ def load_exemplar(
     path: str | Path,
     max_chars: int = EXEMPLAR_MAX_CHARS,
     progress=print,
+    only_files: Optional[List[str]] = None,
 ) -> str:
     """读文风金标准语料（0.5 目录化 + 0.5b 精选清单 + 说明全文注入）。
 
     - 路径是单文件 -> 读它；是目录 -> 使用说明全文作首块 + 按注入清单选定的样文，\\n\\n 拼接
       （无清单则全量样文；说明的「推荐喂法」节即此设计）；
+    - only_files（exemplar-routing）：非 None 时在上述结果上再按此清单过滤，
+      顺序遵 only_files（路由结果的注入序）；不在目录内的名字跳过并提示；
+      过滤后样文为空时仍返回说明全文（说明照常注入）；
     - 不存在 -> 空串；单个文件读失败 -> progress 提示后跳过，不阻断；
     - 累计超出 max_chars 按序截断（不抽样，靠前的基准优先保住），progress 打日志。
     """
     manifest_text, files = _exemplar_corpus(path, progress)
+    if only_files is not None:
+        by_name = {f.name: f for f in files}
+        selected: list[Path] = []
+        for n in only_files:
+            f = by_name.get(n)
+            if f is None:
+                progress(f"(路由选中的样文不存在，跳过：{n})")
+            elif f not in selected:
+                selected.append(f)
+        files = selected
     if not files and manifest_text is None:
         return ""
     texts: list[str] = []
@@ -162,6 +186,27 @@ def exemplar_info(path: str | Path) -> tuple[int, int]:
         except OSError:
             continue
     return len(files), total
+
+
+# ---------- 样文路由 prompt（exemplar-routing） ----------
+EXEMPLAR_ROUTER_SYSTEM = """你是文风样文路由器。根据本章写作任务，从样文标签列表中选出最适合本次注入的样文。
+
+规则：
+1. 选 3 到 5 篇；宁缺毋滥，场景不贴的不要选
+2. files 必须原样使用标签列表中出现的文件名，不得编造、不得改写
+3. 只返回纯 JSON，不要 markdown 包裹、不要加任何其他文字：
+{"files": ["文件名", "..."], "reason": "一句话理由（不超过30字）"}
+"""
+
+
+def exemplar_router_user(task: str, tags: List[Tuple[str, str]]) -> str:
+    """路由 user 消息：本章任务 + 标签行列表（纯函数）。"""
+    lines = "\n".join(f"- {name}: {desc}" for name, desc in tags)
+    return (
+        f"【本章写作任务】\n{task}\n\n"
+        f"【样文标签列表】\n{lines}\n\n"
+        "请选出最适合本章的样文。"
+    )
 
 
 def _instruction_block(instruction: str) -> str:

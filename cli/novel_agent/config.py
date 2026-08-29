@@ -66,8 +66,16 @@ class Settings:
     writer_model: str = ""
     # 0.7：生成类调用温度覆盖（NOVEL_TEMPERATURE，None = 不覆盖、用调用点现值）
     llm_temperature: Optional[float] = None
+    # 0.9：单代理温度（None = 写作侧回落 NOVEL_TEMPERATURE，再回落调用点默认 0.8/0.6/0.2）
+    writer_temperature: Optional[float] = None
+    polisher_temperature: Optional[float] = None
+    reviewer_temperature: Optional[float] = None
     # 0.7：chat 请求体透传参数（NOVEL_LLM_EXTRA，JSON 对象，同名键 extra 赢）
     llm_extra: Dict[str, Any] = field(default_factory=dict)
+    # 0.8：思考模型推理深度（NOVEL_REASONING_EFFORT，GLM-5.3 专属 low 有效；空 = 不发送该参数）
+    reasoning_effort: str = ""
+    # 0.8：生成类调用的推理深度（NOVEL_WRITER_REASONING_EFFORT；空 = 继承 NOVEL_REASONING_EFFORT）
+    writer_reasoning_effort: str = ""
 
     # --- Embedding（火山方舟 multimodal embedding，套餐内）---
     embed_model: str = "doubao-embedding-vision"
@@ -82,6 +90,7 @@ class Settings:
     # --- 小说内相对路径（相对 novel_dir）---
     chapter_subdir: str = "正文/AI生成"   # NOVEL_CHAPTER_SUBDIR
     exemplar_subpath: str = "文风基准"    # NOVEL_EXEMPLAR（目录或单文件，相对 novel_dir；留空则不用范例）
+    exemplar_tags_subpath: str = "文风基准/样文标签.md"  # NOVEL_EXEMPLAR_TAGS（exemplar-routing；留空=禁用路由）
     instruction_subpath: str = "写作指令.md"  # NOVEL_INSTRUCTION（相对 novel_dir；留空则不加载写作指令全文）
     rules_subpath: str = "写作铁律.md"       # NOVEL_RULES（相对 novel_dir；留空则不加载铁律）
     quality_rules_subpath: str = "质量规则.json"  # NOVEL_QUALITY_RULES（相对 novel_dir；留空 = 禁用 checker 与门禁，1.1）
@@ -130,6 +139,11 @@ class Settings:
     def exemplar_full(self) -> Path:
         """文风金标准文件（novel_dir 内的相对路径）。"""
         return self.novel_path / self.exemplar_subpath if self.exemplar_subpath else self.novel_path
+
+    @property
+    def exemplar_tags_full(self) -> Path:
+        """样文标签文件（exemplar-routing，novel_dir 内相对路径；留空指向 novel_path 下的不存在文件=禁用）。"""
+        return self.novel_path / self.exemplar_tags_subpath if self.exemplar_tags_subpath else self.novel_path / ""
 
     @property
     def instruction_full(self) -> Path:
@@ -203,11 +217,17 @@ def get_settings() -> Settings:
         writer_api_key=os.environ.get("WRITER_API_KEY", ""),
         writer_model=os.environ.get("WRITER_MODEL", ""),
         llm_temperature=_env_float("NOVEL_TEMPERATURE"),
+        writer_temperature=_env_float("NOVEL_WRITER_TEMPERATURE"),
+        polisher_temperature=_env_float("NOVEL_POLISHER_TEMPERATURE"),
+        reviewer_temperature=_env_float("NOVEL_REVIEWER_TEMPERATURE"),
         llm_extra=_env_json_object("NOVEL_LLM_EXTRA"),
+        reasoning_effort=os.environ.get("NOVEL_REASONING_EFFORT", ""),
+        writer_reasoning_effort=os.environ.get("NOVEL_WRITER_REASONING_EFFORT", ""),
         novel_name=os.environ.get("NOVEL_NAME", "本小说"),
         novel_dir=os.environ.get("NOVEL_DIR", ""),
         chapter_subdir=os.environ.get("NOVEL_CHAPTER_SUBDIR", "正文/AI生成"),
         exemplar_subpath=os.environ.get("NOVEL_EXEMPLAR", "文风基准"),
+        exemplar_tags_subpath=os.environ.get("NOVEL_EXEMPLAR_TAGS", "文风基准/样文标签.md"),
         instruction_subpath=os.environ.get("NOVEL_INSTRUCTION", "写作指令.md"),
         rules_subpath=os.environ.get("NOVEL_RULES", "写作铁律.md"),
         quality_rules_subpath=os.environ.get("NOVEL_QUALITY_RULES", "质量规则.json"),

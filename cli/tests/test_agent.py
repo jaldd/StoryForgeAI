@@ -449,8 +449,8 @@ def test_strip_polisher_meta():
     # 有"## 润色说明"：截掉说明，去开头"## 润色后正文"标题（保留章节标题）
     text = "## 润色后正文\n\n## 第一章 相亲\n\n傍晚六点。\n\n## 润色说明\n\n改了开头。"
     assert _strip_polisher_meta(text) == "## 第一章 相亲\n\n傍晚六点。"
-    # "---" 分隔正文与说明
-    assert _strip_polisher_meta("正文第一段。\n\n---\n\n这是说明。") == "正文第一段。"
+    # "---" 是场景分隔符，不触发截断（按它截会吃掉正文中段）
+    assert _strip_polisher_meta("正文第一段。\n\n---\n\n这是说明。") == "正文第一段。\n\n---\n\n这是说明。"
     # 干净正文：原样返回
     assert _strip_polisher_meta("风起了。他没说话。") == "风起了。他没说话。"
 
@@ -1075,3 +1075,68 @@ def test_record_config_quality_rules_flag(fake_llm, tmp_settings):
     agent2 = NovelAgent(llm=fake_llm, settings=tmp_settings, quality_rules={"blacklist": ["眼眸"]})
     _, record2 = agent2.run("写第5章：异乡风起")
     assert record2["config"]["quality_rules"] is True
+
+
+# ---------------- 0.9：单代理温度（_temp 融合） ----------------
+
+
+def _mk_agent_for_temp(**temp_kw) -> tuple:
+    """构造最小 agent + 记录型 LLM，返回 (agent, recorder)。"""
+    rec = _SysRecorder()
+    s = Settings(ark_api_key="k", base_url="u", model="m", **temp_kw)
+    agent = NovelAgent(llm=rec, settings=s, working_memory=WorkingMemory())
+    return agent, rec
+
+
+def test_temp_defaults_when_unset():
+    """全不配：三个代理用调用点默认 0.8/0.6/0.2。"""
+    agent, _ = _mk_agent_for_temp()
+    assert agent._temp("writer", 0.8) == 0.8
+    assert agent._temp("polisher", 0.6) == 0.6
+    assert agent._temp("reviewer", 0.2) == 0.2
+
+
+def test_temp_novel_temperature_writer_side_fallback():
+    """只配 NOVEL_TEMPERATURE：writer/polisher 吃到，reviewer 不吃（只管写作侧）。"""
+    agent, _ = _mk_agent_for_temp(llm_temperature=0.7)
+    assert agent._temp("writer", 0.8) == 0.7
+    assert agent._temp("polisher", 0.6) == 0.7
+    assert agent._temp("reviewer", 0.2) == 0.2
+
+
+def test_temp_per_agent_wins_over_fallback():
+    """单代理配置赢过 NOVEL_TEMPERATURE（细粒度优先）。"""
+    agent, _ = _mk_agent_for_temp(
+        llm_temperature=0.7, writer_temperature=0.95
+    )
+    assert agent._temp("writer", 0.8) == 0.95
+    assert agent._temp("polisher", 0.6) == 0.7   # 未单配，吃兜底
+
+
+def test_temp_reviewer_independent():
+    """reviewer 单配直接生效，与写作侧配置互不影响。"""
+    agent, _ = _mk_agent_for_temp(
+        llm_temperature=0.7, reviewer_temperature=0.5
+    )
+    assert agent._temp("reviewer", 0.2) == 0.5
+
+
+def test_run_uses_configured_temperatures(fake_rag, tmp_settings):
+    """端到端：run 全流程各调用点的温度来自配置。"""
+    rec = _SysRecorder(script=[
+        "构思。\n===\n正文。",
+        "【润色】正文。",
+        '{"pass": true, "reason": "通过"}',
+    ])
+    from dataclasses import replace
+    s = replace(
+        tmp_settings,
+        writer_temperature=0.9, polisher_temperature=0.5, reviewer_temperature=0.3,
+    )
+    agent = NovelAgent(
+        llm=rec, rag=fake_rag, settings=s, working_memory=WorkingMemory()
+    )
+    agent.run("写第1章：测试")
+    assert rec.kws[0]["temperature"] == 0.9   # writer
+    assert rec.kws[1]["temperature"] == 0.5   # polisher
+    assert rec.kws[2]["temperature"] == 0.3   # reviewer

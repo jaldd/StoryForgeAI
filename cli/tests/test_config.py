@@ -11,6 +11,7 @@ def test_settings_path_resolution(tmp_settings, tmp_path):
     assert tmp_settings.doc_path == novel                       # RAG 索引源 = 小说根
     assert tmp_settings.chapter_path == novel / "正文/AI生成"
     assert tmp_settings.exemplar_full == novel / "文风基准"    # 0.5 目录级语料
+    assert tmp_settings.exemplar_tags_full == novel / "文风基准/样文标签.md"  # exemplar-routing
     assert tmp_settings.instruction_full == novel / "写作指令.md"
     assert tmp_settings.rules_full == novel / "写作铁律.md"      # 0.2 铁律外置
     assert tmp_settings.runs_path == novel / ".agent" / "runs"
@@ -27,6 +28,62 @@ def test_rules_subpath_empty(tmp_settings):
         rules_subpath="",
     )
     assert s.rules_full == s.novel_path
+
+
+# ---------- exemplar-routing：标签文件路径 ----------
+def test_exemplar_tags_subpath_empty(tmp_settings):
+    """exemplar_tags_subpath 留空 = 显式禁用路由：exemplar_tags_full 不指向存在文件。"""
+    s = Settings(
+        ark_api_key="k",
+        repo_root=tmp_settings.repo_root,
+        novel_dir=tmp_settings.novel_dir,
+        exemplar_tags_subpath="",
+    )
+    assert s.exemplar_tags_full == s.novel_path / ""
+    assert not s.exemplar_tags_full.is_file()
+
+
+def test_exemplar_tags_env(monkeypatch):
+    """NOVEL_EXEMPLAR_TAGS 环境变量生效（自定义标签文件路径）。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_EXEMPLAR_TAGS", "文风基准/我的标签.md")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.exemplar_tags_subpath == "文风基准/我的标签.md"
+        assert s.exemplar_tags_full == s.novel_path / "文风基准/我的标签.md"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_reasoning_effort_env(monkeypatch):
+    """NOVEL_REASONING_EFFORT / NOVEL_WRITER_REASONING_EFFORT 环境变量生效。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_REASONING_EFFORT", "low")
+    monkeypatch.setenv("NOVEL_WRITER_REASONING_EFFORT", "max")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.reasoning_effort == "low"
+        assert s.writer_reasoning_effort == "max"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_agent_temperature_env(monkeypatch):
+    """NOVEL_{WRITER,POLISHER,REVIEWER}_TEMPERATURE 环境变量生效。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_WRITER_TEMPERATURE", "0.9")
+    monkeypatch.setenv("NOVEL_POLISHER_TEMPERATURE", "0.5")
+    monkeypatch.setenv("NOVEL_REVIEWER_TEMPERATURE", "0.3")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.writer_temperature == 0.9
+        assert s.polisher_temperature == 0.5
+        assert s.reviewer_temperature == 0.3
+    finally:
+        get_settings.cache_clear()
 
 
 def test_runtime_dir_override(tmp_path):
@@ -74,7 +131,7 @@ def test_defaults():
     s = Settings(ark_api_key="k")
     assert s.model == "glm-5.2"
     assert s.novel_name == "本小说"
-    assert s.max_reviews == 2
+    assert s.max_reviews == 6
     assert s.chunk_size == 300 and s.chunk_overlap == 80
     assert s.chapter_subdir == "正文/AI生成"
     assert s.index_exclude == "正文"

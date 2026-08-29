@@ -41,6 +41,10 @@ def replay(
     out(f"task : {d['task']}")
     out(f"config: {d['config']}")
     out(f"time : {d['timestamp']}")
+    # exemplar-routing：本次写章注入了哪些样文（旧记录无该键则不显示）
+    route = d.get("exemplar_route")
+    if route:
+        out(f"样文路由: {'、'.join(route.get('files', []))}（{route.get('reason', '')}）")
     out(f"--- 共 {len(d['steps'])} 步 ---")
     for s in d["steps"]:
         o = s["output_state"]

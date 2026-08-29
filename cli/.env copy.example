@@ -19,14 +19,29 @@ CLAUDE_MODEL=glm-5.2
 #     LLM_BASE_URL=https://api.moonshot.cn/v1
 #     LLM_API_KEY=你的Moonshot密钥
 #     LLM_MODEL=按实际名称填写（如 kimi-k3）
+#     注：kimi-k3 等思考模型只允许 temperature=1，客户端遇 400 会自动锁定，
+#     各角色调用点的 0.2/0.6/0.8 无需改动
 #   SenseNova（商汤）：
 #     LLM_BASE_URL=https://api.sensenova.cn/compatible-mode/v2
 #     LLM_API_KEY=你的SenseNova密钥
 #     LLM_MODEL=按实际名称填写
 # 审稿留火山、写作单独换商：改用 WRITER_* 三行（用法同上），主配置不动。
 #
-# 生成类温度覆盖（只作用写作侧；未设 = 调用点现值 0.8/0.6/0.6，零漂移）
+# 生成类温度覆盖（写作侧整体；未设 = 调用点默认 0.8/0.6，零漂移）
 # NOVEL_TEMPERATURE=0.7
+#
+# 单代理温度（0.9）：各自独立，优先级高于 NOVEL_TEMPERATURE；未设回落写作侧配置再回落默认
+#   writer 默认 0.8 / polisher（含局部精修）默认 0.6 / reviewer 默认 0.2
+# NOVEL_WRITER_TEMPERATURE=0.9
+# NOVEL_POLISHER_TEMPERATURE=0.5
+# NOVEL_REVIEWER_TEMPERATURE=0.3
+#
+# 思考模型推理深度（GLM-5.3 专属 low；max 深/high 中/low 浅；未设 = 不发送、走模型默认）
+# 生成调用浅思考实测省约 18 倍思考 token；审稿浅思考意见会变泛，深浅由你按效果取舍
+# NOVEL_REASONING_EFFORT=low
+# 生成类调用（writer/polisher）专属深度：未设继承 NOVEL_REASONING_EFFORT
+# 「审稿深、写作浅」：只设这一行为 low，上面不设
+# NOVEL_WRITER_REASONING_EFFORT=low
 #
 # chat 请求体透传（合法 JSON 对象；与内建参数同名时此值赢，兼作 max_tokens 逃生门）
 # NOVEL_LLM_EXTRA={"max_tokens": 8192}
@@ -42,6 +57,10 @@ NOVEL_DIR=/path/to/your/novel
 # 小说内相对路径（可选，按需改）：
 # NOVEL_CHAPTER_SUBDIR=正文/AI生成
 # NOVEL_EXEMPLAR=文风基准/1.txt
+# 样文标签（exemplar-routing）：每行 "- 文件名: 一行场景描述"，写作前按本章任务选 3~5 篇注入；
+# 存在且路由成功只注入选中样文，失败回落全量。留空=禁用路由（每章全量注入）。
+# 注意：自定义文件名时请放在文风基准目录外，否则会被当样文注入。
+# NOVEL_EXEMPLAR_TAGS=文风基准/样文标签.md
 # NOVEL_INSTRUCTION=写作指令.md
 # 写作铁律（0.2 外置）：注入 writer/polisher/reviewer 的硬性约束全文。
 # NOVEL_RULES=写作铁律.md

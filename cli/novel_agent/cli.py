@@ -33,6 +33,7 @@ from .memory import WorkingMemory
 from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
 from .prompts import exemplar_info, load_exemplar
 from .rag import RAGStore
+from .routing import parse_tag_lines, route_exemplars
 from .state import PipelineState
 from .storage import (
     list_runs,
@@ -86,18 +87,64 @@ def _refresh_working_memory(
         save_working_memory(wm, settings)
 
 
-def _build_agent(settings: Settings):
+def _load_exemplar_tags(settings: Settings) -> list:
+    """读样文标签文件（exemplar-routing）；不存在/禁用/解析为空返回 []。"""
+    if not settings.exemplar_tags_subpath:
+        return []
+    tags_path = settings.exemplar_tags_full
+    if not tags_path.is_file():
+        return []
+    try:
+        text = tags_path.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"(样文标签文件不可读，跳过路由：{e})")
+        return []
+    return parse_tag_lines(text)
+
+
+def _route_exemplar_files(settings: Settings, task: str):
+    """按本章任务路由样文（exemplar-routing）；返回 (only_files 或 None, route 或 None)。
+
+    - 标签为空 -> (None, None)（不路由，走现状加载）；
+    - 路由成功 -> (选中文件名列表, RouteResult)；
+    - 失败/异常 -> (None, None) + 一行提示，写作不中断（A3/A4）。
+    - 走主 profile（路由要稳，不用可能便宜的 writer_llm；design.md §3.2）。
+    """
+    tags = _load_exemplar_tags(settings)
+    if not tags:
+        return None, None
+    profiles = load_profiles(settings)
+    router_llm = LLMClient(settings=settings, profile=profiles.default)
+    try:
+        route = route_exemplars(router_llm, task, tags)
+    except Exception as e:
+        print(f"(样文路由失败，回落全量加载：{e})")
+        return None, None
+    if route is None:
+        print("(样文路由未返回有效结果，回落全量加载)")
+        return None, None
+    print(f"🧭 样文路由：{'、'.join(route.files)}（{route.reason}）")
+    return route.files, route
+
+
+def _build_agent(settings: Settings, task: str = ""):
     """构造 NovelAgent：加载文风金标准 + 写作指令 + 写作铁律 + 工作记忆，RAG 惰性。
 
     0.7：load_profiles 一次解析，双 LLMClient 注入（llm=default profile，
     writer_llm=writer profile）；未配 WRITER_* 时两 profile 逐字段相等，
     行为与改造前完全一致（A9 回归保险）。
     1.1：质量规则 JSON 在装配点加载注入（非法 JSON fail-fast，A23）。
+    exemplar-routing：task 非空且标签文件存在时先路由（一次廉价调用），按选中
+    样文加载；路由任何失败回落现状（清单/全量）加载，永不阻塞写作。
     """
+    only_files = None
+    route = None
+    if task:
+        only_files, route = _route_exemplar_files(settings, task)
     exemplar = ""
     # 0.5：exemplar 支持目录级（目录下全部 *.txt/*.md 按序拼接，超限截断）
     if settings.exemplar_subpath and settings.exemplar_full.exists():
-        exemplar = load_exemplar(settings.exemplar_full)
+        exemplar = load_exemplar(settings.exemplar_full, only_files=only_files)
     instruction = _load_instruction(settings)
     rules = _load_rules(settings)
     quality_rules = load_quality_rules(settings)
@@ -114,7 +161,7 @@ def _build_agent(settings: Settings):
         rules=rules,
         quality_rules=quality_rules,
     )
-    return agent, wm
+    return agent, wm, route
 
 
 # ---------- 质量门禁（1.1 A30-A34，design §3.6）----------
@@ -168,7 +215,7 @@ def _do_write(task: str, settings: Settings) -> None:
         return
     print("🔧 构建 Agent（加载设定/文风基准/写作指令）...")
     try:
-        agent, wm = _build_agent(settings)
+        agent, wm, route = _build_agent(settings, task=task)
     except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等装配错误，命令层兜住不崩 REPL
         print(f"❌ {e}")
         return
@@ -178,6 +225,10 @@ def _do_write(task: str, settings: Settings) -> None:
     except Exception as e:
         print(f"❌ 创作失败：{e}")
         return
+
+    # exemplar-routing：路由结果进 run 记录（replay 可见，A5）
+    if route is not None:
+        record["exemplar_route"] = {"files": list(route.files), "reason": route.reason}
 
     print("💾 落盘运行记录...")
     # 运行日志落盘（1.1：先落 run record，弃而不失数据，design §3.6）
@@ -347,8 +398,9 @@ def _do_refine(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
+    # exemplar-routing：精修也按文件名路由样文（task=精修：文件名；路由失败回落）
     try:
-        agent, wm = _build_agent(settings)
+        agent, wm, _route = _build_agent(settings, task=f"精修：{file_path}")
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -387,8 +439,9 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
+    # exemplar-routing：重写按文件名路由样文（task=重写：文件名；路由失败回落）
     try:
-        agent, wm = _build_agent(settings)
+        agent, wm, _route = _build_agent(settings, task=f"重写：{file_path}")
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -446,8 +499,9 @@ def _do_partial_flow(args: List[str], settings: Settings) -> None:
     """_do_partial 主体（参数与目录校验之后）。"""
     file_path = " ".join(args)  # 容忍路径含空格（同精修/重写）
     print("🔧 构建 Agent...")
+    # A7：改（局部精修）不路由不注入 exemplar（polisher_system 本就不带），零新增 token
     try:
-        agent, _ = _build_agent(settings)
+        agent, _, _ = _build_agent(settings)
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -670,6 +724,10 @@ def _do_status(settings: Settings) -> None:
             print(f"人工语料：未找到 {settings.human_text_full}（AI 味基准不含人工语料）")
     else:
         print("人工语料：未配置（NOVEL_HUMAN_TEXT 为空）")
+    # exemplar-routing：标签文件启用情况（不存在则不显示，不添噪音）
+    tags = _load_exemplar_tags(settings)
+    if tags:
+        print(f"样文路由：启用（{len(tags)} 条标签 @ {settings.exemplar_tags_full}）")
 
 
 def _do_replay(args: List[str], settings: Settings) -> None:

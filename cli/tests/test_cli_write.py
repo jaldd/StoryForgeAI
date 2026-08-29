@@ -52,7 +52,7 @@ class WriteAgent:
 
 def _run_write(monkeypatch, tmp_settings, agent):
     """把 _build_agent / evaluate 替换掉后跑一次 _do_write。"""
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, WorkingMemory()))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
 
@@ -83,6 +83,92 @@ def test_write_index_failure_not_fatal(tmp_settings, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "索引更新失败" in out and "boom" in out
     assert "最终章节" in out  # 流程未被阻断，走到结尾
+
+
+# ---------- exemplar-routing：_build_agent 路由接线 ----------
+def _mk_route_env(tmp_settings):
+    """小说目录 + 文风基准（说明 + 两篇样文 + 标签文件），返回样文内容常量。"""
+    d = tmp_settings.exemplar_full
+    d.mkdir(parents=True)
+    (d / "00-使用说明.md").write_text("使用说明", encoding="utf-8")
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    (d / "2.txt").write_text("乙", encoding="utf-8")
+    tags = tmp_settings.exemplar_tags_full
+    tags.write_text("# 样文标签\n\n- 1.txt: 天气感\n- 2.txt: 日常\n", encoding="utf-8")
+
+
+def test_build_agent_routes_exemplars(tmp_settings, monkeypatch, capsys):
+    """A2：标签存在 + 路由成功 -> agent.exemplar 只含说明 + 选中样文（未选中的不进）。"""
+    _mk_route_env(tmp_settings)
+    from tests.conftest import FakeLLM
+
+    router_llm = FakeLLM(script=['{"files": ["1.txt"], "reason": "天气章"}'])
+    captured: dict = {}
+
+    class _Agent:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "LLMClient", lambda settings=None, profile=None: router_llm)
+    monkeypatch.setattr(cli, "RAGStore", lambda settings=None: None)
+    monkeypatch.setattr(cli, "NovelAgent", _Agent)
+    agent, _wm, route = cli._build_agent(tmp_settings, task="写第1章：风起")
+
+    assert captured["exemplar"] == "使用说明\n\n甲"   # 2.txt 未被路由选中，不注入
+    assert route is not None and route.files == ["1.txt"]
+    out = capsys.readouterr().out
+    assert "样文路由：1.txt" in out
+
+
+def test_build_agent_route_failure_falls_back(tmp_settings, monkeypatch, capsys):
+    """A3/A4：路由返回坏 JSON -> 回落全量加载（说明 + 全部样文），写作不中断。"""
+    _mk_route_env(tmp_settings)
+    from tests.conftest import FakeLLM
+
+    router_llm = FakeLLM(script=["模型抽风，不是 JSON"])
+    captured: dict = {}
+
+    class _Agent:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "LLMClient", lambda settings=None, profile=None: router_llm)
+    monkeypatch.setattr(cli, "RAGStore", lambda settings=None: None)
+    monkeypatch.setattr(cli, "NovelAgent", _Agent)
+    agent, _wm, route = cli._build_agent(tmp_settings, task="写第1章：风起")
+
+    assert captured["exemplar"] == "使用说明\n\n甲\n\n乙"  # 现状全量
+    assert route is None
+    assert "回落" in capsys.readouterr().out
+
+
+def test_do_write_records_route(tmp_settings, fake_rag, monkeypatch, capsys):
+    """A5：路由结果进 run 记录落盘，可 load_run 读回。"""
+    from novel_agent.routing import RouteResult
+    from novel_agent.storage import load_run
+
+    agent = WriteAgent(fake_rag)
+    wm = WorkingMemory()
+    route = RouteResult(files=["1.txt", "2.txt"], reason="日常章")
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, wm, route))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    saved = load_run("run_20260828_000001", tmp_settings)
+    assert saved["exemplar_route"] == {"files": ["1.txt", "2.txt"], "reason": "日常章"}
+
+
+def test_do_write_no_route_no_key(tmp_settings, fake_rag, monkeypatch, capsys):
+    """A5 边界：未路由（route=None）时 run 记录不含 exemplar_route 键。"""
+    from novel_agent.storage import load_run
+
+    agent = WriteAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    saved = load_run("run_20260828_000001", tmp_settings)
+    assert "exemplar_route" not in saved
 
 
 def test_write_no_chapter_no_index(tmp_settings, fake_rag, monkeypatch, capsys):
@@ -247,7 +333,7 @@ def test_refine_pass_refreshes_working_memory(tmp_settings, fake_rag, monkeypatc
 
     agent = RefineAgent(fake_rag)
     wm = WorkingMemory()
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, wm))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, wm, None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_refine([str(chap)], tmp_settings)
 
@@ -266,7 +352,7 @@ def test_build_agent_injects_dual_clients(tmp_settings):
 
     未配 WRITER_* 时两 profile 逐字段相等（A9 回归保险，行为与改造前一致）。
     """
-    agent, _ = cli._build_agent(tmp_settings)
+    agent, _, _ = cli._build_agent(tmp_settings)
     assert agent.llm.profile == load_profiles(tmp_settings).default
     assert agent.writer_llm.profile == load_profiles(tmp_settings).writer
     assert agent.llm.profile == agent.writer_llm.profile   # 未配时同值
@@ -281,7 +367,7 @@ def test_build_agent_writer_model_configured(tmp_settings):
         novel_dir=tmp_settings.novel_dir,
         writer_model="kimi-k3",
     )
-    agent, _ = cli._build_agent(settings)
+    agent, _, _ = cli._build_agent(settings)
     assert agent.llm.profile.model == "glm-5.2"
     assert agent.writer_llm.profile.model == "kimi-k3"
 
@@ -299,7 +385,7 @@ def _write_gate_rules(tmp_settings, threshold=4.0):
 
 def _patch_write(monkeypatch, tmp_settings, agent, score):
     """门禁测试公共注入：假 agent + 假评委返回固定分。"""
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, WorkingMemory()))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: score)
 
 
@@ -451,7 +537,7 @@ def _run_refine_gated(monkeypatch, tmp_settings, fake_rag, agent, score, confirm
     novel.mkdir(parents=True, exist_ok=True)
     chap = novel / "第05章-异乡风起.md"
     chap.write_text("旧正文。", encoding="utf-8")
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, WorkingMemory()))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: score)
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirm)
     cli._do_refine([str(chap)], tmp_settings)

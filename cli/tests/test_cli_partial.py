@@ -44,7 +44,7 @@ def env(tmp_path, tmp_settings, fake_rag, monkeypatch):
     path = novel_dir / "第05章.md"
     path.write_bytes(CHAPTER.encode("utf-8"))
     agent = FakeAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, None, None))
     return path, agent, fake_rag
 
 
@@ -159,7 +159,7 @@ def test_partial_length_warning(env, tmp_settings, monkeypatch, capsys):
 def test_partial_file_not_found(tmp_path, tmp_settings, monkeypatch, fake_rag, capsys):
     """文件不存在 -> 提示后退出。"""
     agent = FakeAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, None, None))
     cli._do_partial([str(tmp_path / "不存在.md")], tmp_settings)
     assert "找不到文件" in capsys.readouterr().out
 
@@ -189,7 +189,7 @@ def test_partial_no_numbered_paragraphs(tmp_path, tmp_settings, monkeypatch, fak
     path = novel_dir / "纯标题.md"
     path.write_bytes("## 第5章\n\n---\n\n".encode("utf-8"))
     agent = FakeAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="": (agent, None, None))
     cli._do_partial([str(path)], tmp_settings)
     assert "无可选段落" in capsys.readouterr().out
     assert agent.calls == []

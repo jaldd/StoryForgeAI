@@ -89,6 +89,72 @@ def test_load_exemplar_skips_unreadable_file(tmp_path, monkeypatch):
     assert any("跳过" in m for m in logs)
 
 
+# ---------- exemplar-routing：only_files 过滤 ----------
+def _mk_dir_with_usage(tmp_path):
+    """带使用说明 + 两篇样文的目录（0.5b 目录结构）。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "00-使用说明.md").write_text("使用说明全文", encoding="utf-8")
+    (d / "1.txt").write_text("甲" * 5, encoding="utf-8")
+    (d / "2.txt").write_text("乙" * 5, encoding="utf-8")
+    return d
+
+
+def test_load_exemplar_only_files_filters_and_orders(tmp_path):
+    """A2：only_files 按清单序过滤（顺序遵 only_files，不按文件名排序）。"""
+    d = _mk_dir_with_usage(tmp_path)
+    text = load_exemplar(d, progress=_quiet, only_files=["2.txt", "1.txt"])
+    # 使用说明仍作首块，样文按 only_files 序
+    assert text == "使用说明全文\n\n" + "乙" * 5 + "\n\n" + "甲" * 5
+
+
+def test_load_exemplar_only_files_skips_missing(tmp_path):
+    """A4：only_files 中不存在的名字跳过并提示，其余照常。"""
+    d = _mk_dir_with_usage(tmp_path)
+    logs: list[str] = []
+    text = load_exemplar(d, progress=logs.append, only_files=["99.txt", "1.txt"])
+    assert text == "使用说明全文\n\n" + "甲" * 5
+    assert any("99.txt" in m and "跳过" in m for m in logs)
+
+
+def test_load_exemplar_only_files_empty_keeps_manifest(tmp_path):
+    """only_files 过滤后样文为空：仍返回说明全文（说明照常注入）。"""
+    d = _mk_dir_with_usage(tmp_path)
+    text = load_exemplar(d, progress=_quiet, only_files=["不存在.txt"])
+    assert text == "使用说明全文"
+
+
+def test_load_exemplar_only_files_none_is_status_quo(tmp_path):
+    """A1：only_files=None（默认）行为与现状完全一致。"""
+    d = _mk_dir_with_usage(tmp_path)
+    assert load_exemplar(d, progress=_quiet) == "使用说明全文\n\n" + "甲" * 5 + "\n\n" + "乙" * 5
+    assert load_exemplar(d, progress=_quiet, only_files=None) == load_exemplar(d, progress=_quiet)
+
+
+def test_load_exemplar_only_files_with_truncation(tmp_path):
+    """A6：only_files 与截断叠加——超限时按（过滤后的）序截断。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "00-使用说明.md").write_text("说明", encoding="utf-8")
+    (d / "1.txt").write_text("甲" * 20, encoding="utf-8")
+    (d / "2.txt").write_text("乙" * 20, encoding="utf-8")
+    text = load_exemplar(d, max_chars=25, progress=_quiet, only_files=["2.txt", "1.txt"])
+    # 说明(2)+分隔(2)+乙*20=24 装满预算；1.txt 的剩余预算为负，整体不进
+    assert len(text) == 24
+    assert text.startswith("说明\n\n" + "乙" * 20)
+
+
+def test_tags_file_not_a_sample(tmp_path):
+    """exemplar-routing：样文标签.md 是路由元数据，不算样文、不注入（含 info 统计）。"""
+    d = tmp_path / "文风基准"
+    d.mkdir()
+    (d / "00-使用说明.md").write_text("使用说明", encoding="utf-8")
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    (d / "样文标签.md").write_text("# 样文标签\n\n- 1.txt: 天气感\n", encoding="utf-8")
+    assert load_exemplar(d, progress=_quiet) == "使用说明\n\n甲"
+    assert exemplar_info(d) == (1, 5)  # 1 篇样文（标签文件不计）
+
+
 # ---------- 0.5b 精选清单（00-使用说明.md：说明全文注入 + 清单选样文） ----------
 def test_manifest_selects_subset_in_list_order(tmp_path):
     """有清单：说明全文作首块 + 清单内样文（清单序即注入序）；说明不算样文。"""
@@ -247,3 +313,20 @@ def test_fixer_whole_user_renders_text_and_issues():
     assert "原稿全文内容。" in user_prompt
     assert "比喻密度" in user_prompt and "删减比喻" in user_prompt
     assert "独白过长" in user_prompt and "压缩" in user_prompt
+
+
+def test_build_agent_no_tag_file_no_route(tmp_settings, monkeypatch):
+    """exemplar-routing A1：标签文件不存在时 _build_agent 不路由，行为与现状一致。
+
+    _route_exemplar_files 在标签为空时直接 (None, None)，不构造 LLMClient。
+    """
+    called = []
+
+    def _boom(*a, **kw):
+        called.append(1)
+        raise AssertionError("不应发起路由调用")
+
+    monkeypatch.setattr(cli, "LLMClient", _boom)
+    only, route = cli._route_exemplar_files(tmp_settings, "写第1章：风起")
+    assert only is None and route is None
+    assert not called

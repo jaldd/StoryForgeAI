@@ -55,6 +55,32 @@ def test_replay_shows_outline(tmp_settings):
     assert "构思：风起，他站在路口，林晚没回头。" in text
 
 
+def test_replay_shows_exemplar_route(tmp_settings):
+    """exemplar-routing A5/T6：run 记录含 exemplar_route 时回放展示路由行。"""
+    from novel_agent.storage import save_run
+    record = {
+        "run_id": "run_route", "task": "写第5章：异乡风起", "timestamp": "",
+        "config": {},
+        "initial_state": {},
+        "steps": [],
+        "final_state": {"final_chapter": "风起了。"},
+        "exemplar_route": {"files": ["5.txt", "10.txt"], "reason": "日常靠近"},
+    }
+    save_run(record, tmp_settings)
+    lines = []
+    replay("run_route", tmp_settings, out=lines.append)
+    text = "\n".join(lines)
+    assert "样文路由: 5.txt、10.txt（日常靠近）" in text
+
+
+def test_replay_old_record_no_route_line(sample_run, tmp_settings):
+    """exemplar-routing：旧记录（无 exemplar_route 键）不显示路由行。"""
+    lines = []
+    replay(sample_run, tmp_settings, out=lines.append)
+    text = "\n".join(lines)
+    assert "样文路由" not in text
+
+
 def test_run_tests_pass(sample_run, tmp_settings):
     """样例 run 守住铁律（含'风'、不含'许风'、审稿通过且 done）-> 全通过。"""
     lines = []

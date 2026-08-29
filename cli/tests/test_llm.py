@@ -42,7 +42,6 @@ class TestLoadProfiles:
         assert p.default.base_url == "https://ark.example/api/v3"
         assert p.default.api_key == "ark-key"          # llm_api_key 空 -> ark_api_key
         assert p.default.model == "glm-5.2"
-        assert p.default.temperature is None            # 主配置永不带温度覆盖
         assert p.default.extra == {}
         # 未配 WRITER_*：writer 逐字段回落 default
         assert p.writer == p.default
@@ -53,7 +52,6 @@ class TestLoadProfiles:
         assert p.writer.model == "kimi-k3"
         assert p.writer.base_url == p.default.base_url
         assert p.writer.api_key == p.default.api_key
-        assert p.writer.temperature is None
 
     def test_fully_configured_writer_independent(self):
         """全配：writer 完整独立（含 llm_api_key 高于 ark_api_key 的主键链）。"""
@@ -63,7 +61,6 @@ class TestLoadProfiles:
                 writer_base_url="https://kimi.example/v1",
                 writer_api_key="writer-key",
                 writer_model="kimi-k3",
-                llm_temperature=0.7,
                 llm_extra={"max_tokens": 8192},
             )
         )
@@ -71,13 +68,7 @@ class TestLoadProfiles:
         assert p.writer.base_url == "https://kimi.example/v1"
         assert p.writer.api_key == "writer-key"
         assert p.writer.model == "kimi-k3"
-        assert p.writer.temperature == 0.7
         assert p.writer.extra == {"max_tokens": 8192}
-
-    def test_temperature_none_when_unset(self):
-        """llm_temperature 未设（None）：writer.temperature 为 None（哨兵=不覆盖）。"""
-        p = load_profiles(_settings())
-        assert p.writer.temperature is None
 
     def test_extra_shared_by_both_profiles(self):
         """extra 同值进两个 profile（Z4）。"""
@@ -91,6 +82,45 @@ class TestLoadProfiles:
         """只配 ark key + WRITER_MODEL：writer.api_key 回落 ARK 解析值（两段式回落）。"""
         p = load_profiles(_settings(writer_model="kimi-k3"))
         assert p.writer.api_key == "ark-key"
+
+    # ---------------- reasoning_effort（0.8 思考深度分流） ----------------
+
+    def test_effort_unset_sends_nothing(self):
+        """都不配：extra 不带 reasoning_effort（现状零漂移）。"""
+        p = load_profiles(_settings())
+        assert p.default.extra == {}
+        assert p.writer.extra == {}
+
+    def test_global_effort_applies_to_both(self):
+        """只配全局：两 profile 都带（writer 继承）。"""
+        p = load_profiles(_settings(reasoning_effort="low"))
+        assert p.default.extra == {"reasoning_effort": "low"}
+        assert p.writer.extra == {"reasoning_effort": "low"}
+
+    def test_writer_effort_overrides_global(self):
+        """全局 + writer 专属：各自生效（审稿深、写作浅的分流）。"""
+        p = load_profiles(
+            _settings(reasoning_effort="max", writer_reasoning_effort="low")
+        )
+        assert p.default.extra == {"reasoning_effort": "max"}
+        assert p.writer.extra == {"reasoning_effort": "low"}
+
+    def test_writer_effort_only_leaves_default_clean(self):
+        """只配 writer 专属：default 不带参数、writer 带。"""
+        p = load_profiles(_settings(writer_reasoning_effort="low"))
+        assert p.default.extra == {}
+        assert p.writer.extra == {"reasoning_effort": "low"}
+
+    def test_llm_extra_effort_wins(self):
+        """NOVEL_LLM_EXTRA 显式 reasoning_effort 赢过专用字段（Z2 逃生门）。"""
+        p = load_profiles(
+            _settings(
+                reasoning_effort="low",
+                llm_extra={"reasoning_effort": "high"},
+            )
+        )
+        assert p.default.extra == {"reasoning_effort": "high"}
+        assert p.writer.extra == {"reasoning_effort": "high"}
 
 
 # ---------------- T4：_strip_think_blocks 纯函数四态 ----------------
@@ -131,11 +161,14 @@ class TestStripThinkBlocks:
 
 
 class _FakeResp:
-    """最小伪 OpenAI response：choices[0].message.content / finish_reason。"""
+    """最小伪 OpenAI response：choices[0].message.content / finish_reason。
 
-    def __init__(self, content: str):
-        msg = type("M", (), {"content": content})()
-        self.choices = [type("C", (), {"message": msg, "finish_reason": "stop"})()]
+    reasoning_content 模拟思考模型（GLM-5.3 等）把思考放独立字段的行为。
+    """
+
+    def __init__(self, content: str, finish: str = "stop", reasoning: str = ""):
+        msg = type("M", (), {"content": content, "reasoning_content": reasoning})()
+        self.choices = [type("C", (), {"message": msg, "finish_reason": finish})()]
 
 
 class SpyClient:
@@ -153,6 +186,23 @@ class SpyClient:
     def create(self, **kwargs):
         self.kwargs = kwargs
         return _FakeResp(self.content)
+
+
+class _ScriptedClient(SpyClient):
+    """伪 OpenAI client：按脚本顺序返回响应/抛异常，记录每次 create kwargs。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.all_kwargs: list = []
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kwargs):
+        self.all_kwargs.append(kwargs)
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class TestLLMClientProfile:
@@ -176,19 +226,12 @@ class TestLLMClientProfile:
         llm.chat("sys", "user")
         assert spy.kwargs["model"] == "glm-5.2"
 
-    def test_temperature_none_uses_call_site_value(self):
-        """profile.temperature=None（哨兵）：用调用点现值。"""
+    def test_temperature_uses_call_site_value(self):
+        """调用点温度直传请求体（0.9 温度融合上移 agent._temp，profile 不再覆盖）。"""
         spy = SpyClient()
         profile = ModelProfile(base_url="u", api_key="k", model="m")
         LLMClient(client=spy, profile=profile).chat("sys", "user", temperature=0.6)
         assert spy.kwargs["temperature"] == 0.6
-
-    def test_temperature_set_overrides_call_site(self):
-        """profile.temperature 设值：压掉调用点现值（仅 writer profile 可能配）。"""
-        spy = SpyClient()
-        profile = ModelProfile(base_url="u", api_key="k", model="m", temperature=0.7)
-        LLMClient(client=spy, profile=profile).chat("sys", "user", temperature=0.6)
-        assert spy.kwargs["temperature"] == 0.7
 
     def test_extra_merged_into_request(self):
         """extra 合并进请求体。"""
@@ -247,3 +290,99 @@ class TestLLMClientProfile:
         )
         assert out == ""
         assert calls["n"] == 3
+
+
+# ---------------- 思考模型：max_tokens 翻倍重试 ----------------
+
+
+class TestThinkingModelDoubling:
+    def test_thinking_exhausted_doubles_and_succeeds(self, monkeypatch):
+        """思考烧光 max_tokens：翻倍重试后成功，第二次请求 max_tokens 翻倍。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        exhausted = _FakeResp("", finish="length", reasoning="（很长的思考）")
+        ok = _FakeResp("正文内容")
+        spy = _ScriptedClient([exhausted, ok])
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=2048
+        )
+        assert out == "正文内容"
+        assert spy.all_kwargs[0]["max_tokens"] == 2048
+        assert spy.all_kwargs[1]["max_tokens"] == 4096
+
+    def test_explicit_extra_max_tokens_never_doubles(self, monkeypatch):
+        """extra 显式配 max_tokens：尊重配置不自动翻倍（Z2 逃生门）。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        empty = _FakeResp("", finish="length", reasoning="思考")
+        spy = _ScriptedClient([empty, empty, empty])
+        profile = ModelProfile(
+            base_url="u", api_key="k", model="m", extra={"max_tokens": 8192}
+        )
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=1024, max_retries=3
+        )
+        assert out == ""
+        assert [kw["max_tokens"] for kw in spy.all_kwargs] == [8192, 8192, 8192]
+
+    def test_double_caps_at_limit(self, monkeypatch):
+        """翻倍封顶 _MAX_TOKENS_CAP=16384，到顶后原值重试至耗尽。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        empty = _FakeResp("", finish="length", reasoning="思考")
+        spy = _ScriptedClient([empty] * 6)
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=8192, max_retries=6
+        )
+        assert out == ""
+        assert [kw["max_tokens"] for kw in spy.all_kwargs] == [
+            8192, 16384, 16384, 16384, 16384, 16384,
+        ]
+
+    def test_plain_empty_without_reasoning_keeps_original(self, monkeypatch):
+        """普通空回（无 reasoning_content）：不翻倍，原样重试语义不变。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        empty = _FakeResp("", finish="stop")
+        spy = _ScriptedClient([empty, empty, empty])
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=2048, max_retries=3
+        )
+        assert out == ""
+        assert [kw["max_tokens"] for kw in spy.all_kwargs] == [2048, 2048, 2048]
+
+
+# ---------------- 思考模型：temperature=1 锁定 ----------------
+
+_KIMI_TEMP_400 = Exception(
+    "Error code: 400 - {'error': {'message': 'field Temperature invalid, "
+    "only 1 is allowed for this model', 'type': 'invalid_request_error', "
+    "'param': 'temperature', 'code': '3'}}"
+)
+
+
+class TestTemperatureLock:
+    def test_temp_400_locks_one_and_retries(self, monkeypatch):
+        """kimi-k3 式 temperature 400：锁定 1 立即重试成功。"""
+        sleeps: list = []
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: sleeps.append(s))
+        spy = _ScriptedClient([_KIMI_TEMP_400, _FakeResp("正文")])
+        profile = ModelProfile(base_url="u", api_key="k", model="kimi-k3")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", temperature=0.2
+        )
+        assert out == "正文"
+        assert spy.all_kwargs[0]["temperature"] == 0.2
+        assert spy.all_kwargs[1]["temperature"] == 1
+        assert sleeps == []  # 参数错误不退避
+
+    def test_other_400_not_locked(self, monkeypatch):
+        """非 temperature 的 400：不锁定，正常退避重试到耗尽。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        err = Exception("Error code: 400 - {'param': 'model'}")
+        spy = _ScriptedClient([err, err, err])
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", temperature=0.8, max_retries=3
+        )
+        assert out == ""
+        assert [kw["temperature"] for kw in spy.all_kwargs] == [0.8, 0.8, 0.8]

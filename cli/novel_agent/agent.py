@@ -275,6 +275,19 @@ class NovelAgent:
         }
 
     # ---------- RAG 检索辅助 ----------
+    def _temp(self, kind: str, default: float) -> float:
+        """调用点温度（0.9 可配）：单代理 NOVEL_<KIND>_TEMPERATURE >
+        NOVEL_TEMPERATURE（仅写作侧兜底）> 调用点默认。
+
+        reviewer 无兜底档：只看 NOVEL_REVIEWER_TEMPERATURE 和默认值。
+        """
+        per = getattr(self.settings, f"{kind}_temperature", None)
+        if per is not None:
+            return per
+        if kind in ("writer", "polisher") and self.settings.llm_temperature is not None:
+            return self.settings.llm_temperature
+        return default
+
     def _retrieve(self, task: str, with_prior: bool = True) -> str:
         """检索设定+人物（必须遵守）+ 前文（参考），拼成带出处分段的字符串。
 
@@ -340,7 +353,7 @@ class NovelAgent:
             system,
             user_msg,
             max_tokens=4096,
-            temperature=0.8,
+            temperature=self._temp("writer", 0.8),
         )
         # 按 === 分隔：构思存入 state.outline（0.8 保留传递，供 polisher/reviewer/run 日志消费），正文进 draft
         outline, body = _split_writer_output(raw or "")
@@ -370,7 +383,7 @@ class NovelAgent:
             system,
             f"以下是初稿，请润色：\n\n{draft_safe}{outline_hint}",
             max_tokens=4096,
-            temperature=0.6,
+            temperature=self._temp("polisher", 0.6),
         )
         if not raw:
             state.polished = state.draft
@@ -447,7 +460,7 @@ class NovelAgent:
             system,
             f"请审查以下稿件：\n\n{state.polished}{outline_hint}",
             max_tokens=2048,
-            temperature=0.2,
+            temperature=self._temp("reviewer", 0.2),
         )
         parsed = parse_review_full(result)
 
@@ -712,7 +725,10 @@ class NovelAgent:
                 "model": profiles.default.model,
                 "temperature": temperature,
                 "writer_model": profiles.writer.model,
-                "llm_temperature": profiles.writer.temperature,
+                "llm_temperature": self.settings.llm_temperature,
+                "writer_temperature": self.settings.writer_temperature,
+                "polisher_temperature": self.settings.polisher_temperature,
+                "reviewer_temperature": self.settings.reviewer_temperature,
                 "max_rounds": self.max_rounds,
                 "max_reviews": self.max_reviews,
                 "target_words": self.target_words,
@@ -831,7 +847,7 @@ class NovelAgent:
                 system,
                 partial_refine_user(before, selection, after),
                 max_tokens=4096,
-                temperature=0.6,
+                temperature=self._temp("polisher", 0.6),
             )
             text = _strip_code_fence(_strip_polisher_meta(raw or ""))
             results.append(text if text.strip() else None)
