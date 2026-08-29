@@ -2,9 +2,10 @@
 
 从 py/multiagent_novel.py 迁移，适配新 storage/llm/state：
 - replay：读 run JSON，纯重演状态链（不调模型）
-- compare：两 run 并排对比
-- evaluate：LLM 当评委按 rubric 打分
-- run_tests：基于规则的断言（铁律/意图/状态机），不调模型
+- compare：两 run 并排对比（规则词统计 + AI 味浓度行）
+- evaluate：LLM 当评委按 rubric 打分，附 AI 味量化（1.1）
+- run_tests：基于规则的断言（称呼红线/意图/维度分/状态机），不调模型
+- backtest_gate：历史 runs 回测门禁阈值（1.1 A35，分数缓存增量）
 
 所有函数接收 settings 与可选 out（输出函数），便于测试捕获输出。
 """
@@ -14,12 +15,19 @@ import json
 import re
 from typing import Any, Callable, Dict, Optional
 
+from .checker import ai_flavor_score, load_baseline, load_quality_rules
 from .config import Settings, get_settings
 from .llm import LLMClient
 from .prompts import EVALUATOR_RUBRIC
-from .storage import load_run
+from .storage import list_runs, load_run
 
-__all__ = ["replay", "compare", "evaluate", "run_tests"]
+__all__ = ["replay", "compare", "evaluate", "run_tests", "backtest_gate"]
+
+# AI 味组件中文名（design §3.8 输出样例）
+_AI_COMP_NAMES = {"blacklist": "黑名单", "sentence": "句长", "freq": "词频"}
+# reviewer 八维（A1/A7，run_tests 维度分断言用）
+_SCORE_DIMS = ("人物一致性", "文风一致性", "剧情连贯性", "时间线一致性",
+               "环境一致性", "伏笔一致性", "比喻密度", "视角越界")
 
 
 def replay(
@@ -154,6 +162,16 @@ def evaluate(
         out(f"  建议标题: {suggestion}（仅建议，不自动改）")
     if "标题理由" in score:
         out(f"  标题理由: {score['标题理由']}")
+
+    # 1.1：AI 味量化（纯代码组件，规则与基准从 settings 加载；A28 双方/每次现算）
+    ai = ai_flavor_score(chapter, load_quality_rules(settings), load_baseline(settings))
+    comp = " · ".join(
+        f"{_AI_COMP_NAMES.get(k, k)} {v}" for k, v in ai["components"].items()
+    )
+    out(f"  AI 味浓度: {ai['score']}/100（越高越AI）" + (f" 组件：{comp}" if comp else ""))
+    if ai["degraded"]:
+        out("  （降级：基准语料不足，词频组件未参与）")
+    score["AI味浓度"] = ai["score"]
     return score
 
 
@@ -164,24 +182,45 @@ def run_tests(
 ) -> bool:
     """对一次运行做基于规则的断言（不调模型）。返回是否全部通过。
 
-    三层维度：①铁律(不该出现) ②意图(该出现) ③状态机(流程跑通)。
+    四层维度：①称呼红线（规则 forbidden，不出现）②意图（规则 intent_words，
+    该出现）③维度分（八维齐全且各分 1-5 整数，A7/A37）④状态机（流程跑通）。
+    规则未配置 -> ①②退化为无（A36 不误伤）；旧记录无 scores -> ③跳过（A37）。
     """
+    if settings is None:
+        settings = get_settings()
     d = load_run(run_id, settings)
     final = d["final_state"]
     chapter = final.get("final_chapter") or ""
     feedback = final.get("feedback") or ""
     next_agent = final.get("next_agent") or ""
 
-    cases = [
-        # ① 铁律：男主不被取名
-        ("人物一致性：不含'许风'", "许风" not in chapter, f"出现次数={chapter.count('许风')}"),
-        # ② 意图：天气线落到正文
-        ("文风特征：含'风'字", "风" in chapter, f"出现次数={chapter.count('风')}"),
-        # ③ 状态机：审稿通过且正常终止
-        ("流程正确性：审稿通过且 done",
-         ("通过" in feedback) and (next_agent == "done"),
-         f"feedback含通过={'通过' in feedback}, next_agent={next_agent}"),
-    ]
+    rules = load_quality_rules(settings)
+    cases = []
+    if rules:
+        for w in (rules.get("naming_redlines") or {}).get("forbidden") or []:
+            cases.append((f"称呼红线：不含'{w}'", w not in chapter,
+                          f"出现次数={chapter.count(w)}"))
+        for w in rules.get("intent_words") or []:
+            cases.append((f"意图：含'{w}'", w in chapter,
+                          f"出现次数={chapter.count(w)}"))
+
+    scores = final.get("scores")
+    if isinstance(scores, dict) and scores:  # 旧记录无/空 scores -> 跳过（A37）
+        missing = [k for k in _SCORE_DIMS if k not in scores]
+        bad = {k: v for k, v in scores.items()
+               if not (isinstance(v, int) and not isinstance(v, bool)
+                      and 1 <= v <= 5)}
+        cases.append((
+            "维度分：八维齐全且各分 1-5 整数",
+            not missing and not bad,
+            f"缺失={missing or '无'}，越界或非整数={bad or '无'}",
+        ))
+
+    cases.append((
+        "流程正确性：审稿通过且 done",
+        ("通过" in feedback) and (next_agent == "done"),
+        f"feedback含通过={'通过' in feedback}, next_agent={next_agent}",
+    ))
 
     out(f"=== 测试用例 {d['run_id']} ===")
     all_ok = True
@@ -213,8 +252,122 @@ def compare(
         out(f"{'writer_model':<14}{str(wm_a):<28}{str(wm_b)}")
     out(f"{'task':<14}{a['task'][:20]:<28}{b['task'][:20]}")
     out(f"{'字数':<14}{len(cha):<28}{len(chb)}")
-    out(f"{'含风次数':<14}{cha.count('风'):<28}{chb.count('风')}")
-    out(f"{'含许风':<14}{str('许风' in cha):<28}{str('许风' in chb)}")
+    # 1.1 Z1：规则词统计改读规则文件（forbidden / intent_words），未配置跳过
+    rules = load_quality_rules(settings)
+    if rules:
+        for w in (rules.get("naming_redlines") or {}).get("forbidden") or []:
+            out(f"{'含' + w:<14}{str(w in cha):<28}{str(w in chb)}")
+        for w in rules.get("intent_words") or []:
+            out(f"{'含' + w + '次数':<14}{cha.count(w):<28}{chb.count(w)}")
+    # 1.1：AI 味浓度行（双方现算，A28；旧记录无该键不受影响）
+    baseline = load_baseline(settings)
+    out(f"{'AI味浓度':<14}"
+        f"{ai_flavor_score(cha, rules, baseline)['score']:<28}"
+        f"{ai_flavor_score(chb, rules, baseline)['score']}")
     out(f"{'审稿通过':<14}{str('通过' in (ca.get('feedback') or '')):<28}{str('通过' in (cb.get('feedback') or ''))}")
     out("\n--- A 开头 ---\n" + cha[:80])
     out("\n--- B 开头 ---\n" + chb[:80])
+
+
+# ---------- 回测门禁（A35，design §3.7）----------
+_GATE_BACKTEST_THRESHOLDS = (3.0, 3.5, 4.0)
+
+
+def _gate_weighted(score: Any, rules: Optional[dict]) -> Optional[float]:
+    """按 eval_gate.weights 算加权分（标题评分硬排除，A32）；不可算 -> None。
+
+    与 cli._gate_ok 同公式（Σw·s/Σw），此处要数值不要 bool（回测要分布）。
+    """
+    if not isinstance(rules, dict) or not isinstance(score, dict):
+        return None
+    gate = rules.get("eval_gate")
+    if not isinstance(gate, dict) or not gate.get("enabled"):
+        return None
+    weights = {
+        k: w for k, w in (gate.get("weights") or {}).items()
+        if k != "标题评分" and isinstance(w, (int, float))
+    }
+    hits = [(w, score[k]) for k, w in weights.items()
+            if isinstance(score.get(k), (int, float)) and not isinstance(score[k], bool)]
+    wsum = sum(w for w, _ in hits)
+    if not hits or wsum <= 0:
+        return None
+    return sum(w * s for w, s in hits) / wsum
+
+
+def backtest_gate(
+    settings: Optional[Settings] = None,
+    out: Callable[[str], None] = print,
+    limit: Optional[int] = None,
+) -> Optional[dict]:
+    """回测门禁（A35）：历史 runs 逐条跑评委，输出加权分分布与候选阈值拦截面。
+
+    - 遍历 runs（limit 控条数），跳过无 final_chapter 的记录；
+    - 分数缓存 <runs 目录>/../gate_backtest.json（Z10，按 run_id 增量，命中不重烧评委）；
+    - 拦截面无自动 ground truth，清单供人工核对（REPL 里人是标尺）；
+    - 未配置 eval_gate -> 提示后返回 None。
+    """
+    if settings is None:
+        settings = get_settings()
+    rules = load_quality_rules(settings)
+    gate = rules.get("eval_gate") if isinstance(rules, dict) else None
+    if not (isinstance(gate, dict) and gate.get("enabled")):
+        out("未配置 eval_gate（质量规则缺失或未启用），无法回测。")
+        return None
+
+    cache_path = settings.runs_path.parent / "gate_backtest.json"
+    cache: Dict[str, Any] = {}
+    if cache_path.is_file():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cache = loaded
+        except (json.JSONDecodeError, OSError):
+            pass  # 缓存坏 -> 当作无缓存重算
+
+    ids = list_runs(settings)
+    if limit:
+        ids = ids[:limit]
+
+    out("=== 门禁回测（顺序跑评委，命中缓存不重烧）===")
+    rows: list[tuple[str, Optional[float]]] = []
+    for rid in ids:
+        try:
+            record = load_run(rid, settings)
+        except (OSError, json.JSONDecodeError) as e:
+            out(f"  跳过 {rid}（读取失败：{e}）")
+            continue
+        if not (record.get("final_state") or {}).get("final_chapter"):
+            continue  # 无 final_chapter -> 跳过（tasks T10）
+        if isinstance(cache.get(rid), dict):
+            score, src = cache[rid], "缓存"
+        else:
+            score = evaluate(rid, settings, out=out)
+            if not isinstance(score, dict) or "error" in score:
+                out(f"  {rid} 评测失败，跳过")
+                continue
+            cache[rid] = score
+            src = "评委"
+        weighted = _gate_weighted(score, rules)
+        rows.append((rid, weighted))
+        ws = f"{weighted:.2f}" if weighted is not None else "N/A"
+        out(f"  {rid}  加权分 {ws}（{src}）")
+
+    # 增量写回缓存（Z10）
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        out(f"（缓存写入失败：{e}）")
+
+    valid = sorted(((w, rid) for rid, w in rows if w is not None))
+    out(f"\n--- 加权分分布（低->高，共 {len(valid)}/{len(rows)} 条有效）---")
+    for w, rid in valid:
+        out(f"  {w:.2f}  {rid}")
+    out("--- 候选阈值拦截面（人工核对误伤）---")
+    for t in _GATE_BACKTEST_THRESHOLDS:
+        blocked = [rid for w, rid in valid if w < t]
+        out(f"  threshold {t}: 拦截 {len(blocked)} 条"
+            + (" -> " + ", ".join(blocked) if blocked else ""))
+    return {rid: w for rid, w in rows}

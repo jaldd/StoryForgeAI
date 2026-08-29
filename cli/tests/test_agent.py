@@ -1,7 +1,8 @@
 """agent 模块测试：状态机流程，用 fake LLM/RAG 不联网。"""
-from novel_agent.agent import NovelAgent, parse_review
+from novel_agent.agent import NovelAgent, parse_review, parse_review_full
 from novel_agent.config import Settings
 from novel_agent.memory import WorkingMemory
+from novel_agent.state import PipelineState
 
 
 # ---------- parse_review ----------
@@ -45,6 +46,58 @@ def test_parse_review_reason_with_brace():
     assert "附录" in reason
 
 
+# ---------- parse_review_full（1.1 A5-A6）----------
+def test_parse_review_full_new_schema():
+    """新 schema 全字段：scores 八维分 + issues 结构化，reason 不折叠 issues。"""
+    text = ('{"pass": false, "reason": "称呼错误", '
+            '"scores": {"人物一致性": 4, "文风一致性": 2, "剧情连贯性": 5}, '
+            '"issues": [{"quote": "许风走进来", "problem": "人物一致性：称呼错误", '
+            '"fix": "改为林晚"}]}')
+    r = parse_review_full(text)
+    assert r.passed is False
+    assert r.reason == "称呼错误"
+    assert r.scores == {"人物一致性": 4, "文风一致性": 2, "剧情连贯性": 5}
+    assert r.issues == [{"quote": "许风走进来", "problem": "人物一致性：称呼错误",
+                          "fix": "改为林晚"}]
+
+
+def test_parse_review_full_old_schema_string_issues_normalized():
+    """旧 schema 字符串 issues 归一为三键 dict（D4 兼容）；无 scores -> 空。"""
+    r = parse_review_full('{"pass": false, "reason": "不够克制", "issues": ["称呼错了", "天气解释了"]}')
+    assert r.passed is False
+    assert r.scores == {}
+    assert r.issues == [
+        {"quote": "", "problem": "称呼错了", "fix": ""},
+        {"quote": "", "problem": "天气解释了", "fix": ""},
+    ]
+
+
+def test_parse_review_full_unparseable_returns_none():
+    """不可解析 -> None（不可解析路径交 _confirm_unparseable，不动）。"""
+    assert parse_review_full("看不懂这段，无法判断") is None
+    assert parse_review_full("") is None
+
+
+def test_parse_review_full_scores_validation():
+    """scores 只收 1-5 整数：越界 / 浮点 / 字符串 / 布尔全丢弃（A6）。"""
+    text = ('{"pass": true, "reason": "ok", "scores": '
+            '{"人物一致性": 0, "文风一致性": 6, "剧情连贯性": 3, '
+            '"环境一致性": 4.5, "伏笔一致性": true, "视角越界": "5"}}')
+    r = parse_review_full(text)
+    assert r.scores == {"剧情连贯性": 3}
+
+
+def test_parse_review_full_json_in_backticks():
+    """四级提取共享：```json 围栏 + 前后杂文字仍可解析。"""
+    text = ('审查结果：\n```json\n'
+            '{"pass": true, "reason": "通过", "scores": {"人物一致性": 5}, "issues": []}\n'
+            '```\n以上。')
+    r = parse_review_full(text)
+    assert r.passed is True
+    assert r.scores == {"人物一致性": 5}
+    assert r.issues == []
+
+
 # ---------- 完整流程（happy path）----------
 def test_pipeline_happy_path(fake_llm, fake_rag, tmp_settings):
     agent = NovelAgent(
@@ -57,7 +110,7 @@ def test_pipeline_happy_path(fake_llm, fake_rag, tmp_settings):
     assert state.final_chapter  # 非空
     assert "风" in state.draft
     assert "通过" in state.feedback
-    assert len(record["steps"]) == 3  # writer/polisher/reviewer（0.8 删 director）
+    assert len(record["steps"]) == 4  # writer/polisher/checker/reviewer（1.1：checker 零 LLM 直通）
     assert record["run_id"].startswith("run_")
     assert record["config"]["model"] == "glm-5.2"
 
@@ -74,14 +127,14 @@ def test_pipeline_without_rag(fake_llm, tmp_settings):
 
 # ---------- 打回场景 ----------
 def test_pipeline_review_reject_then_pass(fake_llm, fake_rag, tmp_settings):
-    """审稿先打回再通过：review_count 递增，回到 writer 重写。"""
+    """审稿先打回再通过：review_count 递增，打回进 fixer 精修问题段后复检（1.1 D9）。"""
     fake_llm.script = [
-        "【初稿1】风起了。",                       # writer #1
-        "【润色1】风起了，林晚。",                  # polisher #1
-        '{"pass": false, "reason": "不够克制"}',  # reviewer #1 -> 打回
-        "【初稿2】风又起了。",                      # writer #2
-        "【润色2】风又起了，她在。",                # polisher #2
-        '{"pass": true, "reason": "通过"}',       # reviewer #2 -> 通过
+        "【初稿1】风起了。\n\n她低头。",         # writer #1
+        "【润色1】风起了，林晚。\n\n她低头。",    # polisher #1
+        '{"pass": false, "reason": "不够克制", "issues": '
+        '[{"dimension": "文风", "problem": "太直白", "quote": "她低头", "suggestion": "更含蓄"}]}',  # reviewer #1 -> 打回 fixer
+        "【第2段·修复后】她沉默地低下头。",       # fixer #1（writer_llm 回落 llm）
+        '{"pass": true, "reason": "通过"}',      # reviewer #2 -> 通过
     ]
     agent = NovelAgent(
         llm=fake_llm, rag=fake_rag, exemplar="范文",
@@ -91,19 +144,48 @@ def test_pipeline_review_reject_then_pass(fake_llm, fake_rag, tmp_settings):
 
     assert state.review_count == 1
     assert state.next_agent == "done"
-    assert state.final_chapter == "【润色2】风又起了，她在。"
-    assert len(record["steps"]) == 6  # 3 + 打回多出的 writer/polisher/reviewer
-    assert len(fake_llm.calls) == 6
+    assert state.final_chapter == "【润色1】风起了，林晚。\n\n她沉默地低下头。"
+    # A8：writer 仅一次，打回不重写全章，由 fixer 只修问题段
+    assert len([c for c in fake_llm.calls if "写一段新章节" in c]) == 1
+    agents_seq = [s["agent"] for s in record["steps"]]
+    assert agents_seq == ["writer", "polisher", "checker", "reviewer", "fixer", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 5  # checker 两过均零 LLM
+
+
+def test_pipeline_checker_reject_then_pass(fake_llm, fake_rag, tmp_settings):
+    """1.1 规则门禁全链路：checker 命中 -> fixer 修复 -> checker 复检 -> reviewer。"""
+    fake_llm.script = [
+        "【初稿】她低头。",                # writer
+        "【润色】她低头。",                # polisher（含黑名单词）
+        "【第1段·修复后】她垂下目光。",      # fixer
+        '{"pass": true, "reason": "通过"}',  # reviewer
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+        quality_rules={"blacklist": ["她低头"]},
+    )
+    state, record = agent.run("写第5章：异乡风起")
+
+    assert state.review_count == 1          # checker 打回复用 review 预算（A14）
+    assert state.final_chapter == "她垂下目光。"
+    assert state.issues == []               # Z5：修复后清空，无陈旧意见
+    agents_seq = [s["agent"] for s in record["steps"]]
+    assert agents_seq == ["writer", "polisher", "checker", "fixer", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 4          # checker 两过均零 LLM
+    assert record["config"]["quality_rules"] is True   # Z6：本 run 带规则
+    fs = record["final_state"]
+    assert "scores" in fs and "issues" in fs  # 富解析字段随 asdict 落 record（A4/A24）
 
 
 def test_pipeline_max_reviews_cap(fake_llm, fake_rag, tmp_settings):
-    """达到打回上限强制定稿，防死循环。"""
+    """达到打回上限强制定稿，防死循环（打回进 fixer，第二次 reviewer 直接收口）。"""
     fake_llm.script = [
-        "【初稿1】",                  # writer #1
-        "【润色1】",                  # polisher #1
-        '{"pass": false, "reason": "不好"}',  # reviewer #1 -> 打回 (review_count=1)
-        "【初稿2】",                  # writer #2
-        "【润色2】最终稿",            # polisher #2
+        "【初稿1】风起了。\n\n她低头。",         # writer #1
+        "【润色1】风起了，林晚。\n\n她低头。",    # polisher #1
+        '{"pass": false, "reason": "不好", "issues": '
+        '[{"dimension": "文风", "problem": "太直白", "quote": "她低头", "suggestion": "更含蓄"}]}',  # reviewer #1 -> 打回 (review_count=1)
+        "【第2段·修复后】她沉默地低下头。",       # fixer #1
         # reviewer #2 不再调 LLM：review_count(1) >= max_reviews(1) -> 强制定稿
     ]
     agent = NovelAgent(
@@ -113,15 +195,18 @@ def test_pipeline_max_reviews_cap(fake_llm, fake_rag, tmp_settings):
     state, _ = agent.run("写第5章：异乡风起")
     assert state.review_count == 1
     assert state.next_agent == "done"
-    assert state.final_chapter == "【润色2】最终稿"
-    assert len(fake_llm.calls) == 5  # 第 2 次 reviewer 未调 LLM
+    assert state.final_chapter == "【润色1】风起了，林晚。\n\n她沉默地低下头。"
+    assert len(fake_llm.calls) == 4  # 第 2 次 reviewer 未调 LLM（逃生门收口）
 
 
 def test_pipeline_max_reviews_forced_finalize_warns(fake_llm, fake_rag, tmp_settings, capsys):
     """0.1：强制定稿逃生门必须控制台显著警告 + run 日志留痕。"""
     fake_llm.script = [
-        "【初稿1】", "【润色1】", '{"pass": false, "reason": "不好"}',
-        "【初稿2】", "【润色2】最终稿",
+        "【初稿1】风起了。\n\n她低头。",
+        "【润色1】风起了，林晚。\n\n她低头。",
+        '{"pass": false, "reason": "不好", "issues": '
+        '[{"dimension": "文风", "problem": "太直白", "quote": "她低头", "suggestion": "更含蓄"}]}',
+        "【第2段·修复后】她沉默地低下头。",
     ]
     agent = NovelAgent(
         llm=fake_llm, rag=fake_rag, exemplar="范文",
@@ -237,7 +322,7 @@ def test_working_context_gating(fake_llm, fake_rag, tmp_settings):
 
 # ---------- 精修（refine）----------
 def test_refine_skips_writer(fake_llm, fake_rag, tmp_settings):
-    """精修：跳过 writer，polisher->reviewer，初稿=传入内容。"""
+    """精修：跳过 writer，polisher->checker->reviewer，初稿=传入内容。"""
     agent = NovelAgent(
         llm=fake_llm, rag=fake_rag, exemplar="范文",
         settings=tmp_settings, working_memory=WorkingMemory(),
@@ -246,32 +331,34 @@ def test_refine_skips_writer(fake_llm, fake_rag, tmp_settings):
     assert state.next_agent == "done"
     assert state.final_chapter  # 非空
     assert state.draft == "这是要精修的初稿。"  # 初稿保留
-    assert len(record["steps"]) == 2  # 只有 polisher + reviewer
+    assert len(record["steps"]) == 3  # polisher + checker + reviewer（checker 无规则直通）
     assert record["run_id"].startswith("refine_")
     assert all("写一段新章节" not in c for c in fake_llm.calls)  # 未走 writer
 
 
-def test_refine_reject_goes_to_polisher(fake_llm, fake_rag, tmp_settings):
-    """精修模式下 reviewer 打回 -> 回 polisher，不回 writer。"""
+def test_refine_reject_goes_to_fixer(fake_llm, fake_rag, tmp_settings):
+    """精修模式下 reviewer 打回 -> 进 fixer 修复，不回 writer/polisher（1.1 D9）。"""
     fake_llm.script = [
-        "【润色1】",                              # polisher #1
-        '{"pass": false, "reason": "不够克制"}',  # reviewer #1 -> 打回 polisher
-        "【润色2】最终",                          # polisher #2
-        '{"pass": true, "reason": "通过"}',       # reviewer #2 -> 通过
+        "【润色1】她低头。",                       # polisher #1
+        '{"pass": false, "reason": "不够克制", "issues": '
+        '[{"dimension": "文风", "problem": "太直白", "quote": "她低头", "suggestion": "更含蓄"}]}',  # reviewer #1 -> 打回 fixer
+        "【第1段·修复后】她沉默地低下头。",          # fixer #1
+        '{"pass": true, "reason": "通过"}',        # reviewer #2 -> 通过
     ]
     agent = NovelAgent(
         llm=fake_llm, rag=fake_rag, exemplar="范文",
         settings=tmp_settings, working_memory=WorkingMemory(),
     )
-    state, record = agent.refine("初稿", "精修：x")
+    state, record = agent.refine("她低头。", "精修：x")
     assert state.review_count == 1
     assert state.next_agent == "done"
-    assert state.final_chapter == "【润色2】最终"
-    assert len(record["steps"]) == 4  # polisher,reviewer,polisher,reviewer
-    assert len(fake_llm.calls) == 4
+    assert state.final_chapter == "她沉默地低下头。"
+    agents_seq = [s["agent"] for s in record["steps"]]
+    assert agents_seq == ["polisher", "checker", "reviewer", "fixer", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 4  # checker 两过均零 LLM
     assert all("写一段新章节" not in c for c in fake_llm.calls)
-    # refine 跑完应复位打回目标，不影响后续 run()
-    assert agent._reject_target == "writer"
+    assert "请润色" in fake_llm.calls[0]        # 第 1 次调用是 polisher
+    assert "待修段落" in fake_llm.calls[2]      # 第 3 次调用是 fixer（打回不回 polisher 重润）
 
 
 def test_writer_strips_construction_notes(fake_llm, fake_rag, tmp_settings):
@@ -752,3 +839,239 @@ def test_record_config_new_keys_configured(fake_llm, fake_rag, tmp_settings):
     assert cfg["llm_temperature"] == 0.7
     # 密钥/端点绝不落盘
     assert "api_key" not in cfg and "base_url" not in cfg
+
+
+# ---------- 1.1 质量门禁：_checker / _fixer / reviewer 富解析（T6）----------
+def _gate_state(polished: str, **kw):
+    """方法级直调用的 state：填好 polished 与任意覆盖字段。"""
+    s = PipelineState(task="测试章节")
+    s.polished = polished
+    for k, v in kw.items():
+        setattr(s, k, v)
+    return s
+
+
+GATE_TEXT = (
+    "他沿着河岸走了很久。\n\n"
+    "风从北边来。\n\n"
+    "她的眼眸里闪过一丝哀伤。\n\n"
+    "狗在村口叫了两声。\n\n"
+    "水开了。\n"
+)
+
+
+def test_checker_no_rules_passes_through(fake_llm, tmp_settings):
+    """未注入 quality_rules -> checker 直通 reviewer，零 LLM 调用。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state("她的眼眸里闪过一丝哀伤。")
+    agent._checker(state)
+    assert state.next_agent == "reviewer"
+    assert state.review_count == 0
+    assert state.issues == []
+    assert fake_llm.calls == []            # 纯代码零 LLM
+
+
+def test_checker_hit_rejects_to_fixer(fake_llm, tmp_settings):
+    """命中 -> 打回 fixer：review_count+1（A14）、issues 入 state、feedback 附摘要（Z2）。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules={"blacklist": ["眼眸"]},
+    )
+    state = _gate_state("她的眼眸里闪过一丝哀伤。")
+    agent._checker(state)
+    assert state.next_agent == "fixer"
+    assert state.review_count == 1
+    assert len(state.issues) == 1
+    assert "黑名单词" in state.feedback and "规则检查不通过" in state.feedback
+    assert fake_llm.calls == []
+
+
+def test_checker_clean_text_passes(fake_llm, tmp_settings):
+    """有规则但无命中 -> 放行 reviewer，issues / review_count 不动。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules={"blacklist": ["眼眸"]},
+    )
+    state = _gate_state("风从北边来。")
+    agent._checker(state)
+    assert state.next_agent == "reviewer"
+    assert state.issues == [] and state.review_count == 0
+
+
+def test_checker_at_cap_lets_through_with_log(fake_llm, tmp_settings):
+    """达打回上限放行 reviewer（D7）：review_count 不再递增，log 留痕。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings, max_reviews=1,
+        quality_rules={"blacklist": ["眼眸"]},
+    )
+    state = _gate_state("她的眼眸里闪过一丝哀伤。", review_count=1)
+    agent._checker(state)
+    assert state.next_agent == "reviewer"
+    assert state.review_count == 1
+    assert any("放行" in line for line in state.log)
+
+
+def test_fixer_repairs_located_paragraph(fake_llm, tmp_settings):
+    """quote 定位段落后按标记协议修复：仅该段变、区间外逐字节不变、issues 清空（Z5）。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [{"quote": "她的眼眸里闪过一丝哀伤", "problem": "黑名单词「眼眸」", "fix": "换成具体描写"}]
+    fake_llm.script = ["【第3段·修复后】\n她低下头，没说话。"]
+    agent._fixer(state)
+
+    assert state.next_agent == "checker"
+    assert state.issues == []                                  # Z5 清空
+    assert len(fake_llm.calls) == 1                            # A11 单次调用
+    assert state.polished == GATE_TEXT.replace(
+        "她的眼眸里闪过一丝哀伤。", "她低下头，没说话。")
+    assert state.polished.startswith("他沿着河岸走了很久。\n\n风从北边来。\n\n")
+    assert state.polished.endswith("\n\n狗在村口叫了两声。\n\n水开了。\n")
+    assert any("[fixer]" in line for line in state.log)
+
+
+def test_fixer_multi_issue_single_call(fake_llm, tmp_settings):
+    """多个问题段合并单次调用（A11）：一次调用 payload 含全部问题段与各自意见。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [
+        {"quote": "他沿着河岸", "problem": "p1", "fix": "f1"},
+        {"quote": "她的眼眸", "problem": "p2", "fix": "f2"},
+    ]
+    fake_llm.script = ["【第1段·修复后】\n他沿河走了很久。\n\n【第3段·修复后】\n她低下头。"]
+    agent._fixer(state)
+
+    assert len(fake_llm.calls) == 1
+    payload = fake_llm.calls[0]
+    assert "第1段" in payload and "第3段" in payload
+    assert "他沿着河岸走了很久。" in payload    # 段落原文入 prompt
+    assert "她的眼眸里闪过一丝哀伤。" in payload
+    assert "p1" in payload and "p2" in payload  # 各段意见入 prompt
+    assert "他沿河走了很久。" in state.polished
+    assert "她低下头。" in state.polished
+    assert "风从北边来。" in state.polished       # 非问题段不动
+
+
+def test_fixer_adjacent_paragraphs_merged(fake_llm, tmp_settings):
+    """相邻问题段（2、3）合并为一个 span 整块替换，段间空行结构保持。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [
+        {"quote": "风从北边来", "problem": "p1", "fix": "f1"},
+        {"quote": "她的眼眸", "problem": "p2", "fix": "f2"},
+    ]
+    fake_llm.script = ["【第2段·修复后】\n新二。\n\n【第3段·修复后】\n新三。"]
+    agent._fixer(state)
+
+    assert "新二。\n\n新三。" in state.polished
+    assert state.polished.startswith("他沿着河岸走了很久。\n\n")
+    assert "狗在村口叫了两声。" in state.polished
+
+
+def test_fixer_unlocatable_quote_goes_whole(fake_llm, tmp_settings):
+    """quote 为空（metaphor 风格）-> 整文降级（D12）：payload 含原稿全文。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [{"quote": "", "problem": "比喻密度过高", "fix": "删减比喻"}]
+    whole = "整文修复后的稿子，风从北边来，他沿着河岸走了很久，狗也叫了。" * 2
+    fake_llm.script = [whole]
+    agent._fixer(state)
+
+    assert "【原稿全文】" in fake_llm.calls[0]      # fixer_whole_user 渲染
+    assert "他沿着河岸走了很久。" in fake_llm.calls[0]
+    assert state.next_agent == "checker"
+    assert state.issues == []
+    assert state.polished == whole
+    assert any("整文" in line for line in state.log)
+
+
+def test_fixer_quote_not_substring_goes_whole(fake_llm, tmp_settings):
+    """quote 非原文子串 -> 整组整文降级（D12，不做混合协议），仍单次调用。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [
+        {"quote": "他沿着河岸", "problem": "p1", "fix": "f1"},
+        {"quote": "这句引文不在原文中", "problem": "p2", "fix": "f2"},  # 任一不可定位
+    ]
+    fake_llm.script = ["整文修复后的稿子，风从北边来，他沿着河岸走了很久，狗也叫了。" * 2]
+    agent._fixer(state)
+
+    assert "【原稿全文】" in fake_llm.calls[0]
+    assert len(fake_llm.calls) == 1
+    assert state.next_agent == "checker"
+
+
+def test_fixer_shrink_protection_keeps_original(fake_llm, tmp_settings):
+    """段落级字数保护（A15）：修复缩水超 50% 保留原段 + log 留痕。"""
+    long_para = ("她的眼眸里闪过一丝淡淡的哀伤，情绪如潮水般涌上心头，无可回避。"
+                 "他蹲在门槛上抽烟，没说话，屋檐下的灯还亮着。")
+    text = f"{long_para}\n\n狗在村口叫了两声。\n"
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(text)
+    state.issues = [{"quote": "眼眸", "problem": "p", "fix": "f"}]
+    fake_llm.script = ["【第1段·修复后】\n太短。"]
+    agent._fixer(state)
+
+    assert state.polished == text                  # 保留原段
+    assert any("缩水" in line for line in state.log)
+    assert state.next_agent == "checker"
+
+
+def test_fixer_missing_paragraph_falls_back(fake_llm, tmp_settings):
+    """未返回段保持原文（D11）；LLM 幻觉返回的额外段号被忽略。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [
+        {"quote": "他沿着河岸", "problem": "p1", "fix": "f1"},
+        {"quote": "她的眼眸", "problem": "p2", "fix": "f2"},
+    ]
+    fake_llm.script = ["【第1段·修复后】\n新段一。\n\n【第5段·修复后】\n幻觉段。"]
+    agent._fixer(state)
+
+    assert "新段一。" in state.polished                  # 段 1 已修
+    assert "她的眼眸里闪过一丝哀伤。" in state.polished  # 段 3 未返回 -> 原文
+    assert "水开了。" in state.polished                   # 段 5 未请求 -> 幻觉被忽略
+    assert "幻觉段。" not in state.polished
+
+
+def test_reviewer_rich_parse_reject_stores_scores_issues(fake_llm, tmp_settings):
+    """reviewer 富解析：scores/issues 落 state；打回 feedback 含 problem 摘要（A3）。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state("风起了。")
+    fake_llm.script = [
+        '{"pass": false, "reason": "称呼错误", '
+        '"scores": {"人物一致性": 4, "文风一致性": 2}, '
+        '"issues": [{"quote": "许风走进来", "problem": "人物一致性：称呼错误", "fix": "改为林晚"}]}'
+    ]
+    agent._reviewer(state)
+
+    assert state.scores == {"人物一致性": 4, "文风一致性": 2}
+    assert state.issues == [{"quote": "许风走进来", "problem": "人物一致性：称呼错误", "fix": "改为林晚"}]
+    assert state.review_count == 1
+    assert "称呼错误" in state.feedback
+    assert "人物一致性：称呼错误" in state.feedback    # problem 摘要进 feedback
+    assert state.next_agent == "fixer"               # 1.1 D9：打回固定 fixer
+    assert not state.final_chapter
+
+
+def test_reviewer_rich_parse_pass_keeps_scores(fake_llm, tmp_settings):
+    """通过路径：scores 落 state 且定稿。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state("风起了。")
+    fake_llm.script = ['{"pass": true, "reason": "通过", "scores": {"人物一致性": 5}, "issues": []}']
+    agent._reviewer(state)
+
+    assert state.scores == {"人物一致性": 5}
+    assert state.issues == []
+    assert state.final_chapter == "风起了。"
+    assert state.next_agent == "done"
+
+
+def test_record_config_quality_rules_flag(fake_llm, tmp_settings):
+    """Z6：config.quality_rules 布尔如实反映注入状态。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    _, record = agent.run("写第5章：异乡风起")
+    assert record["config"]["quality_rules"] is False
+
+    agent2 = NovelAgent(llm=fake_llm, settings=tmp_settings, quality_rules={"blacklist": ["眼眸"]})
+    _, record2 = agent2.run("写第5章：异乡风起")
+    assert record2["config"]["quality_rules"] is True

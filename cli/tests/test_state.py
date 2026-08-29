@@ -11,6 +11,9 @@ def test_defaults():
     assert s.outline == ""           # 0.8：构思字段，无 === 分隔时为空
     assert s.round == 0 and s.review_count == 0
     assert s.log == []
+    # 1.1 审核维度化：独立默认值，互不共享（default_factory）
+    assert s.scores == {}
+    assert s.issues == []
 
 
 def test_asdict_roundtrip():
@@ -21,3 +24,13 @@ def test_asdict_roundtrip():
     # 可序列化回同字段
     s2 = PipelineState(**d)
     assert s2.task == s.task and s2.draft == s.draft
+
+
+def test_scores_issues_fields():
+    """scores/issues 可写并进 asdict（run record 的 steps/final_state，A4/A24）。"""
+    s = PipelineState(task="写第5章")
+    s.scores = {"人物一致性": 4}
+    s.issues = [{"quote": "许风进来", "problem": "称呼错误", "fix": "改为林晚"}]
+    d = asdict(s)
+    assert d["scores"] == {"人物一致性": 4}
+    assert d["issues"] == [{"quote": "许风进来", "problem": "称呼错误", "fix": "改为林晚"}]

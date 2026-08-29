@@ -19,6 +19,9 @@ __all__ = [
     "writer_system",
     "polisher_system",
     "reviewer_system",
+    "fixer_system",
+    "fixer_user",
+    "fixer_whole_user",
     "EVALUATOR_RUBRIC",
     "PLOT_SUMMARY_SYSTEM",
     "COMPARE_SYSTEM",
@@ -204,14 +207,74 @@ def reviewer_system(novel_name: str, retrieved: str, instruction: str = "", rule
 4. 时间线一致性：时间/季节/昼夜是否合理
 5. 环境一致性：场景/意象是否连贯
 6. 伏笔一致性：有没有矛盾或遗漏
+7. 比喻密度：像/仿佛/宛如类标记词是否密集堆叠（5=克制自然，1=滥用）
+8. 视角越界：叙述是否越出当前视角人物可知的范围（5=无越界）
 
 
 {_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
 
 只返回纯 JSON，格式如下，不要加任何其他文字、不要用 ```json 包裹：
-{{"pass": true/false, "reason": "总评（不超过30字）", "issues": ["问题1", "问题2", "问题3"]}}
-不通过时必须把所有问题一次性列全，不要只写一个。通过时 issues 留空数组。
+{{"pass": true/false, "reason": "总评（不超过30字）",
+ "scores": {{"人物一致性": 4, "文风一致性": 3, "剧情连贯性": 4, "时间线一致性": 5,
+             "环境一致性": 4, "伏笔一致性": 5, "比喻密度": 4, "视角越界": 5}},
+ "issues": [{{"quote": "原句逐字引用", "problem": "维度名：问题描述", "fix": "具体改法"}}]}}
+不通过时必须把所有问题一次性列全，每个问题引用原句并给出改法。通过时 issues 留空数组。
 """
+
+
+# ---------- 修稿（1.1 quality-gate fixer）----------
+def fixer_system(novel_name: str, rules: str = "") -> str:
+    return f"""你是小说《{novel_name}》的修稿师。
+任务：只修复明确列出的问题，其余部分保持原样。
+铁律（绝对不能违反）：
+1. 只改问题处：按每段附带的意见修改，其余表达一个字都不动
+2. 严禁改动情节、人物人称、称呼与伏笔
+3. 每个待修段独立修复，不要合并、移动或增删段落
+{_rules_block(rules)}
+输出协议（必须遵守）：
+- 每个修复后的段，先写标记行「【第N段·修复后】」（N 为该段编号），紧跟整段修复后的文本
+- 只返回被修复的段，未提及的段不要返回
+- 不要加任何总说明、标题、注释，不要用代码围栏包裹
+"""
+
+
+def fixer_user(spans_data: list) -> str:
+    """修稿 user prompt：多个问题段 + 各自意见 + 上下文，合并单次调用（A11）。
+
+    spans_data 元素：{"no": 段号, "before": 上文或空, "text": 段落原文,
+    "after": 下文或空, "issues": [{"quote", "problem", "fix"}, ...]}。
+    """
+    parts: list[str] = []
+    for item in spans_data:
+        parts.append(f"━━ 第{item['no']}段 ━━")
+        if item.get("before"):
+            parts.append(f"【上文（仅供理解语境，不要修改）】\n{item['before']}\n")
+        parts.append(f"【待修段落】\n{item['text']}\n")
+        if item.get("after"):
+            parts.append(f"【下文（仅供理解语境，不要修改）】\n{item['after']}\n")
+        issues = item.get("issues") or []
+        if issues:
+            lines = [
+                f"{i}. 问题：{iss.get('problem', '')}；改法：{iss.get('fix', '')}"
+                for i, iss in enumerate(issues, 1)
+            ]
+            parts.append("【该段意见（逐条修复）】\n" + "\n".join(lines) + "\n")
+    return "\n".join(parts)
+
+
+def fixer_whole_user(text: str, issues: list) -> str:
+    """整文修复降级的 user prompt（A12）：原稿全文 + 全部意见，保内容只改问题处。"""
+    lines = [
+        f"{i}. 问题：{iss.get('problem', '')}；改法：{iss.get('fix', '')}"
+        for i, iss in enumerate(issues or [], 1)
+    ]
+    advice = "\n".join(lines)
+    return (
+        "以下稿件的问题无法精确定位到段落，请整文修复：保留内容，只改问题处，"
+        "情节、人称、称呼与其余表达都不要动。\n\n"
+        f"【意见清单（逐条修复）】\n{advice}\n\n"
+        f"【原稿全文】\n{text}"
+    )
 
 
 # ---------- 评测 / 摘要 prompt ----------

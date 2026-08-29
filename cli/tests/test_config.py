@@ -272,6 +272,46 @@ def test_llm_extra_non_object_fail_fast(monkeypatch):
         get_settings.cache_clear()
 
 
+# ---------- 1.1 质量门禁（quality-gate T1）----------
+def test_quality_paths_default(tmp_settings):
+    """A23/A27：质量规则与人工语料默认路径。"""
+    assert tmp_settings.quality_rules_subpath == "质量规则.json"
+    assert tmp_settings.human_text_subpath == "正文/新"
+    assert tmp_settings.quality_rules_full == tmp_settings.novel_path / "质量规则.json"
+    assert tmp_settings.human_text_full == tmp_settings.novel_path / "正文/新"
+
+
+def test_quality_rules_env_wiring(monkeypatch):
+    """A23：NOVEL_QUALITY_RULES / NOVEL_HUMAN_TEXT 接线；空串 = 禁用（full 退回 novel_path）。
+
+    get_settings 带 @lru_cache(maxsize=1)：setenv 后必须先 cache_clear
+    才能读到新值，收尾再 clear 一次防污染其他用例（0.8 纪律）。
+    """
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_QUALITY_RULES", "设定/门禁.json")
+    monkeypatch.setenv("NOVEL_HUMAN_TEXT", "正文/旧稿")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.quality_rules_subpath == "设定/门禁.json"
+        assert s.human_text_subpath == "正文/旧稿"
+        assert s.quality_rules_full.name == "门禁.json"
+        assert s.human_text_full.name == "旧稿"
+    finally:
+        get_settings.cache_clear()
+    # 空串 = 禁用：full 退回 novel_path（同 rules_subpath 空串先例）
+    monkeypatch.setenv("NOVEL_QUALITY_RULES", "")
+    monkeypatch.setenv("NOVEL_HUMAN_TEXT", "")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.quality_rules_subpath == "" and s.human_text_subpath == ""
+        assert s.quality_rules_full == s.novel_path
+        assert s.human_text_full == s.novel_path
+    finally:
+        get_settings.cache_clear()
+
+
 def test_no_llm_envs_keeps_current_behavior(monkeypatch):
     """A4：全部 0.7 变量未设时与现状一致（火山端点 + glm-5.2 + 各字段空/None）。"""
     from novel_agent.config import get_settings

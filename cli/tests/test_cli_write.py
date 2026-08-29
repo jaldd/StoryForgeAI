@@ -2,8 +2,11 @@
 
 覆盖 0.3（写完自动入库）：章节保存后 rag.add_document 收到章节文件绝对路径；
 索引失败不阻断写作流程。
+1.1 T8：质量门禁三路 / D8 豁免 / 规则未配置 / refine 同构 / _gate_ok 单测 / A23 命令层捕获。
 """
 from __future__ import annotations
+
+import json
 
 from novel_agent import cli
 from novel_agent.config import Settings
@@ -16,18 +19,19 @@ from novel_agent.storage import load_working_memory
 class WriteAgent:
     """替身 agent：run() 返回已定稿的 state；llm 摘要返回固定文本。"""
 
-    def __init__(self, rag, final="风起了。他没说话。"):
+    def __init__(self, rag, final="风起了。他没说话。", feedback="审稿通过：ok"):
         self.rag = rag
         self.final = final
+        self.feedback = feedback
         self.instruction = ""
         self.llm = self  # 摘要用（agent.llm.chat）
 
     def run(self, task, run_id=None, temperature=0.9):
         state = PipelineState(task=task)
         state.final_chapter = self.final
-        state.feedback = "审稿通过：ok"
+        state.feedback = self.feedback
         state.round = 3
-        state.log = ["[reviewer] 审稿通过：ok"]
+        state.log = ["[reviewer] " + self.feedback]
         record = {
             "run_id": "run_20260828_000001",
             "task": task,
@@ -280,3 +284,236 @@ def test_build_agent_writer_model_configured(tmp_settings):
     agent, _ = cli._build_agent(settings)
     assert agent.llm.profile.model == "glm-5.2"
     assert agent.writer_llm.profile.model == "kimi-k3"
+
+
+# ---------- 质量门禁（1.1 T8 / A30-A34）----------
+def _write_gate_rules(tmp_settings, threshold=4.0):
+    """往临时小说目录写只含 eval_gate 的质量规则 JSON（配权维度故意取低分可拦）。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    (novel / "质量规则.json").write_text(json.dumps({
+        "eval_gate": {"enabled": True, "threshold": threshold,
+                      "weights": {"连贯性": 1.0, "人物一致性": 1.0}},
+    }), encoding="utf-8")
+
+
+def _patch_write(monkeypatch, tmp_settings, agent, score):
+    """门禁测试公共注入：假 agent + 假评委返回固定分。"""
+    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, WorkingMemory()))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: score)
+
+
+def test_write_gate_low_score_confirm_discard(tmp_settings, fake_rag, monkeypatch, capsys):
+    """A30/A31：低分 + 确认弃 -> 章节文件未写、未入库，run record 已落（弃而不失数据）。"""
+    _write_gate_rules(tmp_settings)
+    agent = WriteAgent(fake_rag)
+    _patch_write(monkeypatch, tmp_settings, agent, {"连贯性": 2.0, "人物一致性": 2.0})
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "n")
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    assert list(tmp_settings.chapter_path.glob("*.md")) == []
+    assert fake_rag.add_calls == []
+    assert (tmp_settings.runs_path / "run_20260828_000001.json").exists()
+    out = capsys.readouterr().out
+    assert "已放弃保存本章" in out
+    assert "本章未保存" in out
+
+
+def test_write_gate_low_score_confirm_keep(tmp_settings, fake_rag, monkeypatch, capsys):
+    """A30：低分 + 确认存 -> 章节照常写入并入库。"""
+    _write_gate_rules(tmp_settings)
+    agent = WriteAgent(fake_rag)
+    _patch_write(monkeypatch, tmp_settings, agent, {"连贯性": 2.0, "人物一致性": 2.0})
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    chapters = list(tmp_settings.chapter_path.glob("*.md"))
+    assert len(chapters) == 1
+    assert fake_rag.add_calls == [str(chapters[0])]
+    out = capsys.readouterr().out
+    assert "章节已存" in out
+
+
+def test_write_gate_score_none_skips_gate(tmp_settings, fake_rag, monkeypatch):
+    """A33：evaluate 失败/返回 None -> 无从判，跳过门禁照常存，不弹确认。"""
+    _write_gate_rules(tmp_settings)
+    agent = WriteAgent(fake_rag)
+    _patch_write(monkeypatch, tmp_settings, agent, None)
+    confirms = []
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirms.append(prompt) or "n")
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    assert confirms == []
+    assert len(list(tmp_settings.chapter_path.glob("*.md"))) == 1
+
+
+def test_write_gate_exempt_forced_finalize(tmp_settings, fake_rag, monkeypatch):
+    """D8：强制定稿豁免 -> 不弹确认直存，向量库照入。"""
+    _write_gate_rules(tmp_settings)
+    agent = WriteAgent(fake_rag, feedback="已达最大审稿次数，强制定稿")
+    _patch_write(monkeypatch, tmp_settings, agent, {"连贯性": 2.0, "人物一致性": 2.0})
+    confirms = []
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirms.append(prompt) or "n")
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    assert confirms == []
+    chapters = list(tmp_settings.chapter_path.glob("*.md"))
+    assert len(chapters) == 1
+    assert fake_rag.add_calls == [str(chapters[0])]
+
+
+def test_write_gate_exempt_human_confirm(tmp_settings, fake_rag, monkeypatch):
+    """D8：人工确认豁免 -> 不弹确认直存，向量库照入。"""
+    _write_gate_rules(tmp_settings)
+    agent = WriteAgent(fake_rag, feedback="审稿结果不可解析，人工确认：存")
+    _patch_write(monkeypatch, tmp_settings, agent, {"连贯性": 2.0, "人物一致性": 2.0})
+    confirms = []
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirms.append(prompt) or "n")
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    assert confirms == []
+    chapters = list(tmp_settings.chapter_path.glob("*.md"))
+    assert len(chapters) == 1
+    assert fake_rag.add_calls == [str(chapters[0])]
+
+
+def test_write_gate_rules_not_configured(tmp_settings, fake_rag, monkeypatch):
+    """规则未配置 -> 门禁全程不生效（低分也不弹确认，照常存）。"""
+    agent = WriteAgent(fake_rag)
+    _patch_write(monkeypatch, tmp_settings, agent, {"连贯性": 2.0, "人物一致性": 2.0})
+    confirms = []
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirms.append(prompt) or "n")
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    assert confirms == []
+    assert len(list(tmp_settings.chapter_path.glob("*.md"))) == 1
+
+
+def test_gate_ok_title_excluded_and_weighted():
+    """A32：标题评分从 weights 硬排除；A30：加权分 Σw·s / Σw >= threshold 判定。"""
+    rules = {"eval_gate": {"enabled": True, "threshold": 3.5,
+                           "weights": {"连贯性": 1.0, "人物一致性": 2.0, "标题评分": 5.0}}}
+    # 只有标题分 -> 无配权维度命中，放行（A32 + A33）
+    assert cli._gate_ok({"标题评分": 1.0}, rules) is True
+    # 标题再低也不拉低门禁：(3*1+3*2)/3=3.0 < 3.5 -> 拦
+    assert cli._gate_ok({"连贯性": 3.0, "人物一致性": 3.0, "标题评分": 1.0}, rules) is False
+    # (4*1+3*2)/3≈3.33 < 3.5 -> 拦；标题 5 分不参与拉分
+    assert cli._gate_ok({"连贯性": 4.0, "人物一致性": 3.0, "标题评分": 5.0}, rules) is False
+    # (4*1+4*2)/3=4.0 >= 3.5 -> 过
+    assert cli._gate_ok({"连贯性": 4.0, "人物一致性": 4.0}, rules) is True
+
+
+def test_gate_ok_degenerate_inputs():
+    """缺规则 / 未启用 / 无阈值 / score None / 无配权维命中 -> 一律放行（A33）。"""
+    rules = {"eval_gate": {"enabled": True, "threshold": 3.5, "weights": {"连贯性": 1.0}}}
+    assert cli._gate_ok({"连贯性": 1.0}, None) is True            # 未配置
+    assert cli._gate_ok({"连贯性": 1.0}, {}) is True               # 无 eval_gate 节
+    assert cli._gate_ok({"连贯性": 1.0},
+                        {"eval_gate": {"enabled": False, "threshold": 3.5}}) is True
+    assert cli._gate_ok({"连贯性": 1.0},
+                        {"eval_gate": {"enabled": True, "weights": {"连贯性": 1.0}}}) is True
+    assert cli._gate_ok(None, rules) is True                       # 评测缝（evaluate None）
+    assert cli._gate_ok({"节奏": 1.0}, rules) is True             # 无配权维命中
+    assert cli._gate_ok({"连贯性": 1.0}, rules) is False           # 对照：低分确实拦
+
+
+# ---------- refine 门禁同构（1.1 T8 / D8）----------
+class GateRefineAgent:
+    """精修替身：refine() 返回 passed 定稿（final/feedback 可配）。"""
+
+    def __init__(self, rag, final="新正文。", feedback="审稿通过：ok"):
+        self.rag = rag
+        self.instruction = ""
+        self.final = final
+        self.feedback = feedback
+
+    def refine(self, content, task, run_id=None, temperature=0.7):
+        state = PipelineState(task=task)
+        state.draft = content
+        state.polished = self.final
+        state.final_chapter = self.final
+        state.feedback = self.feedback
+        state.round = 2
+        state.log = ["[reviewer] " + self.feedback]
+        record = {
+            "run_id": "refine_gate", "task": task, "timestamp": "",
+            "config": {}, "initial_state": {}, "steps": [], "final_state": {},
+        }
+        return state, record
+
+    def summarize_chapter(self, chapter_text, max_tokens=1024):
+        return "第5章精修后的摘要。"
+
+
+def _run_refine_gated(monkeypatch, tmp_settings, fake_rag, agent, score, confirm):
+    """建目标文件 + 注入替身后跑一次 _do_refine，返回章节路径。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    chap = novel / "第05章-异乡风起.md"
+    chap.write_text("旧正文。", encoding="utf-8")
+    monkeypatch.setattr(cli, "_build_agent", lambda settings: (agent, WorkingMemory()))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: score)
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirm)
+    cli._do_refine([str(chap)], tmp_settings)
+    return chap
+
+
+def test_refine_gate_low_score_discard(tmp_settings, fake_rag, monkeypatch, capsys):
+    """refine passed 分支同构：低分 + 弃 -> 原文件未动、不入库。"""
+    _write_gate_rules(tmp_settings)
+    chap = _run_refine_gated(monkeypatch, tmp_settings, fake_rag, GateRefineAgent(fake_rag),
+                             {"连贯性": 2.0, "人物一致性": 2.0}, "n")
+    assert chap.read_text(encoding="utf-8") == "旧正文。"
+    assert fake_rag.add_calls == []
+    out = capsys.readouterr().out
+    assert "已放弃存回" in out
+
+
+def test_refine_gate_low_score_keep(tmp_settings, fake_rag, monkeypatch):
+    """refine passed 分支同构：低分 + 确认存 -> 照常覆盖存回并入库。"""
+    _write_gate_rules(tmp_settings)
+    chap = _run_refine_gated(monkeypatch, tmp_settings, fake_rag, GateRefineAgent(fake_rag),
+                             {"连贯性": 2.0, "人物一致性": 2.0}, "y")
+    assert chap.read_text(encoding="utf-8") == "新正文。"
+    assert fake_rag.add_calls == [str(chap)]
+
+
+def test_refine_gate_forced_not_gated(tmp_settings, fake_rag, monkeypatch):
+    """D8：refine 强制定稿走 is_better 判优，不进门禁不弹确认。"""
+    _write_gate_rules(tmp_settings)
+    agent = GateRefineAgent(fake_rag, feedback="已达最大审稿次数，强制定稿")
+    agent.is_better = lambda old, new, **kw: True
+    chap = _run_refine_gated(monkeypatch, tmp_settings, fake_rag, agent,
+                             {"连贯性": 2.0, "人物一致性": 2.0}, "n")  # 若弹确认会被拒
+    assert chap.read_text(encoding="utf-8") == "新正文。"  # is_better=True 直存
+    assert fake_rag.add_calls == [str(chap)]
+
+
+# ---------- A23 命令层捕获 + Z7 状态行 ----------
+def test_write_invalid_rules_json_caught(tmp_settings, fake_rag, monkeypatch, capsys):
+    """A23：非法规则 JSON 在装配点 fail-fast，命令层捕获打印，REPL 不崩。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    (novel / "质量规则.json").write_text("{不是json", encoding="utf-8")
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", tmp_settings)  # 不应抛异常
+
+    out = capsys.readouterr().out
+    assert "不是合法 JSON" in out
+    assert list(tmp_settings.chapter_path.glob("*.md")) == []
+
+
+def test_status_shows_quality_lines(tmp_settings, capsys):
+    """Z7：状态命令展示质量规则 / 人工语料两行（未配置给提示，已配置给词数）。"""
+    cli._do_status(tmp_settings)
+    out = capsys.readouterr().out
+    assert "质量规则：未找到" in out
+    assert "人工语料：未找到" in out
+
+    _write_gate_rules(tmp_settings)
+    (tmp_settings.novel_path / "质量规则.json").write_text(json.dumps(
+        {"blacklist": ["一丝", "不禁"], "naming_redlines": {"forbidden": ["许风"]}}
+    ), encoding="utf-8")
+    cli._do_status(tmp_settings)
+    out = capsys.readouterr().out
+    assert "黑名单 3 词" in out

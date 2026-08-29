@@ -1,7 +1,7 @@
 """交互式命令行入口。
 
 命令：
-  写第N章：标题     走完整流程（查设定->草稿->润色->审稿->存文件->打分）
+  写第N章：标题     走完整流程（查设定->草稿->润色->审稿->打分->门禁->存文件）
   精修 <文件路径>   精修已有正文（润色->审稿->存回->更新索引，不写新场景）
   改 <文件路径>     局部精修（列出段落->选段->只润色选区->diff 确认->逐字节存回）
   index            查看向量库；index rebuild 全量重建；index add/remove <路径> 单文件增删
@@ -25,8 +25,9 @@ except ImportError:  # 未编译 readline 的环境：历史功能禁用，CLI �
     readline = None
 
 from .agent import NovelAgent
+from .checker import load_quality_rules
 from .config import Settings, get_settings
-from .harness import compare, evaluate, replay, run_tests
+from .harness import backtest_gate, compare, evaluate, replay, run_tests
 from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
@@ -91,6 +92,7 @@ def _build_agent(settings: Settings):
     0.7：load_profiles 一次解析，双 LLMClient 注入（llm=default profile，
     writer_llm=writer profile）；未配 WRITER_* 时两 profile 逐字段相等，
     行为与改造前完全一致（A9 回归保险）。
+    1.1：质量规则 JSON 在装配点加载注入（非法 JSON fail-fast，A23）。
     """
     exemplar = ""
     # 0.5：exemplar 支持目录级（目录下全部 *.txt/*.md 按序拼接，超限截断）
@@ -98,6 +100,7 @@ def _build_agent(settings: Settings):
         exemplar = load_exemplar(settings.exemplar_full)
     instruction = _load_instruction(settings)
     rules = _load_rules(settings)
+    quality_rules = load_quality_rules(settings)
     wm = load_working_memory(settings)
     profiles = load_profiles(settings)
     agent = NovelAgent(
@@ -109,8 +112,51 @@ def _build_agent(settings: Settings):
         settings=settings,
         working_memory=wm,
         rules=rules,
+        quality_rules=quality_rules,
     )
     return agent, wm
+
+
+# ---------- 质量门禁（1.1 A30-A34，design §3.6）----------
+def _gate_confirm(prompt: str) -> str:
+    """门禁人工确认缝（模块级，测试可替换，同 agent.review_confirm 的 0.1 模式）。
+
+    EOF / Ctrl-C -> 返回 "n" 保守弃（A34，门禁默认不放过）。
+    """
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return "n"
+
+
+def _gate_ok(score, rules) -> bool:
+    """eval_gate 判定：门禁是否放行。
+
+    - rules 未配置 / eval_gate 缺失或 enabled falsy / threshold 缺失 -> True（不过门禁）；
+    - score 非 dict（含 None）或无任何配权维度命中 -> True（A33：evaluate 失败/被替换的测试缝）；
+    - 标题评分从 weights 硬排除（A32）；其余维度加权分 Σw·s / Σw >= threshold 才放行。
+    """
+    if not isinstance(rules, dict):
+        return True
+    gate = rules.get("eval_gate")
+    if not isinstance(gate, dict) or not gate.get("enabled"):
+        return True
+    threshold = gate.get("threshold")
+    if not isinstance(threshold, (int, float)):
+        return True
+    if not isinstance(score, dict):
+        return True
+    weights = {
+        k: w for k, w in (gate.get("weights") or {}).items()
+        if k != "标题评分" and isinstance(w, (int, float))
+    }
+    hits = [(w, score[k]) for k, w in weights.items() if k in score]
+    if not hits:  # A33：评委没给出任何配权维度的分 -> 无从判，放行
+        return True
+    wsum = sum(w for w, _ in hits)
+    if wsum <= 0:
+        return True
+    return sum(w * s for w, s in hits) / wsum >= threshold
 
 
 # ---------- 命令处理 ----------
@@ -121,7 +167,11 @@ def _do_write(task: str, settings: Settings) -> None:
         print(f"❌ {e}")
         return
     print("🔧 构建 Agent（加载设定/文风基准/写作指令）...")
-    agent, wm = _build_agent(settings)
+    try:
+        agent, wm = _build_agent(settings)
+    except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等装配错误，命令层兜住不崩 REPL
+        print(f"❌ {e}")
+        return
     print(f"✍️  开始创作：{task}\n")
     try:
         state, record = agent.run(task)
@@ -130,12 +180,30 @@ def _do_write(task: str, settings: Settings) -> None:
         return
 
     print("💾 落盘运行记录...")
-    # 运行日志落盘
+    # 运行日志落盘（1.1：先落 run record，弃而不失数据，design §3.6）
     run_file = save_run(record, settings)
+
+    # 自动评测（1.1：从存盘后移到存盘前--门禁要用分；失败不阻断，豁免路径同样照跑留报告）
+    print("\n--- 自动评测 ---")
+    score = None
+    try:
+        score = evaluate(record["run_id"], settings, instruction=agent.instruction)
+    except Exception as e:
+        print(f"(评测跳过：{e})")
+
+    # 1.1 D8 豁免口径：强制定稿 / 人工确认 -> 跳过门禁判定直存（向量库/摘要照常）
+    exempt = "强制定稿" in state.feedback or "人工确认" in state.feedback
+    # 1.1 A30-A34：未豁免且已定稿且门禁不过 -> 人工确认，应答弃则不写章节文件
+    save = bool(state.final_chapter)
+    if save and not exempt and not _gate_ok(score, load_quality_rules(settings)):
+        answer = _gate_confirm("\n⚠️ 评测低于门禁阈值，仍保存本章？(y/n)：").strip().lower()
+        if answer != "y":
+            save = False
+            print("已放弃保存本章（运行日志已落，可 replay 查看）")
 
     # 章节落盘 + 工作记忆更新
     chapter_file = None
-    if state.final_chapter:
+    if save:
         print("📖 保存章节 + 生成剧情摘要...")
         chapter_file = save_chapter(state.final_chapter, task, record["run_id"], settings)
         # 0.3：写完自动入库（新章立即进 RAG，后续章节检索得到前文，不靠手动 index add）
@@ -164,15 +232,15 @@ def _do_write(task: str, settings: Settings) -> None:
     print(f"共 {state.round} 轮，审稿：{state.feedback}")
 
     print("\n=== 最终章节 ===")
-    # 0.1：弃稿/未定稿时明确提示未保存，而非只打印"(空)"
-    print(state.final_chapter if state.final_chapter else "（本章未定稿，未保存）")
-
-    # 自动评测打分（失败不阻断）
-    print("\n--- 自动评测 ---")
-    try:
-        evaluate(record["run_id"], settings, instruction=agent.instruction)
-    except Exception as e:
-        print(f"(评测跳过：{e})")
+    # 0.1：弃稿/未定稿时明确提示未保存，而非只打印"(空)"；
+    # 1.1 A31：门禁弃同样展示内容但明示未保存
+    if chapter_file:
+        print(state.final_chapter)
+    elif state.final_chapter:
+        print(state.final_chapter)
+        print("（本章未保存，运行日志已落）")
+    else:
+        print("（本章未定稿，未保存）")
 
 
 def _refine_postprocess(
@@ -186,13 +254,33 @@ def _refine_postprocess(
     file_path: str,
     action: str = "精修",
 ) -> None:
-    """精修/重写后的公共处理：落盘、存回、差异、评测。"""
+    """精修/重写后的公共处理：落盘、评测、门禁、存回、差异。"""
     print("💾 落盘运行记录...")
     run_file = save_run(record, settings)
 
+    # 自动评测（1.1：从尾部提前到分支判定前--门禁要用分；每命令仍恰一次评委调用）
+    print("\n--- 自动评测 ---")
+    score = None
+    try:
+        score = evaluate(record["run_id"], settings, instruction=agent.instruction)
+    except Exception as e:
+        print(f"(评测跳过：{e})")
+
     forced = "强制定稿" in state.feedback
     passed = "审稿通过" in state.feedback and not forced
-    if passed and state.final_chapter:
+
+    # 1.1 A30-A34：仅 passed 自动存回分支过门禁（D8）；forced 走 is_better 判优、
+    # 人工确认豁免，未通过分支本就不存回，均不叠加门禁。
+    gate_rejected = False
+    if passed and state.final_chapter and "人工确认" not in state.feedback:
+        if not _gate_ok(score, load_quality_rules(settings)):
+            answer = _gate_confirm(f"\n⚠️ 评测低于门禁阈值，仍存回{action}结果？(y/n)：").strip().lower()
+            if answer != "y":
+                gate_rejected = True
+                print(f"⚠️ 已放弃存回，原文件未改动。")
+                print(f"   结果在运行日志中，可用 replay {record['run_id']} 查看")
+
+    if passed and state.final_chapter and not gate_rejected:
         path.write_text(state.final_chapter, encoding="utf-8")
         print(f"✅ 已覆盖存回：{path}")
         print("📚 更新向量库...")
@@ -221,7 +309,7 @@ def _refine_postprocess(
         else:
             print(f"⚠️ {action}版本未优于原文，原文件未改动。")
             print(f"   结果在运行日志中，可用 replay {record['run_id']} 查看")
-    elif state.final_chapter:
+    elif state.final_chapter and not gate_rejected:
         print(f"⚠️ 审稿未通过（{state.feedback}），原文件未改动，结果未入库。")
 
     print("--- 流程日志 ---")
@@ -245,12 +333,6 @@ def _refine_postprocess(
         diff_text = "".join(diff)
         print(diff_text if diff_text else "（无变化）")
 
-    print("\n--- 自动评测 ---")
-    try:
-        evaluate(record["run_id"], settings, instruction=agent.instruction)
-    except Exception as e:
-        print(f"(评测跳过：{e})")
-
 
 def _do_refine(args: List[str], settings: Settings) -> None:
     """精修 <文件路径>：读文件 -> polisher->reviewer -> 覆盖存回 -> 更新索引 -> 评测。"""
@@ -265,7 +347,11 @@ def _do_refine(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
-    agent, wm = _build_agent(settings)
+    try:
+        agent, wm = _build_agent(settings)
+    except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
+        print(f"❌ {e}")
+        return
     rag = agent.rag
     abs_path = rag._resolve_source(file_path)
     path = Path(abs_path)
@@ -301,7 +387,11 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
-    agent, wm = _build_agent(settings)
+    try:
+        agent, wm = _build_agent(settings)
+    except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
+        print(f"❌ {e}")
+        return
     rag = agent.rag
     abs_path = rag._resolve_source(file_path)
     path = Path(abs_path)
@@ -356,7 +446,11 @@ def _do_partial_flow(args: List[str], settings: Settings) -> None:
     """_do_partial 主体（参数与目录校验之后）。"""
     file_path = " ".join(args)  # 容忍路径含空格（同精修/重写）
     print("🔧 构建 Agent...")
-    agent, _ = _build_agent(settings)
+    try:
+        agent, _ = _build_agent(settings)
+    except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
+        print(f"❌ {e}")
+        return
     abs_path = agent.rag._resolve_source(file_path)
     path = Path(abs_path)
     if not path.is_file():
@@ -550,6 +644,32 @@ def _do_status(settings: Settings) -> None:
     if settings.exemplar_subpath and settings.exemplar_full.exists():
         files, chars = exemplar_info(settings.exemplar_full)
         print(f"文风基准：{files} 个文件，共 {chars} 字 @ {settings.exemplar_full}")
+    # 1.1 Z7：质量规则 / 人工语料状态行（防静默失效）
+    if settings.quality_rules_subpath:
+        try:
+            rules = load_quality_rules(settings)
+        except RuntimeError as e:
+            print(f"质量规则：❌ {e}")
+        else:
+            if rules is None:
+                print(f"质量规则：未找到 {settings.quality_rules_full}（checker 与门禁不启用）")
+            else:
+                n_words = len(rules.get("blacklist") or []) + len(
+                    (rules.get("naming_redlines") or {}).get("forbidden") or [])
+                print(f"质量规则：黑名单 {n_words} 词 @ {settings.quality_rules_full}")
+    else:
+        print("质量规则：未配置（NOVEL_QUALITY_RULES 为空，checker 与门禁不启用）")
+    if settings.human_text_subpath:
+        if settings.human_text_full.is_dir():
+            n_files = sum(
+                1 for q in settings.human_text_full.iterdir()
+                if q.is_file() and q.suffix.lower() in (".txt", ".md")
+            )
+            print(f"人工语料：{n_files} 个文件 @ {settings.human_text_full}")
+        else:
+            print(f"人工语料：未找到 {settings.human_text_full}（AI 味基准不含人工语料）")
+    else:
+        print("人工语料：未配置（NOVEL_HUMAN_TEXT 为空）")
 
 
 def _do_replay(args: List[str], settings: Settings) -> None:
@@ -570,6 +690,8 @@ def _do_eval(args: List[str], settings: Settings) -> None:
         evaluate(args[0], settings, instruction=_load_instruction(settings))
     except FileNotFoundError:
         print(f"❌ 找不到运行记录：{args[0]}")
+    except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等，命令层兜住不崩 REPL
+        print(f"❌ {e}")
 
 
 def _do_compare(args: List[str], settings: Settings) -> None:
@@ -580,6 +702,8 @@ def _do_compare(args: List[str], settings: Settings) -> None:
         compare(args[0], args[1], settings)
     except FileNotFoundError as e:
         print(f"❌ 找不到运行记录：{e}")
+    except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等，命令层兜住不崩 REPL
+        print(f"❌ {e}")
 
 
 def _do_test(args: List[str], settings: Settings) -> None:
@@ -590,11 +714,28 @@ def _do_test(args: List[str], settings: Settings) -> None:
         run_tests(args[0], settings)
     except FileNotFoundError:
         print(f"❌ 找不到运行记录：{args[0]}")
+    except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等，命令层兜住不崩 REPL
+        print(f"❌ {e}")
+
+
+def _do_backtest(args: List[str], settings: Settings) -> None:
+    """回测门禁 [条数]：历史 runs 逐条跑评委，输出加权分分布与候选阈值拦截面。"""
+    limit = None
+    if args:
+        try:
+            limit = int(args[0])
+        except ValueError:
+            print("用法：回测门禁 [条数]（条数为正整数，可省略）")
+            return
+    try:
+        backtest_gate(settings, limit=limit)
+    except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等，命令层兜住不崩 REPL
+        print(f"❌ {e}")
 
 
 def _print_help() -> None:
     print("命令：")
-    print("  写第N章：标题     走完整流程写一章（查设定->草稿->润色->审稿->存文件->打分）")
+    print("  写第N章：标题     走完整流程写一章（查设定->草稿->润色->审稿->打分门禁->存文件）")
     print("  精修 <文件路径>   精修已有正文（润色->审稿->存回->更新索引，不写新场景）")
     print("  重写 <文件路径>   重写已有正文（writer参考原文重写->润色->审稿->存回，能大幅扩写）")
     print("  改 <文件路径>     局部精修（列出段落->选段 3/3-5/3,7->只润色选区->diff 确认->逐字节存回）")
@@ -603,6 +744,7 @@ def _print_help() -> None:
     print("  eval <run_id>    对某次写作打分")
     print("  compare <a> <b>  对比两次写作效果")
     print("  test <run_id>    规则断言测试")
+    print("  回测门禁 [条数]  历史runs跑评委回测门禁阈值（分数有缓存，命中不重烧）")
     print("  状态             查看当前写到第几章、角色状态、未回收伏笔")
     print("  help / quit")
 
@@ -663,6 +805,8 @@ def main() -> None:
                 _do_compare(args, settings)
             elif cmd == "test":
                 _do_test(args, settings)
+            elif cmd == "回测门禁":
+                _do_backtest(args, settings)
             else:
                 print(f"未知命令：{cmd}（输入 help 查看命令）")
     finally:

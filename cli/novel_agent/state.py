@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 __all__ = ["PipelineState"]
 
@@ -25,6 +25,10 @@ class PipelineState:
 
     # -- 重写输入 --
     source_content: str = ""   # 重写模式：已有内容（writer 作为参考自由重写）
+
+    # -- 审核维度化（1.1 A4/A24）--
+    scores: Dict[str, int] = field(default_factory=dict)  # reviewer 八维分（1-5）
+    issues: List[dict] = field(default_factory=list)       # 结构化问题（checker/reviewer 同构）
 
     # -- 控制字段 --
     round: int = 0                 # 当前轮次，防死循环

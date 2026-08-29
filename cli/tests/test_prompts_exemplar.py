@@ -1,10 +1,21 @@
-"""0.5 exemplar 语料目录化测试：目录级加载 / 单文件兼容 / 超限截断 / 状态命令清单。"""
+"""0.5 exemplar 语料目录化测试：目录级加载 / 单文件兼容 / 超限截断 / 状态命令清单。
+
+1.1 quality-gate T5：reviewer 八维 schema 演进与 fixer prompt 构造。
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
 from novel_agent import cli
-from novel_agent.prompts import EXEMPLAR_MAX_CHARS, exemplar_info, load_exemplar
+from novel_agent.prompts import (
+    EXEMPLAR_MAX_CHARS,
+    exemplar_info,
+    fixer_system,
+    fixer_user,
+    fixer_whole_user,
+    load_exemplar,
+    reviewer_system,
+)
 
 
 def _quiet(*_a, **_kw):
@@ -174,3 +185,65 @@ def test_build_agent_loads_exemplar_dir(tmp_settings, monkeypatch):
     monkeypatch.setattr(cli, "NovelAgent", _Agent)
     cli._build_agent(tmp_settings)
     assert captured["exemplar"] == "甲\n\n乙"
+
+
+# ---------- reviewer schema 演进与 fixer prompt（1.1 T5）----------
+def test_reviewer_system_eight_dimensions_and_schema():
+    """reviewer_system 含八维名、scores/issues/quote 键名；旧三键保留（D4）。"""
+    sys_prompt = reviewer_system("测试小说", "")
+    for dim in ["人物一致性", "文风一致性", "剧情连贯性", "时间线一致性",
+                "环境一致性", "伏笔一致性", "比喻密度", "视角越界"]:
+        assert dim in sys_prompt, dim
+    assert '"scores"' in sys_prompt
+    assert '"issues"' in sys_prompt
+    for key in ("quote", "problem", "fix"):
+        assert f'"{key}"' in sys_prompt
+    # D4 兼容：pass/reason/issues 三键保留
+    assert '"pass"' in sys_prompt and '"reason"' in sys_prompt
+
+
+def test_reviewer_system_rules_and_instruction_injected():
+    """铁律与写作指令照旧注入（维度演进不动注入位）。"""
+    sys_prompt = reviewer_system("测试小说", "", instruction="指令内容", rules="铁律内容")
+    assert "铁律内容" in sys_prompt
+    assert "指令内容" in sys_prompt
+
+
+def test_fixer_system_contract():
+    """fixer_system：修稿师定位 + 只改问题处铁律 + 【第N段·修复后】标记协议。"""
+    sys_prompt = fixer_system("测试小说", rules="铁律内容")
+    assert "修稿师" in sys_prompt
+    assert "只改问题处" in sys_prompt
+    assert "【第N段·修复后】" in sys_prompt
+    assert "铁律内容" in sys_prompt
+
+
+def test_fixer_user_renders_spans_and_issues():
+    """fixer_user：段号/上下文/原文/意见全渲染；空上下文不出现占位块。"""
+    spans_data = [
+        {"no": 3, "before": "上文。", "text": "第三段原文。", "after": "下文。",
+         "issues": [{"quote": "第三段原文", "problem": "称呼错误", "fix": "改为林晚"}]},
+        {"no": 7, "before": "", "text": "第七段原文。", "after": "",
+         "issues": [{"quote": "第七段原文", "problem": "超长句", "fix": "拆分"}]},
+    ]
+    user_prompt = fixer_user(spans_data)
+    assert "第3段" in user_prompt and "第7段" in user_prompt
+    assert "第三段原文。" in user_prompt and "第七段原文。" in user_prompt
+    assert "上文。" in user_prompt and "下文。" in user_prompt
+    assert "称呼错误" in user_prompt and "改为林晚" in user_prompt
+    assert "超长句" in user_prompt and "拆分" in user_prompt
+    # 第 7 段 before/after 均空 -> 其渲染区不含上下文占位块
+    seg7 = user_prompt.split("第7段 ━━")[1]
+    assert "【上文" not in seg7 and "【下文" not in seg7
+
+
+def test_fixer_whole_user_renders_text_and_issues():
+    """fixer_whole_user：原稿全文 + 意见清单逐条渲染（A12 整文降级）。"""
+    issues = [
+        {"quote": "", "problem": "比喻密度：10/20句含标记", "fix": "删减比喻"},
+        {"quote": "", "problem": "独白过长", "fix": "压缩"},
+    ]
+    user_prompt = fixer_whole_user("原稿全文内容。", issues)
+    assert "原稿全文内容。" in user_prompt
+    assert "比喻密度" in user_prompt and "删减比喻" in user_prompt
+    assert "独白过长" in user_prompt and "压缩" in user_prompt

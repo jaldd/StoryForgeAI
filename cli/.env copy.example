@@ -46,6 +46,16 @@ NOVEL_DIR=/path/to/your/novel
 # 写作铁律（0.2 外置）：注入 writer/polisher/reviewer 的硬性约束全文。
 # NOVEL_RULES=写作铁律.md
 
+# ---- 质量门禁（1.1；相对 novel_dir 的路径）----
+# 质量规则 JSON：checker 五项机械检查 / 门禁 eval_gate / AI 味 blacklist 与 ai_score 锚点。
+# 默认 质量规则.json；留空 = 禁用。文件不存在 = checker 与门禁不启用（eval 命令照常，仅少 AI 味组件）。
+# 字段模板见 specs/quality-gate/design.md §2。
+# NOVEL_QUALITY_RULES=质量规则.json
+#
+# 人工正文目录：AI 味基准语料之二（与文风基准目录合并统计；只读不写）。
+# 默认 正文/新；留空 = 不用人工语料（AI 味词频组件可能降级）。
+# NOVEL_HUMAN_TEXT=正文/新
+
 # ---- Agent 运行时（可选；不设则默认放 <NOVEL_DIR>/.agent/ 下）----
 # NOVEL_RUNS_DIR=
 # NOVEL_CHROMA_DIR=
