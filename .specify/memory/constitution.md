@@ -17,8 +17,8 @@
 | 组件 | 选型 | 约束 |
 |------|------|------|
 | 语言 | Python 3.11+ | 实际跑 3.13 |
-| LLM | 火山方舟 OpenAI 兼容 coding 网关 | `base_url=https://ark.cn-beijing.volces.com/api/coding/v3` |
-| 默认模型 | `glm-5.2` | **推理模型，见 §4** |
+| LLM | OpenAI 兼容网关，来源可换（0.7） | `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL` 接线；不设回落火山 coding 网关 |
+| 默认模型 | `glm-5.2` | **推理模型，见 §4**；`LLM_MODEL` -> `CLAUDE_MODEL` -> 默认 三级回落 |
 | Embedding | `doubao-embedding-vision`（多模态） | 响应 `data` 是 **dict**（`{"embedding":[...]}`），不是 list |
 | 向量库 | ChromaDB | 本地持久化 |
 | CLI | 内置 `input()` + while | 不引入额外 CLI 框架 |
@@ -45,19 +45,21 @@
 - **不修改 `py/`**（学习成果保留），只读取迁移。
 - 写作铁律与文风金标准的**唯一真源**是 `NOVEL_DIR` 下的设定文档 + `prompts.py`；spec 不重复抄录，只引用。
 
-## 4. glm-5.2 推理模型约束（踩过的坑）
+## 4. glm-5.2 推理模型约束（踩过的坑；换模型须重实测）
 
 `glm-5.2` 是推理模型：生成可见回答前先消耗 token 做内部推理，计入 `max_tokens` 预算。
 
 - `max_tokens` 设小（≤512）会 `finish_reason="length"` 且 `content=""`（空回），重试也救不回来。
 - **短输出调用（摘要/审稿 JSON/评测）`max_tokens` 至少 1024**；长输出（写作/润色）4096。
 - `novel_agent/llm.py` 的 `chat()` 默认 `max_tokens=1024`。新加 LLM 调用处遵循此阈值。
+- 以上经验值绑定 glm-5.2 + 火山网关；换模型/换商后必须重新实测，必要时用
+  `NOVEL_LLM_EXTRA={"max_tokens": ...}` 透传覆盖（同名键 extra 赢）。
 
 ## 5. 模块边界
 
 ```
 cli（REPL 调度）
-  └─ agent（director/writer/polisher/reviewer 状态机）
+  └─ agent（writer/polisher/reviewer 状态机；写作侧可注入独立 writer_llm）
        ├─ llm（LLMClient，可注入 fake client 测试）
        ├─ rag（RAGStore，惰性建 Chroma）
        └─ memory（ShortTerm / WorkingMemory / LongTerm）

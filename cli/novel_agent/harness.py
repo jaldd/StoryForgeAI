@@ -207,6 +207,10 @@ def compare(
     out("=== A/B 对比 ===")
     out(f"{'维度':<14}{'A(' + run_id_a[:19] + ')':<28}{'B(' + run_id_b[:19] + ')'}")
     out(f"{'temperature':<14}{str(a['config'].get('temperature')):<28}{str(b['config'].get('temperature'))}")
+    out(f"{'model':<14}{str(a['config'].get('model')):<28}{str(b['config'].get('model'))}")
+    wm_a, wm_b = a["config"].get("writer_model"), b["config"].get("writer_model")
+    if wm_a is not None or wm_b is not None:  # 旧记录缺键时跳过该行
+        out(f"{'writer_model':<14}{str(wm_a):<28}{str(wm_b)}")
     out(f"{'task':<14}{a['task'][:20]:<28}{b['task'][:20]}")
     out(f"{'字数':<14}{len(cha):<28}{len(chb)}")
     out(f"{'含风次数':<14}{cha.count('风'):<28}{chb.count('风')}")

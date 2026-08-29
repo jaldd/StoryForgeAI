@@ -119,7 +119,7 @@ def test_build_agent_loads_exemplar_dir(tmp_settings, monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-    monkeypatch.setattr(cli, "LLMClient", lambda settings=None: None)
+    monkeypatch.setattr(cli, "LLMClient", lambda settings=None, profile=None: None)  # 0.7：_build_agent 注入 profile
     monkeypatch.setattr(cli, "RAGStore", lambda settings=None: None)
     monkeypatch.setattr(cli, "NovelAgent", _Agent)
     cli._build_agent(tmp_settings)

@@ -3,6 +3,37 @@ ARK_API_KEY=你的火山密钥
 # 模型（不设则默认 glm-5.2；推理模型，短输出 max_tokens 需 ≥1024）
 CLAUDE_MODEL=glm-5.2
 
+# ---- LLM 来源可换（0.7；全不设 = 现状，回落链见各行注释）----
+# 主配置（审稿/摘要/评分等非生成调用；也是未配 WRITER_* 时写作侧的回落来源）
+# LLM_BASE_URL=           # 未设 -> 火山 https://ark.cn-beijing.volces.com/api/coding/v3
+# LLM_API_KEY=            # 未设 -> ARK_API_KEY
+# LLM_MODEL=              # 未设 -> CLAUDE_MODEL -> glm-5.2
+#
+# 写作侧独立（writer/polisher/局部精修；空 = 回落主配置对应解析值，三者各自独立回落）
+# WRITER_BASE_URL=
+# WRITER_API_KEY=
+# WRITER_MODEL=
+#
+# 换商三件套示例（端点 + key + 模型名按实际填写）：
+#   Kimi（Moonshot）：
+#     LLM_BASE_URL=https://api.moonshot.cn/v1
+#     LLM_API_KEY=你的Moonshot密钥
+#     LLM_MODEL=按实际名称填写（如 kimi-k3）
+#   SenseNova（商汤）：
+#     LLM_BASE_URL=https://api.sensenova.cn/compatible-mode/v2
+#     LLM_API_KEY=你的SenseNova密钥
+#     LLM_MODEL=按实际名称填写
+# 审稿留火山、写作单独换商：改用 WRITER_* 三行（用法同上），主配置不动。
+#
+# 生成类温度覆盖（只作用写作侧；未设 = 调用点现值 0.8/0.6/0.6，零漂移）
+# NOVEL_TEMPERATURE=0.7
+#
+# chat 请求体透传（合法 JSON 对象；与内建参数同名时此值赢，兼作 max_tokens 逃生门）
+# NOVEL_LLM_EXTRA={"max_tokens": 8192}
+# Kimi-K3 推理调档示例（仅 Kimi-K3 有效；其他模型勿用）：
+# NOVEL_LLM_EXTRA={"reasoning_effort": "high"}
+
+
 # ---- 小说（仓库外，不硬编码）----
 # 小说显示名：用于 prompt（如 "我的小说"）。不设默认"本小说"。
 NOVEL_NAME=本小说

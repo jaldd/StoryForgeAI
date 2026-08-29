@@ -27,7 +27,7 @@ except ImportError:  # 未编译 readline 的环境：历史功能禁用，CLI �
 from .agent import NovelAgent
 from .config import Settings, get_settings
 from .harness import compare, evaluate, replay, run_tests
-from .llm import LLMClient
+from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
 from .prompts import exemplar_info, load_exemplar
@@ -86,7 +86,12 @@ def _refresh_working_memory(
 
 
 def _build_agent(settings: Settings):
-    """构造 NovelAgent：加载文风金标准 + 写作指令 + 写作铁律 + 工作记忆，RAG 惰性。"""
+    """构造 NovelAgent：加载文风金标准 + 写作指令 + 写作铁律 + 工作记忆，RAG 惰性。
+
+    0.7：load_profiles 一次解析，双 LLMClient 注入（llm=default profile，
+    writer_llm=writer profile）；未配 WRITER_* 时两 profile 逐字段相等，
+    行为与改造前完全一致（A9 回归保险）。
+    """
     exemplar = ""
     # 0.5：exemplar 支持目录级（目录下全部 *.txt/*.md 按序拼接，超限截断）
     if settings.exemplar_subpath and settings.exemplar_full.exists():
@@ -94,8 +99,10 @@ def _build_agent(settings: Settings):
     instruction = _load_instruction(settings)
     rules = _load_rules(settings)
     wm = load_working_memory(settings)
+    profiles = load_profiles(settings)
     agent = NovelAgent(
-        llm=LLMClient(settings=settings),
+        llm=LLMClient(settings=settings, profile=profiles.default),
+        writer_llm=LLMClient(settings=settings, profile=profiles.writer),
         rag=RAGStore(settings=settings),
         exemplar=exemplar,
         instruction=instruction,

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from novel_agent import cli
+from novel_agent.config import Settings
+from novel_agent.llm import load_profiles
 from novel_agent.memory import WorkingMemory
 from novel_agent.state import PipelineState
 from novel_agent.storage import load_working_memory
@@ -252,3 +254,29 @@ def test_refine_pass_refreshes_working_memory(tmp_settings, fake_rag, monkeypatc
     assert wm2.last_plot_point == "第5章精修后的摘要。"
     out = capsys.readouterr().out
     assert "已覆盖存回" in out
+
+
+# ---------- 0.7 双 client 装配（T7）----------
+def test_build_agent_injects_dual_clients(tmp_settings):
+    """T7：_build_agent 用 load_profiles 一次解析，注入 default/writer 双 client。
+
+    未配 WRITER_* 时两 profile 逐字段相等（A9 回归保险，行为与改造前一致）。
+    """
+    agent, _ = cli._build_agent(tmp_settings)
+    assert agent.llm.profile == load_profiles(tmp_settings).default
+    assert agent.writer_llm.profile == load_profiles(tmp_settings).writer
+    assert agent.llm.profile == agent.writer_llm.profile   # 未配时同值
+    assert agent.llm is not agent.writer_llm                # 但仍是两个独立实例
+
+
+def test_build_agent_writer_model_configured(tmp_settings):
+    """T7/A1-A8：配 WRITER_MODEL 后 writer_llm 的 profile 独立可见。"""
+    settings = Settings(
+        ark_api_key=tmp_settings.ark_api_key,
+        repo_root=tmp_settings.repo_root,
+        novel_dir=tmp_settings.novel_dir,
+        writer_model="kimi-k3",
+    )
+    agent, _ = cli._build_agent(settings)
+    assert agent.llm.profile.model == "glm-5.2"
+    assert agent.writer_llm.profile.model == "kimi-k3"

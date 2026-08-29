@@ -1,5 +1,6 @@
 """agent 模块测试：状态机流程，用 fake LLM/RAG 不联网。"""
 from novel_agent.agent import NovelAgent, parse_review
+from novel_agent.config import Settings
 from novel_agent.memory import WorkingMemory
 
 
@@ -666,3 +667,88 @@ def test_is_better_four_replies(fake_llm, tmp_settings):
     assert agent.is_better("原文", "润色") is True
     fake_llm.script = [""]  # 空回
     assert agent.is_better("原文", "润色") is False
+
+
+# ---------- 0.7 模型来源可换：writer_llm 注入与路由 ----------
+def test_writer_llm_routing_generation_vs_review(fake_llm, fake_rag, tmp_settings):
+    """A6-A8：生成类（writer/polisher）走 writer_llm，审稿类走 llm。"""
+    writer_llm = _SysRecorder(["【初稿】风起了。", "【润色】风起了，林晚没说话。"])
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(), writer_llm=writer_llm,
+    )
+    state, _ = agent.run("写第5章：异乡风起")
+
+    assert state.next_agent == "done" and state.final_chapter
+    assert len(writer_llm.users) == 2        # writer + polisher 都在 writer_llm
+    assert len(fake_llm.calls) == 1          # 仅 reviewer 在 llm
+    assert "写一段新章节" in writer_llm.users[0]
+    assert "请润色" in writer_llm.users[1]
+    assert "请审查" in fake_llm.calls[0]
+    assert state.final_chapter == "【润色】风起了，林晚没说话。"  # 定稿来自写作侧输出
+
+
+def test_writer_llm_none_falls_back_to_llm(fake_llm, fake_rag, tmp_settings):
+    """A9：writer_llm=None 时全部走 llm（存量构造零改动，回归保险）。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    assert agent.writer_llm is fake_llm
+    state, _ = agent.run("写第5章：异乡风起")
+    assert state.next_agent == "done"
+    assert len(fake_llm.calls) == 3           # 三调用全在同一个 llm
+
+
+def test_partial_refine_routes_to_writer_llm(fake_llm, fake_rag, tmp_settings):
+    """A6：局部精修也走 writer_llm。"""
+    writer_llm = _SysRecorder(["改写后的第三段。"])
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(), writer_llm=writer_llm,
+    )
+    blocks = _partial_blocks()
+    results = agent.partial_refine(blocks, [(3, 3)], "局部精修：第03章.md")
+
+    assert results == ["改写后的第三段。"]
+    assert len(writer_llm.users) == 1
+    assert len(fake_llm.calls) == 0           # 审稿侧未被触碰
+
+
+# ---------- 0.7 run 记录 config 新键（D3-a 扁平键）----------
+def test_record_config_new_keys_unconfigured(fake_llm, fake_rag, tmp_settings):
+    """A16：未配 WRITER_* 时 writer_model == model，llm_temperature 为 None。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    _, record = agent.run("写第5章：异乡风起")
+    cfg = record["config"]
+    assert cfg["model"] == "glm-5.2"          # 既有断言口径保持
+    assert cfg["writer_model"] == "glm-5.2"   # 未配回落同值
+    assert cfg["llm_temperature"] is None     # 未配为 None（Z3）
+    assert cfg["temperature"] == 0.9          # 既有键不动（run 级遗留语义）
+    assert cfg["max_rounds"] == 10 and cfg["max_reviews"] == 6
+    assert cfg["target_words"] == 1500
+
+
+def test_record_config_new_keys_configured(fake_llm, fake_rag, tmp_settings):
+    """A16-A18：配了 writer_model / llm_temperature 时新键如实落盘（同源重算）。"""
+    settings = Settings(
+        ark_api_key=tmp_settings.ark_api_key,
+        repo_root=tmp_settings.repo_root,
+        novel_dir=tmp_settings.novel_dir,
+        writer_model="kimi-k3",
+        llm_temperature=0.7,
+    )
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=settings,
+        working_memory=WorkingMemory(),
+    )
+    _, record = agent.run("写第5章：异乡风起")
+    cfg = record["config"]
+    assert cfg["model"] == "glm-5.2"          # 主配置未动
+    assert cfg["writer_model"] == "kimi-k3"   # 写作侧独立可见
+    assert cfg["llm_temperature"] == 0.7
+    # 密钥/端点绝不落盘
+    assert "api_key" not in cfg and "base_url" not in cfg

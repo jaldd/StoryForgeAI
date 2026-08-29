@@ -7,10 +7,12 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
@@ -23,14 +25,49 @@ def _repo_root() -> Path:
     return Path(env).expanduser().resolve() if env else Path.cwd().resolve()
 
 
+def _env_float(name: str) -> Optional[float]:
+    """读 env 浮点数（如 NOVEL_TEMPERATURE）；未设置返回 None，非法值 fail-fast。"""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} 必须是数字，当前值: {raw!r}")
+
+
+def _env_json_object(name: str) -> Dict[str, Any]:
+    """读 env JSON 对象（如 NOVEL_LLM_EXTRA）；未设置返回 {}，非法/非对象 fail-fast。"""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return {}
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"{name} 必须是合法 JSON: {e}")
+    if not isinstance(val, dict):
+        raise RuntimeError(f"{name} 必须是 JSON 对象（如 {{\"reasoning_effort\": \"low\"}}）")
+    return val
+
+
 @dataclass(frozen=True)
 class Settings:
     """全局配置。小说相关路径都以 novel_dir 为根解析。"""
 
-    # --- LLM（火山方舟 OpenAI 兼容 coding 网关）---
+    # --- LLM（火山方舟 OpenAI 兼容 coding 网关；0.7 来源可换）---
     ark_api_key: str = ""
     model: str = "glm-5.2"
     base_url: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
+    # 0.7：chat 主配置鉴权（LLM_API_KEY，未设回落 ark_api_key，回落发生在 load_profiles）
+    llm_api_key: str = ""
+    # 0.7：写作侧独立覆盖（WRITER_*，空 = 回落主配置同名字段，回落发生在 load_profiles）
+    writer_base_url: str = ""
+    writer_api_key: str = ""
+    writer_model: str = ""
+    # 0.7：生成类调用温度覆盖（NOVEL_TEMPERATURE，None = 不覆盖、用调用点现值）
+    llm_temperature: Optional[float] = None
+    # 0.7：chat 请求体透传参数（NOVEL_LLM_EXTRA，JSON 对象，同名键 extra 赢）
+    llm_extra: Dict[str, Any] = field(default_factory=dict)
 
     # --- Embedding（火山方舟 multimodal embedding，套餐内）---
     embed_model: str = "doubao-embedding-vision"
@@ -146,7 +183,15 @@ def get_settings() -> Settings:
     load_dotenv()
     return Settings(
         ark_api_key=os.environ.get("ARK_API_KEY", ""),
-        model=os.environ.get("CLAUDE_MODEL", "glm-5.2"),
+        model=os.environ.get("LLM_MODEL", "") or os.environ.get("CLAUDE_MODEL", "") or "glm-5.2",
+        base_url=os.environ.get("LLM_BASE_URL", "")
+        or "https://ark.cn-beijing.volces.com/api/coding/v3",
+        llm_api_key=os.environ.get("LLM_API_KEY", ""),
+        writer_base_url=os.environ.get("WRITER_BASE_URL", ""),
+        writer_api_key=os.environ.get("WRITER_API_KEY", ""),
+        writer_model=os.environ.get("WRITER_MODEL", ""),
+        llm_temperature=_env_float("NOVEL_TEMPERATURE"),
+        llm_extra=_env_json_object("NOVEL_LLM_EXTRA"),
         novel_name=os.environ.get("NOVEL_NAME", "本小说"),
         novel_dir=os.environ.get("NOVEL_DIR", ""),
         chapter_subdir=os.environ.get("NOVEL_CHAPTER_SUBDIR", "正文/AI生成"),

@@ -14,7 +14,7 @@ from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Settings, get_settings
-from .llm import LLMClient
+from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, build_context_pair
 from .prompts import (
@@ -153,6 +153,7 @@ class NovelAgent:
         target_words: Optional[int] = None,
         review_confirm: Optional[Callable[[str], str]] = None,
         rules: str = "",
+        writer_llm: Optional[LLMClient] = None,
     ):
         self.llm = llm
         self.rag = rag
@@ -167,6 +168,8 @@ class NovelAgent:
         self.max_rounds = self.settings.max_rounds if max_rounds is None else max_rounds
         # 0.8：单章目标字数（writer 写作 / polisher 扩写共用口径，进 prompt）
         self.target_words = self.settings.target_words if target_words is None else target_words
+        # 0.7：写作侧独立模型来源（writer/polisher/局部精修）；None 回落 self.llm（A9）。
+        self.writer_llm = writer_llm if writer_llm is not None else llm
         # 0.1：审稿结果不可解析时的人工确认函数（prompt -> 应答）。
         # None = REPL 交互 input；未来批量模式注入恒"弃"（返回"n"）即 fail-closed。
         self.review_confirm = review_confirm
@@ -247,7 +250,7 @@ class NovelAgent:
                 f"{feedback_hint}"
             )
 
-        raw = self.llm.chat(
+        raw = self.writer_llm.chat(
             system,
             user_msg,
             max_tokens=4096,
@@ -281,7 +284,7 @@ class NovelAgent:
         outline_hint = ""
         if state.outline:
             outline_hint = f"\n\n【writer 构思（润色时保持此意图，不要跑偏）】\n{state.outline}"
-        raw = self.llm.chat(
+        raw = self.writer_llm.chat(
             system,
             f"以下是初稿，请润色：\n\n{draft_safe}{outline_hint}{feedback_hint}",
             max_tokens=4096,
@@ -455,14 +458,22 @@ class NovelAgent:
         self, run_id: str, task: str, temperature: float,
         state: PipelineState, steps: List[dict],
     ) -> Dict[str, Any]:
-        """构造运行记录，供 storage 落盘 / harness 回放。"""
+        """构造运行记录，供 storage 落盘 / harness 回放。
+
+        config 从 load_profiles(settings) 同源重算而非读注入对象（Z5：
+        FakeLLM 无 profile 属性；直构 Settings 测试确定性；生产路径两者同源）。
+        api_key / base_url 不进 record（密钥绝不落盘）。
+        """
+        profiles = load_profiles(self.settings)
         return {
             "run_id": run_id,
             "task": task,
             "timestamp": datetime.datetime.now().isoformat(),
             "config": {
-                "model": self.settings.model,
+                "model": profiles.default.model,
                 "temperature": temperature,
+                "writer_model": profiles.writer.model,
+                "llm_temperature": profiles.writer.temperature,
                 "max_rounds": self.max_rounds,
                 "max_reviews": self.max_reviews,
                 "target_words": self.target_words,
@@ -582,7 +593,7 @@ class NovelAgent:
             before, after = build_context_pair(blocks, (lo, hi))
             label = f"第{lo}段" if lo == hi else f"第{lo}-{hi}段"
             print(f"  🔧 局部润色中（{label}，约30秒）...")
-            raw = self.llm.chat(
+            raw = self.writer_llm.chat(
                 system,
                 partial_refine_user(before, selection, after),
                 max_tokens=4096,

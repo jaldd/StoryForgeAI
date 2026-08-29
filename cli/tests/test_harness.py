@@ -175,3 +175,61 @@ def test_compare(sample_run, tmp_settings):
     text = "\n".join(lines)
     assert "A/B 对比" in text
     assert "0.9" in text and "0.5" in text  # 两个 temperature
+
+
+def _new_format_record(run_id, writer_model):
+    """0.7 新格式 run：config 含 model / writer_model / llm_temperature 键。"""
+    return {
+        "run_id": run_id, "task": "写第5章：异乡风起", "timestamp": "",
+        "config": {"model": "glm-5.2", "temperature": 0.9,
+                   "writer_model": writer_model, "llm_temperature": None},
+        "initial_state": {}, "steps": [],
+        "final_state": {
+            "task": "x", "draft": "", "polished": "",
+            "feedback": "审稿通过", "final_chapter": "风起了，他站在路口。",
+            "round": 1, "next_agent": "done", "review_count": 0, "log": [],
+        },
+    }
+
+
+def test_compare_new_records_show_model_lines(tmp_settings):
+    """T10：两条新记录对比展示 model / writer_model 两行。"""
+    from novel_agent.storage import save_run
+    save_run(_new_format_record("run_new_a", "kimi-k3"), tmp_settings)
+    save_run(_new_format_record("run_new_b", "glm-5.2"), tmp_settings)
+    lines = []
+    compare("run_new_a", "run_new_b", tmp_settings, out=lines.append)
+    text = "\n".join(lines)
+    assert "glm-5.2" in text  # model 行
+    assert "kimi-k3" in text  # writer_model 行
+
+
+def test_compare_mixed_old_new_records(sample_run, tmp_settings):
+    """T10：新旧记录混排对比不崩；旧记录缺 writer_model 时打印 None。"""
+    from novel_agent.storage import save_run
+    save_run(_new_format_record("run_new_c", "kimi-k3"), tmp_settings)
+    lines = []
+    compare(sample_run, "run_new_c", tmp_settings, out=lines.append)
+    text = "\n".join(lines)
+    assert "A/B 对比" in text
+    assert "kimi-k3" in text
+
+
+def test_compare_old_records_skip_writer_model_line(sample_run, tmp_settings):
+    """T10：两条旧记录（均无 writer_model）对比时跳过 writer_model 行。"""
+    from novel_agent.storage import save_run
+    record_b = {
+        "run_id": "run_old_b", "task": "写第5章：异乡风起", "timestamp": "",
+        "config": {"model": "glm-5.2", "temperature": 0.5},
+        "initial_state": {}, "steps": [],
+        "final_state": {
+            "task": "x", "draft": "", "polished": "",
+            "feedback": "审稿通过", "final_chapter": "小镇的雨刚歇。",
+            "round": 1, "next_agent": "done", "review_count": 0, "log": [],
+        },
+    }
+    save_run(record_b, tmp_settings)
+    lines = []
+    compare(sample_run, "run_old_b", tmp_settings, out=lines.append)
+    text = "\n".join(lines)
+    assert "writer_model" not in text
