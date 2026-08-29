@@ -1,10 +1,13 @@
 """storage 模块测试：章节落盘、run 日志、工作记忆持久化。"""
+from pathlib import Path
+
 from novel_agent.memory import WorkingMemory
 from novel_agent.storage import (
     _strip_leading_title,
     list_runs,
     load_run,
     load_working_memory,
+    parse_chapter_file,
     parse_chapter_task,
     save_chapter,
     save_run,
@@ -24,6 +27,30 @@ def test_parse_chapter_task_plain():
 def test_parse_chapter_task_no_match():
     num, title = parse_chapter_task("随便写点")
     assert num is None and title == "随便写点"
+
+
+# ---------- parse_chapter_file（0.8 T11）----------
+def test_parse_chapter_file_standard():
+    """匹配 save_chapter 落盘格式（零填充章号 + '-' 分隔）。"""
+    assert parse_chapter_file(Path("第05章-异乡风起.md")) == (5, "异乡风起")
+
+
+def test_parse_chapter_file_variants():
+    """无零填充同样匹配；run_id 冲突后缀名也拿到章号。"""
+    num, _ = parse_chapter_file(Path("第5章-风裂.md"))
+    assert num == 5
+    num, _ = parse_chapter_file(Path("第05章-异乡风起-run_b.md"))
+    assert num == 5
+
+
+def test_parse_chapter_file_no_match():
+    num, title = parse_chapter_file(Path("随便.md"))
+    assert num is None and title == "随便"
+
+
+def test_parse_chapter_file_with_directory():
+    """带目录的完整路径：只看文件名。"""
+    assert parse_chapter_file(Path("novel/正文/AI生成/第12章-夜行.md")) == (12, "夜行")
 
 
 # ---------- _strip_leading_title ----------

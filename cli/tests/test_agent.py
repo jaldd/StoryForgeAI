@@ -56,7 +56,7 @@ def test_pipeline_happy_path(fake_llm, fake_rag, tmp_settings):
     assert state.final_chapter  # 非空
     assert "风" in state.draft
     assert "通过" in state.feedback
-    assert len(record["steps"]) == 4  # director/writer/polisher/reviewer
+    assert len(record["steps"]) == 3  # writer/polisher/reviewer（0.8 删 director）
     assert record["run_id"].startswith("run_")
     assert record["config"]["model"] == "glm-5.2"
 
@@ -91,7 +91,7 @@ def test_pipeline_review_reject_then_pass(fake_llm, fake_rag, tmp_settings):
     assert state.review_count == 1
     assert state.next_agent == "done"
     assert state.final_chapter == "【润色2】风又起了，她在。"
-    assert len(record["steps"]) == 7  # 4 + 打回多出的 writer/polisher/reviewer
+    assert len(record["steps"]) == 6  # 3 + 打回多出的 writer/polisher/reviewer
     assert len(fake_llm.calls) == 6
 
 
@@ -236,7 +236,7 @@ def test_working_context_gating(fake_llm, fake_rag, tmp_settings):
 
 # ---------- 精修（refine）----------
 def test_refine_skips_writer(fake_llm, fake_rag, tmp_settings):
-    """精修：跳过 director/writer，polisher->reviewer，初稿=传入内容。"""
+    """精修：跳过 writer，polisher->reviewer，初稿=传入内容。"""
     agent = NovelAgent(
         llm=fake_llm, rag=fake_rag, exemplar="范文",
         settings=tmp_settings, working_memory=WorkingMemory(),
@@ -274,7 +274,7 @@ def test_refine_reject_goes_to_polisher(fake_llm, fake_rag, tmp_settings):
 
 
 def test_writer_strips_construction_notes(fake_llm, fake_rag, tmp_settings):
-    """writer 输出'构思 === 正文'时，state.draft 只保留正文，丢弃构思与分隔符。"""
+    """writer 输出'构思 === 正文'时：draft 只留正文；构思存入 state.outline（0.8 保留传递）。"""
     fake_llm.script = [
         "构思：风起，他站在路口，林晚没回头。\n===\n风起了。他没说话。林晚没回头。",  # writer
         "【润色】风起了。",  # polisher
@@ -284,10 +284,15 @@ def test_writer_strips_construction_notes(fake_llm, fake_rag, tmp_settings):
         llm=fake_llm, rag=fake_rag, exemplar="范文",
         settings=tmp_settings, working_memory=WorkingMemory(),
     )
-    state, _ = agent.run("写第5章：异乡风起")
+    state, record = agent.run("写第5章：异乡风起")
     assert "构思" not in state.draft
     assert "===" not in state.draft
     assert "风起了。他没说话。" in state.draft
+    # 0.8 A4/A6：构思不再丢弃，存入 outline 并进 run record
+    assert state.outline == "构思：风起，他站在路口，林晚没回头。"
+    assert record["final_state"]["outline"] == state.outline
+    writer_step = next(s for s in record["steps"] if s["agent"] == "writer")
+    assert writer_step["output_state"]["outline"] == state.outline
 
 
 # ---------- 写作指令全文注入 ----------
@@ -493,3 +498,171 @@ def test_partial_refine_empty_reply_is_none(fake_llm, fake_rag, tmp_settings):
     fake_llm.script = ["", "   "]
     results = agent.partial_refine(blocks, [(2, 2), (3, 3)], "局部精修：x.md")
     assert results == [None, None]
+
+
+# ---------- 0.8 流水线数据流补漏 ----------
+class _SysRecorder:
+    """记录 system/user/kwargs 的假 LLM（SpyLLM 模式，断言 system 注入用）。"""
+
+    def __init__(self, script=None):
+        self.script = list(script or [])
+        self.systems = []
+        self.users = []
+        self.kws = []
+
+    def chat(self, system, user, **kw):
+        self.systems.append(system)
+        self.users.append(user)
+        self.kws.append(kw)
+        return self.script.pop(0) if self.script else '{"pass": true, "reason": "通过"}'
+
+
+def test_split_writer_output_four_cases():
+    """T3/A5：构思与正文按首个 === 切分。"""
+    from novel_agent.agent import _split_writer_output
+    # 含 ===：前后各自 strip
+    assert _split_writer_output("构思甲。\n===\n正文乙。") == ("构思甲。", "正文乙。")
+    # 不含：构思为空、正文为全文
+    assert _split_writer_output("只有正文。") == ("", "只有正文。")
+    # 空串
+    assert _split_writer_output("") == ("", "")
+    # 正文内再出现 ===：只按首个切，其余归正文
+    outline, body = _split_writer_output("构思。\n===\n正文。\n===\n补充")
+    assert outline == "构思。"
+    assert body == "正文。\n===\n补充"
+
+
+def test_polisher_consumes_outline(fake_llm, fake_rag, tmp_settings):
+    """T4/A7：writer 构思进入 polisher 的 user 消息（润色不跑偏意图）。"""
+    fake_llm.script = [
+        "构思：风起，他站在路口。\n===\n风起了。",
+        "【润色】风起了。",
+        '{"pass": true, "reason": "通过"}',
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    agent.run("写第5章：异乡风起")
+    assert "构思：风起，他站在路口。" in fake_llm.calls[1]  # calls[1] = polisher
+    assert "writer 构思" in fake_llm.calls[1]
+
+
+def test_reviewer_consumes_outline(fake_llm, fake_rag, tmp_settings):
+    """T5/A8：writer 构思作为验收基准进入 reviewer 的 user 消息。"""
+    fake_llm.script = [
+        "构思：风起，他站在路口。\n===\n风起了。",
+        "【润色】风起了。",
+        '{"pass": true, "reason": "通过"}',
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    agent.run("写第5章：异乡风起")
+    assert "构思：风起，他站在路口。" in fake_llm.calls[2]  # calls[2] = reviewer
+    assert "验收基准" in fake_llm.calls[2]
+
+
+def test_refine_no_empty_outline_hint(fake_llm, fake_rag, tmp_settings):
+    """T4/A7 反例：outline 为空（refine 场景）不注入空构思块。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    agent.refine("要精修的初稿。", "精修：x.md")
+    assert all("构思" not in c for c in fake_llm.calls)
+
+
+def test_working_context_reaches_polisher_reviewer(fake_rag, tmp_settings):
+    """T5/D8/A9：工作记忆快照注入 writer/polisher/reviewer 三处 system。"""
+    wm = WorkingMemory()
+    wm.update_after_write(5, "风起想她", ["伏笔A"])
+    llm = _SysRecorder(["【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = NovelAgent(llm=llm, rag=fake_rag, settings=tmp_settings, working_memory=wm)
+    agent.run("写第6章：夜行")
+    assert len(llm.systems) == 3
+    assert all("当前写作状态" in s for s in llm.systems)
+    assert all("伏笔A" in s for s in llm.systems)
+    assert all("第5章" in s for s in llm.systems)
+
+
+def test_empty_working_memory_not_injected(fake_rag, tmp_settings):
+    """T5/A10：current_chapter=None 时不注入空快照噪音。"""
+    llm = _SysRecorder(["【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = NovelAgent(
+        llm=llm, rag=fake_rag, settings=tmp_settings, working_memory=WorkingMemory(),
+    )
+    agent.run("写第5章：异乡风起")
+    assert all("当前写作状态" not in s for s in llm.systems)
+
+
+def test_working_memory_none_still_runs(fake_llm, fake_rag, tmp_settings):
+    """T5/A11：working_memory=None 时流程照常（既有保护不回退）。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings, working_memory=None,
+    )
+    state, _ = agent.run("写第5章：异乡风起")
+    assert state.next_agent == "done" and state.final_chapter
+
+
+def test_target_words_in_writer_prompts(fake_llm, fake_rag, tmp_settings):
+    """T6/A12/A15：run 与 rewrite 两分支 user 都用 target_words 口径；进 record config。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    _, record = agent.run("写第5章：异乡风起")
+    assert "目标约1500字" in fake_llm.calls[0]
+    assert "约200字" not in fake_llm.calls[0]
+    assert record["config"]["target_words"] == 1500  # A15
+
+    fake_llm.calls.clear()
+    agent.rewrite("旧正文。", "重写：第5章")
+    assert "目标约1500字" in fake_llm.calls[0]
+    assert "参考以下已有内容" in fake_llm.calls[0]  # rewrite 分支
+
+
+def test_target_words_constructor_override(fake_llm, fake_rag, tmp_settings):
+    """T6：构造参数 target_words 覆盖 settings 默认。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(), target_words=800,
+    )
+    _, record = agent.run("写第5章：异乡风起")
+    assert "目标约800字" in fake_llm.calls[0]
+    assert record["config"]["target_words"] == 800
+
+
+def test_target_words_in_polisher_system():
+    """T7：polisher_system 直测 target_words 传参与默认值。"""
+    from novel_agent.prompts import polisher_system
+    assert "约1800字" in polisher_system("书", "", target_words=1800)
+    assert "约1500字" in polisher_system("书", "")
+
+
+def test_summarize_chapter_dedicated_call(tmp_settings):
+    """T8/A16：摘要走 PLOT_SUMMARY_SYSTEM + max_tokens=1024。"""
+    from novel_agent.prompts import PLOT_SUMMARY_SYSTEM
+    llm = _SysRecorder(["风起，他离开小镇。"])
+    agent = NovelAgent(llm=llm, settings=tmp_settings)
+    assert agent.summarize_chapter("章节正文。") == "风起，他离开小镇。"
+    assert llm.systems == [PLOT_SUMMARY_SYSTEM]
+    assert llm.users == ["章节正文。"]
+    assert llm.kws[0]["max_tokens"] == 1024
+    assert llm.kws[0]["temperature"] == 0.3
+
+
+def test_is_better_four_replies(fake_llm, tmp_settings):
+    """T12/A16：JSON true / JSON false / 散文含 true / 空回 四态。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    fake_llm.script = ['{"better": true}']
+    assert agent.is_better("原文", "润色") is True
+    fake_llm.script = ['{"better": false}']
+    assert agent.is_better("原文", "润色") is False
+    fake_llm.script = ["第二段整体更好，true"]  # 非 JSON 兜底：含 true 即 True
+    assert agent.is_better("原文", "润色") is True
+    fake_llm.script = [""]  # 空回
+    assert agent.is_better("原文", "润色") is False

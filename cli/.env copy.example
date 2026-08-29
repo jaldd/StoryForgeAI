@@ -19,5 +19,10 @@ NOVEL_DIR=/path/to/your/novel
 # NOVEL_RUNS_DIR=
 # NOVEL_CHROMA_DIR=
 
+# ---- 编排（可选）----
+# 单章目标字数（0.8）：writer 写作 / polisher 扩写共用口径，进 run record 的 config。
+# 不设默认 1500。注意 glm-5.2 是推理模型，max_tokens=4096 含内部推理预算，调大时留意截断。
+# NOVEL_TARGET_WORDS=1500
+
 # ---- 仓库根（可选；仅用于找 .env，不设则用当前工作目录）----
 # STORYFORGE_ROOT=/usr/local/workspace/github/StoryForgeAI

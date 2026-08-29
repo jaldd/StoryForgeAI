@@ -7,7 +7,8 @@ from novel_agent.state import PipelineState
 def test_defaults():
     s = PipelineState()
     assert s.task == "" and s.draft == "" and s.final_chapter == ""
-    assert s.next_agent == "director"
+    assert s.next_agent == "writer"  # 0.8：删 director，run 起点直接是 writer
+    assert s.outline == ""           # 0.8：构思字段，无 === 分隔时为空
     assert s.round == 0 and s.review_count == 0
     assert s.log == []
 

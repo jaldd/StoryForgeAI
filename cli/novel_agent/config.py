@@ -64,6 +64,7 @@ class Settings:
     # --- 编排控制 ---
     max_rounds: int = 10
     max_reviews: int = 6  # 审稿最多打回次数，防死循环
+    target_words: int = 1500  # NOVEL_TARGET_WORDS：单章目标字数（writer 写作/polisher 扩写共用口径）
 
     # ---------- 路径解析 ----------
     def path(self, rel: str) -> Path:
@@ -155,5 +156,6 @@ def get_settings() -> Settings:
         index_exclude=os.environ.get("NOVEL_INDEX_EXCLUDE", "正文"),
         runs_dir=os.environ.get("NOVEL_RUNS_DIR", ""),
         chroma_dir=os.environ.get("NOVEL_CHROMA_DIR", ""),
+        target_words=int(os.environ.get("NOVEL_TARGET_WORDS", "1500")),
         repo_root=_repo_root(),
     )

@@ -15,6 +15,7 @@ from .memory import WorkingMemory
 
 __all__ = [
     "parse_chapter_task",
+    "parse_chapter_file",
     "save_run",
     "load_run",
     "list_runs",
@@ -54,6 +55,20 @@ def parse_chapter_task(task: str) -> Tuple[Optional[int], str]:
     if m:
         return int(m.group(1)), m.group(2).strip()
     return None, task.strip()
+
+
+def parse_chapter_file(path: Path) -> Tuple[Optional[int], str]:
+    """从章节文件名解析 (章号, 标题)。
+
+    匹配 save_chapter 落盘格式「第05章-标题.md」（按「-」分隔，零填充章号）；
+    同名追加 run_id 后缀的「第05章-标题-run_xxx.md」同样匹配（标题取到第一个后缀前）。
+    不匹配 -> (None, stem)，调用方按「无章号」处理（如跳过工作记忆刷新，A21）。
+    """
+    stem = path.stem
+    m = re.match(r"第\s*0*(\d+)\s*章\s*-\s*(.+)", stem)
+    if m:
+        return int(m.group(1)), m.group(2).strip()
+    return None, stem
 
 
 # ---------- run 日志 ----------

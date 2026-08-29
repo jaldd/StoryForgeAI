@@ -30,12 +30,13 @@ from .harness import compare, evaluate, replay, run_tests
 from .llm import LLMClient
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
-from .prompts import exemplar_info, load_exemplar, PLOT_SUMMARY_SYSTEM
+from .prompts import exemplar_info, load_exemplar
 from .rag import RAGStore
 from .state import PipelineState
 from .storage import (
     list_runs,
     load_working_memory,
+    parse_chapter_file,
     parse_chapter_task,
     save_chapter,
     save_run,
@@ -60,23 +61,28 @@ def _load_rules(settings: Settings) -> str:
     return ""
 
 
-def _is_better(llm, original: str, refined: str) -> bool:
-    """让 LLM 对比原文和润色版本，判断润色后是否更好。"""
-    import json as _json
-    result = llm.chat(
-        "你是小说编辑。对比两段文字，判断第二段（润色后）是否比第一段（原文）更好。"
-        "只返回纯 JSON：{\"better\": true/false}",
-        f"【原文】\n{original[:2000]}\n\n【润色后】\n{refined[:2000]}\n\n"
-        f"润色后是否比原文更好？只返回 JSON。",
-        max_tokens=256,
-        temperature=0.2,
-    )
-    if not result:
-        return False
+def _refresh_working_memory(
+    path: Path,
+    state: PipelineState,
+    agent: NovelAgent,
+    wm: WorkingMemory,
+    settings: Settings,
+) -> None:
+    """精修/重写存回后刷新工作记忆（0.8 T11）。
+
+    - 章号取自文件名（parse_chapter_file，匹配 save_chapter 落盘格式）；
+    - 摘要失败 / 文件名不匹配 -> 静默跳过，不阻断存回主流程（A17/A21）；
+    - D9-b：精修旧章不回退进度指针（num < current_chapter 时不更新）；
+      current_chapter 为 None（首章）时裸 >= 会 TypeError，须补 None 判断。
+    """
+    num, _ = parse_chapter_file(path)
     try:
-        return _json.loads(result.strip()).get("better", False)
+        summary = agent.summarize_chapter(state.final_chapter)
     except Exception:
-        return "true" in result.lower()
+        summary = None
+    if num is not None and summary and (wm.current_chapter is None or num >= wm.current_chapter):
+        wm.update_after_write(num, summary)
+        save_working_memory(wm, settings)
 
 
 def _build_agent(settings: Settings):
@@ -133,11 +139,9 @@ def _do_write(task: str, settings: Settings) -> None:
             print(f"(索引更新失败：{e})")
         num, _ = parse_chapter_task(task)
         # 生成剧情摘要存入工作记忆，让后续章节记得前文（P1 连续性）
+        # 0.8：摘要调 agent.summarize_chapter（收编自裸调 agent.llm.chat），兜底仍留 UI 层
         try:
-            summary = agent.llm.chat(
-                PLOT_SUMMARY_SYSTEM, state.final_chapter,
-                max_tokens=1024, temperature=0.3,
-            )
+            summary = agent.summarize_chapter(state.final_chapter)
         except Exception:
             summary = task
         wm.update_after_write(num, summary or task)
@@ -171,6 +175,7 @@ def _refine_postprocess(
     record: Dict[str, Any],
     settings: Settings,
     agent: NovelAgent,
+    wm: WorkingMemory,
     file_path: str,
     action: str = "精修",
 ) -> None:
@@ -188,10 +193,12 @@ def _refine_postprocess(
             agent.rag.add_document(file_path)
         except Exception as e:
             print(f"(索引更新失败：{e})")
+        # 0.8 T11：存回后刷新工作记忆（精修不回退进度，D9-b）
+        _refresh_working_memory(path, state, agent, wm, settings)
     elif forced and state.final_chapter:
         print(f"⚖️ 强制定稿，对比原文和{action}版本...")
         try:
-            better = _is_better(agent.llm, content, state.final_chapter)
+            better = agent.is_better(content, state.final_chapter)
         except Exception:
             better = False
         if better:
@@ -202,6 +209,8 @@ def _refine_postprocess(
                 agent.rag.add_document(file_path)
             except Exception as e:
                 print(f"(索引更新失败：{e})")
+            # 0.8 T11：存回后刷新工作记忆（精修不回退进度，D9-b）
+            _refresh_working_memory(path, state, agent, wm, settings)
         else:
             print(f"⚠️ {action}版本未优于原文，原文件未改动。")
             print(f"   结果在运行日志中，可用 replay {record['run_id']} 查看")
@@ -249,7 +258,7 @@ def _do_refine(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
-    agent, _ = _build_agent(settings)
+    agent, wm = _build_agent(settings)
     rag = agent.rag
     abs_path = rag._resolve_source(file_path)
     path = Path(abs_path)
@@ -269,7 +278,7 @@ def _do_refine(args: List[str], settings: Settings) -> None:
         print(f"❌ 精修失败：{e}")
         return
 
-    _refine_postprocess(path, content, state, record, settings, agent, file_path, action="精修")
+    _refine_postprocess(path, content, state, record, settings, agent, wm, file_path, action="精修")
 
 
 def _do_rewrite(args: List[str], settings: Settings) -> None:
@@ -285,7 +294,7 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
-    agent, _ = _build_agent(settings)
+    agent, wm = _build_agent(settings)
     rag = agent.rag
     abs_path = rag._resolve_source(file_path)
     path = Path(abs_path)
@@ -305,7 +314,7 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
         print(f"❌ 重写失败：{e}")
         return
 
-    _refine_postprocess(path, content, state, record, settings, agent, file_path, action="重写")
+    _refine_postprocess(path, content, state, record, settings, agent, wm, file_path, action="重写")
 
 
 def _span_text(blocks: List[Block], span: Tuple[int, int]) -> str:

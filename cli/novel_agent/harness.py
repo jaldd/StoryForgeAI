@@ -42,6 +42,11 @@ def replay(
             f"  #{s['step_id']} [{s['agent']}] round={s['round']} "
             f"-> next={s['decision']} | draft={n_draft}字 polished={n_polished}字"
         )
+        # 0.8 T13：writer 步展示构思（前 60 字；.get 容错旧记录无该键）
+        outline = o.get("outline") or ""
+        if outline:
+            head = outline if len(outline) <= 60 else outline[:60] + "…"
+            out(f"     构思：{head}")
     out("\n=== 最终章节 ===")
     out(d["final_state"].get("final_chapter") or "(空)")
     return d

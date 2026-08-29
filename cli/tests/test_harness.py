@@ -9,6 +9,30 @@ def test_replay(sample_run, tmp_settings):
     text = "\n".join(lines)
     assert "回放" in text and "共 3 步" in text
     assert "风起了" in text  # 最终章节打印
+    assert "构思：" not in text  # A20：旧记录无 outline 键，不显示空构思行
+
+
+def test_replay_shows_outline(tmp_settings):
+    """T13：writer 步含 outline 时回放展示构思行（前 60 字）。"""
+    from novel_agent.storage import save_run
+    record = {
+        "run_id": "run_outline", "task": "写第5章：异乡风起", "timestamp": "",
+        "config": {},
+        "initial_state": {},
+        "steps": [
+            {"step_id": 1, "agent": "writer", "round": 1,
+             "input_state": {},
+             "output_state": {"outline": "风起，他站在路口，林晚没回头。",
+                              "draft": "风起了。", "next_agent": "polisher"},
+             "decision": "polisher"},
+        ],
+        "final_state": {"final_chapter": "风起了。"},
+    }
+    save_run(record, tmp_settings)
+    lines = []
+    replay("run_outline", tmp_settings, out=lines.append)
+    text = "\n".join(lines)
+    assert "构思：风起，他站在路口，林晚没回头。" in text
 
 
 def test_run_tests_pass(sample_run, tmp_settings):

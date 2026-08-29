@@ -79,3 +79,24 @@ def test_defaults():
     assert s.chapter_subdir == "正文/AI生成"
     assert s.index_exclude == "正文"
     assert s.instruction_subpath == "写作指令.md"
+
+
+# ---------- target_words（0.8 T6）----------
+def test_target_words_default():
+    """A12：单章目标字数默认 1500。"""
+    assert Settings(ark_api_key="k").target_words == 1500
+
+
+def test_target_words_from_env(monkeypatch):
+    """A14：NOVEL_TARGET_WORDS 环境变量生效。
+
+    get_settings 带 @lru_cache(maxsize=1)：setenv 后必须先 cache_clear
+    才能读到新值，收尾再 clear 一次防污染其他用例。
+    """
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_TARGET_WORDS", "2200")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().target_words == 2200
+    finally:
+        get_settings.cache_clear()

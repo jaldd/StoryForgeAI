@@ -15,19 +15,20 @@ __all__ = ["PipelineState"]
 class PipelineState:
     """一次写作任务的状态机数据。各 Agent 共用同一个实例，改属性 + 推进 next_agent。"""
 
-    # -- 核心五字段 --
-    task: str = ""            # Director 收到的写作任务
+    # -- 核心字段 --
+    task: str = ""            # 写作任务
     draft: str = ""           # Writer 写的初稿
     polished: str = ""        # Polisher 润色稿
     feedback: str = ""        # Reviewer 审稿意见
     final_chapter: str = ""   # 最终定稿
+    outline: str = ""         # Writer 的构思说明（=== 分隔前的部分；无分隔符时为空）
 
     # -- 重写输入 --
     source_content: str = ""   # 重写模式：已有内容（writer 作为参考自由重写）
 
     # -- 控制字段 --
     round: int = 0                 # 当前轮次，防死循环
-    next_agent: str = "director"   # 下一步派给谁
+    next_agent: str = "writer"     # 下一步派给谁
     review_count: int = 0          # 审稿打回次数，防死循环
 
     # -- 过程日志 --

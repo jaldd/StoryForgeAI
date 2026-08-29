@@ -124,8 +124,18 @@ def _strip_code_fence(text: str) -> str:
     return body.strip()
 
 
+def _split_writer_output(raw: str) -> Tuple[str, str]:
+    """writer 输出按首个 === 切分，返回 (构思, 正文)。无分隔符时构思为空、正文为全文。"""
+    if not raw:
+        return "", ""
+    if "===" in raw:
+        outline, _, body = raw.partition("===")
+        return outline.strip(), body.strip()
+    return "", raw.strip()
+
+
 class NovelAgent:
-    """小说创作 Agent：四角色状态机编排。
+    """小说创作 Agent：三角色状态机编排。
 
     依赖全部注入，便于测试（传 fake llm/rag 即可不联网跑完整流程）。
     """
@@ -140,6 +150,7 @@ class NovelAgent:
         working_memory: Optional[WorkingMemory] = None,
         max_reviews: Optional[int] = None,
         max_rounds: Optional[int] = None,
+        target_words: Optional[int] = None,
         review_confirm: Optional[Callable[[str], str]] = None,
         rules: str = "",
     ):
@@ -154,6 +165,8 @@ class NovelAgent:
         self.working_memory = working_memory
         self.max_reviews = self.settings.max_reviews if max_reviews is None else max_reviews
         self.max_rounds = self.settings.max_rounds if max_rounds is None else max_rounds
+        # 0.8：单章目标字数（writer 写作 / polisher 扩写共用口径，进 prompt）
+        self.target_words = self.settings.target_words if target_words is None else target_words
         # 0.1：审稿结果不可解析时的人工确认函数（prompt -> 应答）。
         # None = REPL 交互 input；未来批量模式注入恒"弃"（返回"n"）即 fail-closed。
         self.review_confirm = review_confirm
@@ -161,7 +174,6 @@ class NovelAgent:
         self._reject_target = "writer"
 
         self.agents: Dict[str, Callable[[PipelineState], None]] = {
-            "director": self._director,
             "writer": self._writer,
             "polisher": self._polisher,
             "reviewer": self._reviewer,
@@ -209,14 +221,9 @@ class NovelAgent:
             return ""
         return f"\n--- 当前写作状态（工作记忆）---\n{self.working_memory.snapshot()}"
 
-    # ---------- 四个 Agent ----------
-    def _director(self, state: PipelineState) -> None:
-        """导演：拿到任务，派给 Writer。"""
-        state.log.append(f"[director] 收到任务：{state.task}")
-        state.next_agent = "writer"
-
+    # ---------- 三个 Agent ----------
     def _writer(self, state: PipelineState) -> None:
-        """写手：查设定 + 调模型产出初稿。"""
+        """写手：查设定 + 调模型产出初稿（构思与正文按 === 分离，构思存入 state.outline）。"""
         print("  ✍️  写作中（约30秒）...")
         retrieved = self._retrieve(state.task)
         system = writer_system(self.novel_name, retrieved, self.exemplar, self.instruction, self.rules) + self._working_context()
@@ -227,7 +234,7 @@ class NovelAgent:
 
         if state.source_content:
             user_msg = (
-                f"参考以下已有内容，自由重写一个完整章节：{state.task}"
+                f"参考以下已有内容，自由重写一个完整章节：{state.task}。目标约{self.target_words}字。"
                 "\n你可以自行决定参考多少，结构和情节可以调整，但要保留核心意图。"
                 f"\n\n【已有内容（参考）】\n{state.source_content}"
                 "\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
@@ -235,7 +242,7 @@ class NovelAgent:
             )
         else:
             user_msg = (
-                f"写一段新章节：{state.task}。约200字。"
+                f"写一段新章节：{state.task}。目标约{self.target_words}字。"
                 f"\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
                 f"{feedback_hint}"
             )
@@ -246,11 +253,10 @@ class NovelAgent:
             max_tokens=4096,
             temperature=0.8,
         )
-        # 按 === 分隔，丢弃构思说明，只取正文存入 draft
-        if raw and "===" in raw:
-            state.draft = raw.split("===", 1)[1].strip()
-        else:
-            state.draft = (raw or "").strip()
+        # 按 === 分隔：构思存入 state.outline（0.8 保留传递，供 polisher/reviewer/run 日志消费），正文进 draft
+        outline, body = _split_writer_output(raw or "")
+        state.outline = outline
+        state.draft = body
         if not state.draft:
             state.draft = f"（初稿兜底）{state.task}"
             state.log.append("[writer] 模型未返回内容，已用占位兜底")
@@ -262,17 +268,22 @@ class NovelAgent:
         print("  🔧 润色中（约30秒）...")
         retrieved = self._retrieve(state.task)
         system = polisher_system(
-            self.novel_name, retrieved, self.instruction, rules=self.rules
-        )
+            self.novel_name, retrieved, self.instruction,
+            target_words=self.target_words, rules=self.rules,
+        ) + self._working_context()
         # 防止 GLM 把 --- 当结束标记截断，预处理换掉，润色后换回
         draft_safe = state.draft.replace("\n---\n", "\n【场景分隔】\n")
         # 打回重写时，把审稿意见传给 polisher
         feedback_hint = ""
         if state.feedback and "不通过" in state.feedback:
             feedback_hint = f"\n\n【上次审稿意见，必须据此改进】\n{state.feedback}"
+        # 0.8：writer 构思传给 polisher（润色不跑偏意图）
+        outline_hint = ""
+        if state.outline:
+            outline_hint = f"\n\n【writer 构思（润色时保持此意图，不要跑偏）】\n{state.outline}"
         raw = self.llm.chat(
             system,
-            f"以下是初稿，请润色：\n\n{draft_safe}{feedback_hint}",
+            f"以下是初稿，请润色：\n\n{draft_safe}{outline_hint}{feedback_hint}",
             max_tokens=4096,
             temperature=0.6,
         )
@@ -338,10 +349,14 @@ class NovelAgent:
 
         print("  🔍 审稿中（约10秒）...")
         retrieved = self._retrieve(state.task, with_prior=False)
-        system = reviewer_system(self.novel_name, retrieved, self.instruction, self.rules)
+        system = reviewer_system(self.novel_name, retrieved, self.instruction, self.rules) + self._working_context()
+        # 0.8：writer 构思作为验收基准（正文是否实现了该构思）
+        outline_hint = ""
+        if state.outline:
+            outline_hint = f"\n\n【writer 构思（验收基准：请审查正文是否实现了该构思）】\n{state.outline}"
         result = self.llm.chat(
             system,
-            f"请审查以下稿件：\n\n{state.polished}",
+            f"请审查以下稿件：\n\n{state.polished}{outline_hint}",
             max_tokens=2048,
             temperature=0.2,
         )
@@ -370,6 +385,38 @@ class NovelAgent:
             print(f"  ❌ 审稿不通过：{reason}，打回重写")
             state.log.append(f"[reviewer] {state.feedback}，打回 {self._reject_target}")
             state.next_agent = self._reject_target
+
+    # ---------- 单次调用能力（0.8 从 cli 收编） ----------
+    def summarize_chapter(self, chapter_text: str, max_tokens: int = 1024) -> str:
+        """剧情摘要（0.8 从 cli 收编）：1-2 句话关键情节与情绪落点。
+
+        异常向上抛（原 cli 侧 try/except 兜底逻辑保留在调用方 _do_write）。
+        """
+        return self.llm.chat(
+            PLOT_SUMMARY_SYSTEM, chapter_text,
+            max_tokens=max_tokens, temperature=0.3,
+        )
+
+    def is_better(self, original: str, refined: str) -> bool:
+        """对比原文与润色版（0.8 从 cli._is_better 收编）：润色后是否更好。
+
+        - 空返回 False；
+        - 返回纯 JSON 时取 better 字段（缺省 False）；
+        - 解析失败兜底：文本含 "true" 则 True。
+        """
+        result = self.llm.chat(
+            COMPARE_SYSTEM,
+            f"【原文】\n{original[:2000]}\n\n【润色后】\n{refined[:2000]}\n\n"
+            f"润色后是否比原文更好？只返回 JSON。",
+            max_tokens=256,
+            temperature=0.2,
+        )
+        if not result:
+            return False
+        try:
+            return bool(json.loads(result.strip()).get("better", False))
+        except Exception:
+            return "true" in result.lower()
 
     # ---------- 主循环 ----------
     def _run_loop(
@@ -418,6 +465,7 @@ class NovelAgent:
                 "temperature": temperature,
                 "max_rounds": self.max_rounds,
                 "max_reviews": self.max_reviews,
+                "target_words": self.target_words,
             },
             "initial_state": asdict(PipelineState(task=task)),
             "steps": steps,
@@ -430,7 +478,7 @@ class NovelAgent:
         run_id: Optional[str] = None,
         temperature: float = 0.9,
     ) -> Tuple[PipelineState, Dict[str, Any]]:
-        """跑完整流程（director->writer->polisher->reviewer），返回 (state, record)。"""
+        """跑完整流程（writer->polisher->reviewer），返回 (state, record)。"""
         if run_id is None:
             run_id = "run_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -449,7 +497,7 @@ class NovelAgent:
         """精修已有正文：跳过 writer，直接从 polisher 开始打磨。
 
         - state.draft = 传入的正文（作为初稿）
-        - state.next_agent = "polisher"（跳过 director 和 writer）
+        - state.next_agent = "polisher"（跳过 writer，直接打磨）
         - reviewer 不通过时打回 polisher（不回 writer，因为不写新场景）
         后面 polisher -> reviewer 循环与 run() 一致。
         """
@@ -483,7 +531,7 @@ class NovelAgent:
         """重写已有正文：走 writer->polisher->reviewer，writer 参考原文自由重写。
 
         - state.source_content = 传入的正文（writer 作为参考）
-        - state.next_agent = "writer"（跳过 director，直接写）
+        - state.next_agent = "writer"（直接从 writer 起）
         - reviewer 不通过时打回 writer（和 run 一致，可重写场景）
         与 run() 的区别：writer 拿到已有内容作为参考，而非从零创作。
         与 refine() 的区别：走 writer 而非 polisher，能大幅扩写/重构。
