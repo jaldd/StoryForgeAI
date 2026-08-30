@@ -19,7 +19,8 @@ from .prompts import _exemplar_files
 __all__ = ["load_quality_rules", "split_sentences", "run_checks", "load_baseline", "ai_flavor_score"]
 
 _SENTENCE_DELIM = r"。！？!?；;\n"
-_QUOTE_CHARS = "「」『』“”‘’"
+# 直引号 " ' 也算对话标记：正文章节常用直引号（弯/CJK 引号之外的真实分布）
+_QUOTE_CHARS = "「」『』“”‘’\"'"
 _QUOTE_TRUNC = 50
 
 # AI 味三组件默认权重与锚点（design §3.1.3；ai_score 可配覆盖）

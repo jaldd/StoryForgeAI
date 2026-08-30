@@ -131,6 +131,18 @@ def test_check_monologue_blank_lines_not_counted():
     assert len(run_checks(text, rules)) == 1
 
 
+def test_check_monologue_straight_quote_breaks_run():
+    """直引号 " 对话行同样中断独白区间（真实正文用直引号，Z 修复）。
+
+    两段各 3 行 + 中间直引号对话：上限 5 行，识别直引号则两段各 3 行不
+    命中；旧代码不识别直引号 -> 连成 7 行命中。
+    """
+    lines = ["他想了想。"] * 3 + ['"你来了。"她说。'] + ["他又想了想。"] * 3
+    text = "\n".join(lines)
+    rules = {"monologue": {"max_lines": 5}}
+    assert run_checks(text, rules) == []
+
+
 def test_check_metaphor_rate_hit():
     sents = ["像风一样快。"] * 10 + ["他停下了。"] * 10
     text = "\n".join(sents)
