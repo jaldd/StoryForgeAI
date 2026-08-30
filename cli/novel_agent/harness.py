@@ -143,7 +143,10 @@ def evaluate(
         _eval_system_prompt(instruction),
         f"请评分以下稿件：\n\n{chapter}",
         max_tokens=2048,
-        temperature=0.2,
+        temperature=(
+            settings.judge_temperature
+            if settings.judge_temperature is not None else 0.2
+        ),
     )
 
     if not result or not result.strip():
@@ -218,6 +221,17 @@ def run_tests(
             "维度分：八维齐全且各分 1-5 整数",
             not missing and not bad,
             f"缺失={missing or '无'}，越界或非整数={bad or '无'}",
+        ))
+
+    # 1.6 B16：de-AI 留痕自洽性--accepted 的记录必然 after < before（防造假）；
+    # 旧记录无 deai 键 / 未接受 -> 跳过（B20）；其余情节保真由①②作用于
+    # de-AI 后稿（final_chapter）天然覆盖（design §3.6）。
+    deai = final.get("deai")
+    if isinstance(deai, dict) and deai.get("accepted"):
+        cases.append((
+            "去AI留痕：accepted 时 after < before",
+            deai.get("after", float("inf")) < deai.get("before", float("-inf")),
+            f"before={deai.get('before')}，after={deai.get('after')}",
         ))
 
     cases.append((

@@ -30,7 +30,7 @@
 
 ```
 <NOVEL_DIR>/                  # 仓库外，由 NOVEL_DIR 指向
-  设定.md 文风基准/ 正文/新/   # 小说内容（RAG 索引源 + exemplar + 人工正文）
+  设定.md 文风基准/ 正文/   # 小说内容（RAG 索引源 + exemplar + 人工正文）
   正文/AI生成/                 # Agent 产出章节
   .agent/                      # 运行时（自动生成）
     runs/*.json  chroma_db/  working_memory.json

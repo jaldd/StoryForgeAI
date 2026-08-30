@@ -23,6 +23,8 @@ from .prompts import (
     COMPARE_SYSTEM,
     PARTIAL_REFINE_SUFFIX,
     PLOT_SUMMARY_SYSTEM,
+    deai_system,
+    deai_user,
     fixer_system,
     fixer_user,
     fixer_whole_user,
@@ -223,6 +225,22 @@ def _parse_fixer_output(raw: str) -> Dict[int, str]:
     return result
 
 
+def _locate_issues(text: str, issues: List[dict]) -> Optional[Dict[int, List[dict]]]:
+    """issue -> 段号映射（A10）；任一 issue 不可定位返回 None（D12 整文降级判定）。
+
+    不可定位 = quote 为空 / 非原文子串 / 落在标题或分隔符块（无 para 块包含）。
+    """
+    para_blocks = [b for b in split_paragraphs(text) if b.kind == "para" and b.no is not None]
+    hit: Dict[int, List[dict]] = {}
+    for issue in issues:
+        quote = str(issue.get("quote") or "")
+        target = next((b for b in para_blocks if quote and quote in b.body), None)
+        if target is None:
+            return None
+        hit.setdefault(target.no, []).append(issue)
+    return hit
+
+
 class NovelAgent:
     """小说创作 Agent：三角色状态机编排。
 
@@ -244,11 +262,14 @@ class NovelAgent:
         rules: str = "",
         quality_rules: Optional[dict] = None,
         writer_llm: Optional[LLMClient] = None,
+        recent_human: str = "",
     ):
         self.llm = llm
         self.rag = rag
         self.exemplar = exemplar
         self.instruction = instruction
+        # 1.5 滚动注入：人工正文尾部 N 章片段，只进 writer prompt（B5）。
+        self.recent_human = recent_human
         # 0.2：写作铁律全文（NOVEL_DIR 下「写作铁律.md」），注入 writer/polisher/reviewer。
         self.rules = rules
         # 1.1：质量规则 dict（checker 五项机械检查）；None = 无规则 = checker 直通。
@@ -276,15 +297,17 @@ class NovelAgent:
 
     # ---------- RAG 检索辅助 ----------
     def _temp(self, kind: str, default: float) -> float:
-        """调用点温度（0.9 可配）：单代理 NOVEL_<KIND>_TEMPERATURE >
-        NOVEL_TEMPERATURE（仅写作侧兜底）> 调用点默认。
+        """调用点温度（0.9 全量可配）：单代理 NOVEL_<KIND>_TEMPERATURE >
+        NOVEL_TEMPERATURE（写作侧兜底）> 调用点默认。
 
-        reviewer 无兜底档：只看 NOVEL_REVIEWER_TEMPERATURE 和默认值。
+        - kind ∈ {writer, polisher, reviewer, router, fixer, judge, summarizer}；
+        - 写作侧（writer/polisher/fixer，走 writer_llm）多一档 NOVEL_TEMPERATURE 兜底；
+        - reviewer/judge/summarizer（走主 llm）与 router 只看自己的键和默认值。
         """
         per = getattr(self.settings, f"{kind}_temperature", None)
         if per is not None:
             return per
-        if kind in ("writer", "polisher") and self.settings.llm_temperature is not None:
+        if kind in ("writer", "polisher", "fixer") and self.settings.llm_temperature is not None:
             return self.settings.llm_temperature
         return default
 
@@ -334,7 +357,11 @@ class NovelAgent:
         """写手：查设定 + 调模型产出初稿（构思与正文按 === 分离，构思存入 state.outline）。"""
         print("  ✍️  写作中（约30秒）...")
         retrieved = self._retrieve(state.task)
-        system = writer_system(self.novel_name, retrieved, self.exemplar, self.instruction, self.rules) + self._working_context()
+        # 1.5：滚动人工正文只注入 writer（polisher/reviewer 零改动，B5）
+        system = writer_system(
+            self.novel_name, retrieved, self.exemplar, self.instruction,
+            self.rules, self.recent_human,
+        ) + self._working_context()
 
         if state.source_content:
             user_msg = (
@@ -536,9 +563,10 @@ class NovelAgent:
 
         - 定位（A10）：issue.quote 非空且为原文子串 -> 首个含 quote 的 para 块；
         - 任一 quote 为空或非原文子串 -> 整组整文降级（D12，不做混合协议）；
-        - 段落级：全部问题段 + 各自意见 + 上下文合成一次 writer_llm 调用
-          （A11/Z3），输出按【第N段·修复后】标记协议解析（D11），未返回段回落原文；
-        - 逐段字数保护（A15）；apply_replacements 回填，区间外逐字节不变；
+        - 段落级走 _fix_spans 共用子过程（1.6 D2 抽取，行为不变）：全部问题段
+          + 各自意见 + 上下文合成一次 writer_llm 调用（A11/Z3），输出按
+          【第N段·修复后】标记协议解析（D11），未返回段回落原文；
+          逐段字数保护（A15）；apply_replacements 回填，区间外逐字节不变；
         - 修复后清空 state.issues（Z5，防陈旧意见重复触发）。
         """
         text = state.polished
@@ -548,22 +576,51 @@ class NovelAgent:
             return
 
         # ---- 定位（D12：任一不可定位即整文修复）----
+        if _locate_issues(text, issues) is None:
+            state.polished = self._fixer_whole(state, text, issues)
+            state.issues = []  # Z5
+            state.next_agent = "checker"
+            return
+
+        new_text, n_spans = self._fix_spans(
+            text, issues,
+            fixer_system(self.novel_name, self.rules),
+            fixer_user,
+            log=state.log,
+        )
+        state.polished = new_text
+        state.issues = []  # Z5
+        state.log.append(f"[fixer] 修复 {n_spans} 段，{len(state.polished)} 字，回 checker 复检")
+        state.next_agent = "checker"
+
+    def _fix_spans(
+        self,
+        text: str,
+        issues: List[dict],
+        system: str,
+        user_builder: Callable[[List[dict]], str],
+        log_tag: str = "fixer",
+        log: Optional[List[str]] = None,
+        doing: str = "修复",
+    ) -> Tuple[str, int]:
+        """共用修复子过程（1.6 D2）：定位 -> spans 合并 -> 单次调用 -> 标记协议解析
+        -> 逐段回填 + 字数保护。返回 (新文本, 问题段数)。
+
+        - issues 应为可定位 issue（_fixer 已整组校验、deai_refine 已过滤；
+          残余不可定位项在此丢弃不阻断）；
+        - 与 _fixer 既有行为逐条一致（A10/A11/D11/A15 是回归护栏）；
+        - log_tag/doing 只影响提示文案；log 传入时同步留痕（fixer 传 state.log）。
+        """
         blocks = split_paragraphs(text)
         para_blocks = {b.no: b for b in blocks if b.kind == "para" and b.no is not None}
         hit: Dict[int, List[dict]] = {}
         for issue in issues:
             quote = str(issue.get("quote") or "")
-            target = None
-            if quote and quote in text:
-                # 首个含 quote 的 para 块（A10）
-                target = next((b for b in para_blocks.values() if quote in b.body), None)
-            if target is None:
-                # quote 空 / 非原文子串 / 落在标题或分隔符块 -> 整文降级
-                state.polished = self._fixer_whole(state, text, issues)
-                state.issues = []  # Z5
-                state.next_agent = "checker"
-                return
-            hit.setdefault(target.no, []).append(issue)
+            target = next((b for b in para_blocks.values() if quote and quote in b.body), None)
+            if target is not None:
+                hit.setdefault(target.no, []).append(issue)
+        if not hit:
+            return text, 0
 
         # ---- 问题段号排序去重合并相邻为 spans（A10）----
         nos = sorted(hit)
@@ -586,12 +643,12 @@ class NovelAgent:
                 "after": after,
                 "issues": hit[no],
             })
-        print(f"  🩹 修复中（{len(nos)} 个问题段，约30秒）...")
+        print(f"  🩹 {doing}中（{len(nos)} 个问题段，约30秒）...")
         raw = self.writer_llm.chat(
-            fixer_system(self.novel_name, self.rules),
-            fixer_user(spans_data),
+            system,
+            user_builder(spans_data),
             max_tokens=4096,
-            temperature=0.5,
+            temperature=self._temp("fixer", 0.5),
         )
         fixed = _parse_fixer_output(_strip_code_fence(raw or ""))
 
@@ -605,10 +662,11 @@ class NovelAgent:
                 if new_body is None:
                     new_body = b.body  # 未返回段保持原文（保底不破坏）
                 elif len(b.body) >= 50 and len(new_body) < len(b.body) * 0.5:
-                    print(f"  ⚠️ 字数保护：第{no}段修复缩水（{len(new_body)}字 < 原文50% {len(b.body)}字），保留原段")
-                    state.log.append(
-                        f"[fixer] ⚠️ 第{no}段修复缩水（{len(new_body)}字 < 原文50% {len(b.body)}字），保留原段"
-                    )
+                    print(f"  ⚠️ 字数保护：第{no}段{doing}缩水（{len(new_body)}字 < 原文50% {len(b.body)}字），保留原段")
+                    if log is not None:
+                        log.append(
+                            f"[{log_tag}] ⚠️ 第{no}段{doing}缩水（{len(new_body)}字 < 原文50% {len(b.body)}字），保留原段"
+                        )
                     new_body = b.body
                 parts.append(new_body)
                 if no != hi:
@@ -616,10 +674,34 @@ class NovelAgent:
                     parts.append(b.text[len(b.body):])
             new_texts.append("".join(parts))
 
-        state.polished = apply_replacements(text, blocks, spans, new_texts)
-        state.issues = []  # Z5
-        state.log.append(f"[fixer] 修复 {len(nos)} 段，{len(state.polished)} 字，回 checker 复检")
-        state.next_agent = "checker"
+        return apply_replacements(text, blocks, spans, new_texts), len(nos)
+
+    # ---------- 去 AI 人味重写（1.6 style-loop，B9-B17）----------
+    def deai_refine(self, text: str, issues: List[dict]) -> Tuple[str, int]:
+        """人味重写 pass 本体（D1 旁挂方法）：对可定位问题段做去 AI 表达重写。
+
+        - 不可定位 issue（quote 空/非子串）直接丢弃，不整文降级（D8：
+          B10 只传问题句是硬约束；fixer 服务打回语义必须全消费，两角色差异点）；
+        - 全部不可定位 / 无 issue -> 返回 (原文, 0)，零 LLM 调用（B17 防空跑）；
+        - 管线复用 _fix_spans（D2）：单次 writer_llm 调用（A11 同款纪律）
+          + 标记协议解析（D11）+ 逐段回填 + 字数保护，区间外逐字节不变（B12）；
+        - 温度 self._temp("fixer", 0.5)（Z3 同 fixer 档，可配覆盖）。
+        """
+        if not text or not issues:
+            return text, 0
+        locatable = [
+            i for i in issues
+            if str(i.get("quote") or "") and str(i.get("quote") or "") in text
+        ]
+        if not locatable:
+            return text, 0
+        return self._fix_spans(
+            text, locatable,
+            deai_system(self.novel_name, self.rules),
+            deai_user,
+            log_tag="deai",
+            doing="人味重写",
+        )
 
     def _fixer_whole(self, state: PipelineState, text: str, issues: List[dict]) -> str:
         """整文修复降级（A12/D12）：单次调用全文改写，整体字数保护（A15）。"""
@@ -628,7 +710,7 @@ class NovelAgent:
             fixer_system(self.novel_name, self.rules),
             fixer_whole_user(text, issues),
             max_tokens=4096,
-            temperature=0.5,
+            temperature=self._temp("fixer", 0.5),
         )
         new_text = _strip_code_fence(raw or "")
         if not new_text.strip():
@@ -649,7 +731,7 @@ class NovelAgent:
         """
         return self.llm.chat(
             PLOT_SUMMARY_SYSTEM, chapter_text,
-            max_tokens=max_tokens, temperature=0.3,
+            max_tokens=max_tokens, temperature=self._temp("summarizer", 0.3),
         )
 
     def is_better(self, original: str, refined: str) -> bool:
@@ -664,7 +746,7 @@ class NovelAgent:
             f"【原文】\n{original[:2000]}\n\n【润色后】\n{refined[:2000]}\n\n"
             f"润色后是否比原文更好？只返回 JSON。",
             max_tokens=256,
-            temperature=0.2,
+            temperature=self._temp("judge", 0.2),
         )
         if not result:
             return False

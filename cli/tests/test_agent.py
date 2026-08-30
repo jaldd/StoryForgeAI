@@ -1121,6 +1121,26 @@ def test_temp_reviewer_independent():
     assert agent._temp("reviewer", 0.2) == 0.5
 
 
+def test_temp_aux_roles():
+    """辅助角色（0.9 全量可配）：fixer 属写作侧吃 NOVEL_TEMPERATURE 兜底；
+    judge/summarizer/router 只看自己的键，不吃写作侧兜底。"""
+    agent, _ = _mk_agent_for_temp(
+        llm_temperature=0.7, judge_temperature=0.4
+    )
+    assert agent._temp("fixer", 0.5) == 0.7      # 写作侧兜底
+    assert agent._temp("judge", 0.2) == 0.4     # 自己的键
+    assert agent._temp("summarizer", 0.3) == 0.3  # 无配置回默认
+    assert agent._temp("router", 0.2) == 0.2
+
+
+def test_temp_fixer_own_key_wins_over_fallback():
+    """fixer 单配赢过 NOVEL_TEMPERATURE（细粒度优先，同三代理规则）。"""
+    agent, _ = _mk_agent_for_temp(
+        llm_temperature=0.7, fixer_temperature=0.9
+    )
+    assert agent._temp("fixer", 0.5) == 0.9
+
+
 def test_run_uses_configured_temperatures(fake_rag, tmp_settings):
     """端到端：run 全流程各调用点的温度来自配置。"""
     rec = _SysRecorder(script=[
@@ -1140,3 +1160,147 @@ def test_run_uses_configured_temperatures(fake_rag, tmp_settings):
     assert rec.kws[0]["temperature"] == 0.9   # writer
     assert rec.kws[1]["temperature"] == 0.5   # polisher
     assert rec.kws[2]["temperature"] == 0.3   # reviewer
+
+
+# ---------------- 1.6 style-loop：deai_refine / _fix_spans ----------------
+def test_deai_refine_rewrites_marked_paragraph(fake_llm, tmp_settings):
+    """B12：标记协议重写问题段，区间外逐字节不变；单次调用。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    fake_llm.script = ["【第3段·修复后】\n她低头，风把话吹散。"]
+    issues = [{"quote": "她的眼眸里闪过一丝哀伤", "problem": "黑名单词「一丝」", "fix": "换成具体描写"}]
+    new_text, n = agent.deai_refine(GATE_TEXT, issues)
+
+    assert n == 1
+    assert len(fake_llm.calls) == 1                      # 单次调用（A11 纪律）
+    assert new_text == GATE_TEXT.replace(
+        "她的眼眸里闪过一丝哀伤。", "她低头，风把话吹散。")
+    assert new_text.startswith("他沿着河岸走了很久。\n\n风从北边来。\n\n")  # 区间外不动
+    assert new_text.endswith("\n\n狗在村口叫了两声。\n\n水开了。\n")
+
+
+def test_deai_refine_missing_paragraph_falls_back(fake_llm, tmp_settings):
+    """D11：未返回段保持原文；幻觉段号被忽略。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    fake_llm.script = ["【第1段·修复后】\n他沿河走。\n\n【第5段·修复后】\n幻觉段。"]
+    issues = [
+        {"quote": "他沿着河岸", "problem": "p1", "fix": "f1"},
+        {"quote": "她的眼眸", "problem": "p2", "fix": "f2"},
+    ]
+    new_text, n = agent.deai_refine(GATE_TEXT, issues)
+
+    assert n == 2
+    assert "他沿河走。" in new_text                          # 段 1 已改
+    assert "她的眼眸里闪过一丝哀伤。" in new_text           # 段 3 未返回 -> 原文
+    assert "幻觉段。" not in new_text                        # 段 5 未请求 -> 幻觉被忽略
+
+
+def test_deai_refine_shrink_protection_keeps_original(fake_llm, tmp_settings, capsys):
+    """A15 同款：重写缩水超 50% 保留原段（打印提示）。"""
+    long_para = ("她的眼眸里闪过一丝淡淡的哀伤，情绪如潮水般涌上心头，无可回避。"
+                 "他蹲在门槛上抽烟，没说话，屋檐下的灯还亮着。")
+    text = f"{long_para}\n\n狗在村口叫了两声。\n"
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    fake_llm.script = ["【第1段·修复后】\n太短。"]
+    new_text, _ = agent.deai_refine(text, [{"quote": "眼眸", "problem": "p", "fix": "f"}])
+
+    assert new_text == text                                  # 保留原段
+    assert "字数保护" in capsys.readouterr().out
+
+
+def test_deai_refine_empty_issues_no_llm(fake_llm, tmp_settings):
+    """B17：空 issues 返回 (原文, 0)，零 LLM 调用。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    new_text, n = agent.deai_refine(GATE_TEXT, [])
+    assert new_text == GATE_TEXT and n == 0
+    assert fake_llm.calls == []
+
+
+def test_deai_refine_all_unlocatable_no_llm(fake_llm, tmp_settings):
+    """B17/D8：全部不可定位（quote 空/非子串）-> 丢弃不降级，返回原文零调用。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    issues = [
+        {"quote": "", "problem": "比喻密度过高", "fix": "删减"},
+        {"quote": "这句引文不在原文中", "problem": "p", "fix": "f"},
+    ]
+    new_text, n = agent.deai_refine(GATE_TEXT, issues)
+    assert new_text == GATE_TEXT and n == 0
+    assert fake_llm.calls == []
+
+
+def test_deai_refine_drops_unlocatable_keeps_locatable(fake_llm, tmp_settings):
+    """D8：混合输入 -> 不可定位丢弃、可定位照常重写（不整文降级）。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    fake_llm.script = ["【第3段·修复后】\n她低头。"]
+    issues = [
+        {"quote": "", "problem": "比喻密度过高", "fix": "删减"},     # 丢弃
+        {"quote": "她的眼眸", "problem": "黑名单词", "fix": "换具体"},  # 保留
+    ]
+    new_text, n = agent.deai_refine(GATE_TEXT, issues)
+
+    assert n == 1
+    assert new_text == GATE_TEXT.replace("她的眼眸里闪过一丝哀伤。", "她低头。")
+    payload = fake_llm.calls[0]
+    assert "她的眼眸里闪过一丝哀伤。" in payload        # 可定位段进 prompt
+    assert "比喻密度过高" not in payload               # 不可定位 issue 不进 prompt
+    assert "【原稿全文】" not in payload                # 不整文降级（与 fixer 的差异点）
+
+
+def test_deai_refine_temperature_override():
+    """deai 调用吃 NOVEL_FIXER_TEMPERATURE / NOVEL_TEMPERATURE 覆盖链。"""
+    from dataclasses import replace
+
+    class _Rec:
+        def __init__(self):
+            self.kws = []
+
+        def chat(self, system, user, **kw):
+            self.kws.append(kw)
+            return "【第3段·修复后】\n她低头。"
+
+    rec = _Rec()
+    s = replace(Settings(ark_api_key="k"), fixer_temperature=0.9)
+    agent = NovelAgent(llm=rec, settings=s)
+    agent.deai_refine(GATE_TEXT, [{"quote": "她的眼眸", "problem": "p", "fix": "f"}])
+    assert rec.kws[0]["temperature"] == 0.9
+
+
+def test_fixer_behavior_unchanged_after_extraction(fake_llm, tmp_settings):
+    """D2 回归护栏：_fix_spans 抽取后 fixer 打回路径行为不变（A8-A15 之外再补一条端到端）。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(GATE_TEXT)
+    state.issues = [{"quote": "她的眼眸里闪过一丝哀伤", "problem": "黑名单词「眼眸」", "fix": "换成具体描写"}]
+    fake_llm.script = ["【第3段·修复后】\n她低下头，没说话。"]
+    agent._fixer(state)
+
+    assert state.next_agent == "checker"
+    assert state.issues == []
+    assert state.polished == GATE_TEXT.replace(
+        "她的眼眸里闪过一丝哀伤。", "她低下头，没说话。")
+    assert any("[fixer] 修复 1 段" in line for line in state.log)
+
+
+def test_state_deai_field_defaults():
+    """B14：PipelineState.deai 默认空 dict，asdict 自动落 record。"""
+    from dataclasses import asdict
+    s = PipelineState(task="x")
+    assert s.deai == {}
+    assert "deai" in asdict(s)
+
+
+def test_writer_prompt_contains_recent_human(fake_rag, tmp_settings):
+    """B5：滚动人工正文只进 writer 的 system prompt（构造器注入，novel_name 默认）。"""
+    rec = _SysRecorder(script=["构思。\n===\n正文。"])
+    agent = NovelAgent(
+        llm=rec, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(), recent_human="人工正文片段",
+    )
+    state = PipelineState(task="写第1章：测试")
+    agent._writer(state)
+    assert "【近期人工正文】" in rec.systems[0]
+    assert "人工正文片段" in rec.systems[0]
+
+    # 对照：不注入时（B18 现状）prompt 无该分节
+    rec2 = _SysRecorder(script=["构思。\n===\n正文。"])
+    agent2 = NovelAgent(llm=rec2, rag=fake_rag, settings=tmp_settings, working_memory=WorkingMemory())
+    agent2._writer(PipelineState(task="写第1章：测试"))
+    assert "近期人工正文" not in rec2.systems[0]

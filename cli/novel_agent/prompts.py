@@ -17,6 +17,7 @@ __all__ = [
     "EXEMPLAR_MANIFEST_NAME",
     "load_exemplar",
     "exemplar_info",
+    "load_recent_human",
     "EXEMPLAR_ROUTER_SYSTEM",
     "exemplar_router_user",
     "writer_system",
@@ -25,6 +26,8 @@ __all__ = [
     "fixer_system",
     "fixer_user",
     "fixer_whole_user",
+    "deai_system",
+    "deai_user",
     "EVALUATOR_RUBRIC",
     "PLOT_SUMMARY_SYSTEM",
     "COMPARE_SYSTEM",
@@ -188,6 +191,48 @@ def exemplar_info(path: str | Path) -> tuple[int, int]:
     return len(files), total
 
 
+def load_recent_human(
+    dir_path: str | Path,
+    n: int = 3,
+    slice_chars: int = 1000,
+    progress=print,
+) -> str:
+    """滚动文风注入语料（1.5）：人工正文目录按文件名序取尾部 n 个，每个截前 slice_chars 字。
+
+    - 目录不存在 / n<=0 / 无 .txt/.md 文件 -> ""（B2 降级，零误伤）；
+    - 文件名字典序即章序（Z1），`sorted()[-n:]` 取尾部 n 个，n 超过文件数全取；
+    - 每章超 slice_chars 截断并 progress 留一行（B4，不静默丢内容）；
+      slice_chars<=0 不截断；
+    - 不可读文件 progress 提示后跳过，窗口照常推进（load_exemplar 同款纪律）；
+    - 输出多段拼接（章与章间 \n\n 分隔），不带分节标题（分节在 writer_system 模板）。
+    """
+    if n <= 0:
+        return ""
+    p = Path(dir_path)
+    if not p.is_dir():
+        return ""
+    files = sorted(
+        q for q in p.iterdir()
+        if q.is_file() and q.suffix.lower() in (".txt", ".md")
+    )[-n:]
+    if not files:
+        return ""
+    texts: list[str] = []
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError as e:
+            progress(f"(跳过不可读的人工正文文件：{f.name}（{e}）)")
+            continue
+        if slice_chars > 0 and len(text) > slice_chars:
+            progress(
+                f"(人工正文 {f.name} 共 {len(text)} 字，超过单章注入上限 {slice_chars} 字，只注入前 {slice_chars} 字)"
+            )
+            text = text[:slice_chars]
+        texts.append(text)
+    return "\n\n".join(texts)
+
+
 # ---------- 样文路由 prompt（exemplar-routing） ----------
 EXEMPLAR_ROUTER_SYSTEM = """你是文风样文路由器。根据本章写作任务，从样文标签列表中选出最适合本次注入的样文。
 
@@ -219,13 +264,30 @@ def _rules_block(rules: str) -> str:
     return f"【写作铁律】（绝对不能违反）\n{rules}\n" if rules.strip() else ""
 
 
+def _recent_human_block(recent_human: str) -> str:
+    """近期人工正文块（1.5 滚动注入）；空则返回空串不占位（对齐 _rules_block 先例）。"""
+    if not recent_human.strip():
+        return ""
+    return (
+        "\n【近期人工正文】（学笔性与节奏，不是情节指令，不要模仿其中情节）\n"
+        f"{recent_human}\n"
+    )
+
+
 # ---------- 各 Agent 的 system prompt ----------
-def writer_system(novel_name: str, retrieved: str, exemplar: str, instruction: str = "", rules: str = "") -> str:
+def writer_system(
+    novel_name: str,
+    retrieved: str,
+    exemplar: str,
+    instruction: str = "",
+    rules: str = "",
+    recent_human: str = "",
+) -> str:
     return f"""你是小说《{novel_name}》的创作助手，必须严格模仿以下文风写作。
 {_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
 【风格范例】
 {exemplar}
-"""
+{_recent_human_block(recent_human)}"""
 
 
 def polisher_system(novel_name: str, retrieved: str, instruction: str = "", target_words: int = 1500, rules: str = "") -> str:
@@ -320,6 +382,52 @@ def fixer_whole_user(text: str, issues: list) -> str:
         f"【意见清单（逐条修复）】\n{advice}\n\n"
         f"【原稿全文】\n{text}"
     )
+
+
+# ---------- 去 AI 人味重写（1.6 style-loop deai_refine）----------
+def deai_system(novel_name: str, rules: str = "") -> str:
+    return f"""你是小说《{novel_name}》的人味重写师。
+任务：按每段附带的意见重写问题段，去掉 AI 味，让它读起来像人写的。
+铁律（绝对不能违反）：
+1. 情节、人物人称、称呼、伏笔、段落结构一个字不动语义，只改表达
+2. 只改问题段：按每段附带的意见重写，其余段落一个字都不动
+3. 每个待改段独立重写，不要合并、移动或增删段落
+风格指令（重写的方向）：
+1. 短句为主，能一句说清的绝不用三句；适度独立成行制造留白
+2. 克制，点到即止；情绪靠动作与物象外显，不直接抒情
+3. 不解释因果，不替读者总结；留白比说透好
+4. 具体物象优先（看得见摸得着的细节），删副词堆叠与抽象形容
+{_rules_block(rules)}
+输出协议（必须遵守）：
+- 每个重写后的段，先写标记行「【第N段·修复后】」（N 为该段编号），紧跟整段重写后的文本
+- 只返回被重写的段，未提及的段不要返回
+- 不要加任何总说明、标题、注释，不要用代码围栏包裹
+"""
+
+
+def deai_user(spans_data: list) -> str:
+    """人味重写 user prompt：多个问题段 + 各自意见 + 上下文，合并单次调用（B10/D2）。
+
+    与 fixer_user 同构（before/text/after/issues），文案改为「人味重写」。
+    spans_data 元素：{"no": 段号, "before": 上文或空, "text": 段落原文,
+    "after": 下文或空, "issues": [{"quote", "problem", "fix"}, ...]}。
+    """
+    parts: list[str] = []
+    for item in spans_data:
+        parts.append(f"━━ 第{item['no']}段 ━━")
+        if item.get("before"):
+            parts.append(f"【上文（仅供理解语境，不要修改）】\n{item['before']}\n")
+        parts.append(f"【待人味重写段落】\n{item['text']}\n")
+        if item.get("after"):
+            parts.append(f"【下文（仅供理解语境，不要修改）】\n{item['after']}\n")
+        issues = item.get("issues") or []
+        if issues:
+            lines = [
+                f"{i}. 问题：{iss.get('problem', '')}；改法：{iss.get('fix', '')}"
+                for i, iss in enumerate(issues, 1)
+            ]
+            parts.append("【该段意见（人味重写依据）】\n" + "\n".join(lines) + "\n")
+    return "\n".join(parts)
 
 
 # ---------- 评测 / 摘要 prompt ----------

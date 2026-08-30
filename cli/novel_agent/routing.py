@@ -76,6 +76,7 @@ def route_exemplars(
     llm: LLMClient,
     task: str,
     tags: List[Tuple[str, str]],
+    temperature: float = 0.2,
 ) -> Optional[RouteResult]:
     """按本章任务路由样文：返回选中文件名 + 理由；失败返回 None（回落）。
 
@@ -83,6 +84,7 @@ def route_exemplars(
     - files 过滤：不在标签文件名集合内的丢弃（模型编造的文件名不进加载）；
       过滤后为空也返回 None（全落空 = 失败，A4）。
     - LLM 调用异常向上传播，由 cli 层捕获回落（A3：路由不阻塞写作）。
+    - temperature 由调用方从 settings 传入（0.9 全量可配；默认 0.2 要稳）。
     """
     if not tags:
         return None
@@ -91,7 +93,7 @@ def route_exemplars(
         EXEMPLAR_ROUTER_SYSTEM,
         exemplar_router_user(task, tags),
         max_tokens=1024,      # 宪法 §4：短输出调用至少 1024
-        temperature=0.2,      # 路由要稳不要飘
+        temperature=temperature,
     )
     data = _parse_router_json(raw)
     if data is None:

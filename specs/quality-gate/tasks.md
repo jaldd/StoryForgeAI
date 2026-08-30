@@ -10,7 +10,7 @@
 
 - [x] **T1 config.py：Settings 新字段与 env 接线**
   改动：新增 `quality_rules_subpath`（默认 `质量规则.json`，env `NOVEL_QUALITY_RULES`，空 = 禁用）
-  与 `human_text_subpath`（默认 `正文/新`，env `NOVEL_HUMAN_TEXT`，空 = 不用人工语料）两字段；
+  与 `human_text_subpath`（默认 `正文`，env `NOVEL_HUMAN_TEXT`，空 = 不用人工语料）两字段；
   路径解析复用 `rules_subpath` 的既有模式（novel_dir + subpath property）。
   验证：test_config.py 新增用例--默认值 / setenv 覆盖 / 空串语义；setenv 后
   `get_settings.cache_clear()`、finally 再 clear（0.8 纪律）。A23、A27。

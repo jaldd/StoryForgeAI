@@ -9,12 +9,16 @@ from pathlib import Path
 from novel_agent import cli
 from novel_agent.prompts import (
     EXEMPLAR_MAX_CHARS,
+    deai_system,
+    deai_user,
     exemplar_info,
     fixer_system,
     fixer_user,
     fixer_whole_user,
     load_exemplar,
+    load_recent_human,
     reviewer_system,
+    writer_system,
 )
 
 
@@ -330,3 +334,112 @@ def test_build_agent_no_tag_file_no_route(tmp_settings, monkeypatch):
     only, route = cli._route_exemplar_files(tmp_settings, "写第1章：风起")
     assert only is None and route is None
     assert not called
+
+
+# ---------- 1.5 滚动注入（style-loop T2）----------
+def test_load_recent_human_takes_tail_n(tmp_path):
+    """B3/Z1：按文件名序取尾部 N 个（4 文件取 3 = 后 3 个），章间 \\n\\n 拼接。"""
+    d = tmp_path / "正文"
+    d.mkdir()
+    (d / "第01章-风起.txt").write_text("第一章正文", encoding="utf-8")
+    (d / "第02章-夜行.txt").write_text("第二章正文", encoding="utf-8")
+    (d / "第03章-旧约.txt").write_text("第三章正文", encoding="utf-8")
+    (d / "第04章-新雨.txt").write_text("第四章正文", encoding="utf-8")
+    text = load_recent_human(d, n=3, progress=_quiet)
+    assert text == "第二章正文\n\n第三章正文\n\n第四章正文"  # 最早一章被滚出窗口
+
+
+def test_load_recent_human_truncates_each_file(tmp_path):
+    """B4：逐文件截前 slice_chars（不是拼接后截断，每章都有头部内容）。"""
+    d = tmp_path / "正文"
+    d.mkdir()
+    (d / "1.txt").write_text("甲" * 30, encoding="utf-8")
+    (d / "2.txt").write_text("乙" * 30, encoding="utf-8")
+    logs: list[str] = []
+    text = load_recent_human(d, n=2, slice_chars=10, progress=logs.append)
+    assert text == "甲" * 10 + "\n\n" + "乙" * 10
+    assert any("超过单章注入上限" in m and "只注入前" in m for m in logs)  # 留痕不静默
+
+
+def test_load_recent_human_degraded_states(tmp_path):
+    """B2：n=0 / 目录不存在 / 空目录均返回空串，不报错（零误伤）。"""
+    d = tmp_path / "正文"
+    d.mkdir()
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    assert load_recent_human(d, n=0) == ""                      # 0 = 禁用
+    assert load_recent_human(tmp_path / "不存在") == ""          # 目录不存在
+    empty = tmp_path / "空目录"
+    empty.mkdir()
+    assert load_recent_human(empty, progress=_quiet) == ""      # 无语料文件
+
+
+def test_load_recent_human_filters_suffix(tmp_path):
+    """混合后缀过滤：只认 .txt/.md。"""
+    d = tmp_path / "正文"
+    d.mkdir()
+    (d / "1.txt").write_text("甲", encoding="utf-8")
+    (d / "2.md").write_text("乙", encoding="utf-8")
+    (d / "3.jpg").write_bytes(b"x")
+    assert load_recent_human(d, n=5, progress=_quiet) == "甲\n\n乙"
+
+
+def test_load_recent_human_skips_unreadable_file(tmp_path, monkeypatch):
+    """不可读文件提示后跳过，窗口照常推进（load_exemplar 同款纪律）。"""
+    d = tmp_path / "正文"
+    d.mkdir()
+    (d / "1.txt").write_text("甲" * 5, encoding="utf-8")
+    (d / "2.txt").write_text("乙" * 5, encoding="utf-8")
+    real_read = Path.read_text
+
+    def fake_read(self, *a, **kw):
+        if self.name == "1.txt":
+            raise OSError("boom")
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    logs: list[str] = []
+    assert load_recent_human(d, n=2, progress=logs.append) == "乙" * 5
+    assert any("跳过" in m and "1.txt" in m for m in logs)
+
+
+# ---------- 1.5 writer prompt 注入（style-loop T3）----------
+def test_writer_system_recent_human_block():
+    """B8：recent_human 非空 -> 分节标题 + 防混淆文案；空串整块不占位（B18）。"""
+    base = writer_system("测试小说", "", "范例")
+    assert "近期人工正文" not in base  # 空串不占位，与现状逐字节一致
+    with_block = writer_system("测试小说", "", "范例", recent_human="人工正文片段")
+    assert "【近期人工正文】" in with_block
+    assert "不是情节指令" in with_block
+    assert "人工正文片段" in with_block
+    assert with_block.startswith(base)  # 既有分节零改动，追加在风格范例之后
+
+
+# ---------- 1.6 去 AI prompt（style-loop T4）----------
+def test_deai_system_contract():
+    """B11：人味重写师 + 情节不动铁律 + 风格指令四条 + 标记协议（D11 同协议）。"""
+    sys_prompt = deai_system("测试小说", rules="铁律内容")
+    assert "人味重写师" in sys_prompt
+    assert "情节、人物人称、称呼、伏笔、段落结构" in sys_prompt
+    for kw in ("短句为主", "克制", "不解释因果", "具体物象"):
+        assert kw in sys_prompt, kw
+    assert "【第N段·修复后】" in sys_prompt
+    assert "铁律内容" in sys_prompt
+
+
+def test_deai_user_renders_spans_and_issues():
+    """B10：与 fixer_user 同构（段号/上下文/原文/意见全渲染），文案为人味重写。"""
+    spans_data = [
+        {"no": 3, "before": "上文。", "text": "第三段原文。", "after": "下文。",
+         "issues": [{"quote": "第三段原文", "problem": "黑名单词「一丝」", "fix": "换成具体描写"}]},
+        {"no": 7, "before": "", "text": "第七段原文。", "after": "",
+         "issues": [{"quote": "第七段原文", "problem": "超长句", "fix": "拆分"}]},
+    ]
+    user_prompt = deai_user(spans_data)
+    assert "第3段" in user_prompt and "第7段" in user_prompt
+    assert "第三段原文。" in user_prompt and "第七段原文。" in user_prompt
+    assert "上文。" in user_prompt and "下文。" in user_prompt
+    assert "人味重写" in user_prompt
+    assert "黑名单词" in user_prompt and "拆分" in user_prompt
+    # 第 7 段 before/after 均空 -> 其渲染区不含上下文占位块
+    seg7 = user_prompt.split("第7段 ━━")[1]
+    assert "【上文" not in seg7 and "【下文" not in seg7

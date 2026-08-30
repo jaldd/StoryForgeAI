@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from openai import OpenAI
 
@@ -113,6 +113,50 @@ def _strip_think_blocks(text: str) -> str:
     return out
 
 
+class _ThinkFilter:
+    """流式增量的思考块过滤（2.1，D2）：feed 并入增量，返回当前可安全打印文本。
+
+    - 完整思考块对：剥掉，其余可打印；
+    - 未闭合思考开头：该位置之前可打印，之后全部扣住（思考中不漏）；
+    - 尾部持有 len(_THINK_OPEN)-1 字符不发（防开标签跨 chunk 被截断误放行）；
+    - flush 结算尾部：剩余若是未闭合思考前缀则丢弃（思考不是正文）。
+    打印侧偶有迟发可接受；数据侧由 chat 出口的 _strip_think_blocks 兜底
+    （返回值与现状同源，双层兜底见 design §3.2）。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, delta: str) -> str:
+        if not delta:
+            return ""
+        self._buf += delta
+        out = ""
+        while True:
+            idx = self._buf.find(_THINK_OPEN)
+            if idx == -1:
+                # 无思考开头：除尾部 hold-back 外可安全输出
+                safe = len(self._buf) - (len(_THINK_OPEN) - 1)
+                if safe > 0:
+                    out += self._buf[:safe]
+                    self._buf = self._buf[safe:]
+                return out
+            out += self._buf[:idx]
+            self._buf = self._buf[idx:]
+            close_idx = self._buf.find(_THINK_CLOSE)
+            if close_idx == -1:
+                return out  # 思考未闭合：扣住不打印
+            self._buf = self._buf[close_idx + len(_THINK_CLOSE):]
+
+    def flush(self) -> str:
+        out = self._buf
+        self._buf = ""
+        idx = out.find(_THINK_OPEN)
+        if idx != -1 and _THINK_CLOSE not in out:
+            return out[:idx]
+        return _THINK_BLOCK_RE.sub("", out)
+
+
 class LLMClient:
     """单次 chat completion 调用封装，带重试。
 
@@ -131,6 +175,9 @@ class LLMClient:
     ):
         self.settings = settings or get_settings()
         self._client = client
+        # kimi-k3 类模型只允许 temperature=1：撞 400 后本 client 永久锁定，
+        # 后续调用直接按 1 出门，不再每个调用点重新撞墙
+        self._temp_locked = False
         # None -> 主配置；writer 注入见 cli._build_agent
         self.profile = (
             profile if profile is not None else load_profiles(self.settings).default
@@ -156,6 +203,7 @@ class LLMClient:
         max_tokens: int = 1024,
         temperature: float = 0.9,
         max_retries: int = 5,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         """一次模型调用，返回生成文本；多次重试仍空则返回 ""。
 
@@ -163,9 +211,15 @@ class LLMClient:
         finish_reason=length、content 为空，原样重试必然再空。此时翻倍
         max_tokens 重试（上限 _MAX_TOKENS_CAP）；profile.extra 显式配了
         max_tokens 则尊重配置不自动翻倍（Z2 逃生门精神）。
+        2.1 流式（D1）：on_delta 非空时请求 stream=True，每个可打印增量
+        回调一次（思考块经 _ThinkFilter 过滤不打印）；返回值与非流式同源
+        （收完组装 + 出口剥思考块）。on_delta=None 时请求体不带 stream 键，
+        行为与改造前逐字节一致。
         """
         system = clean_text(system)
         user = clean_text(user)
+        if self._temp_locked:
+            temperature = 1  # 模型只收 1：调用点配了什么都被压掉（模型约束最高）
         req = {
             "model": self.profile.model,
             "max_tokens": max_tokens,
@@ -180,17 +234,23 @@ class LLMClient:
         cur_max = req["max_tokens"]
         allow_double = "max_tokens" not in self.profile.extra
         last_err = ""
-        print("  ⏳ 等待模型响应...")
+        if on_delta is not None:
+            print("  ⏳ 等待模型响应（流式）...")
+        else:
+            print("  ⏳ 等待模型响应...")
         for attempt in range(1, max_retries + 1):
             try:
-                resp = self.client.chat.completions.create(**req)
-                choice = resp.choices[0]
-                content = (choice.message.content or "").strip()
+                if on_delta is None:
+                    resp = self.client.chat.completions.create(**req)
+                    choice = resp.choices[0]
+                    content = (choice.message.content or "").strip()
+                    finish = choice.finish_reason
+                    reasoning = getattr(choice.message, "reasoning_content", None) or ""
+                else:
+                    content, finish, reasoning = self._chat_stream(req, on_delta)
                 if content:
                     return _strip_think_blocks(content)
                 # 空回：finish_reason 可能是 content_filter / length / stop
-                finish = choice.finish_reason
-                reasoning = getattr(choice.message, "reasoning_content", None) or ""
                 if (
                     finish == "length"
                     and reasoning
@@ -212,11 +272,56 @@ class LLMClient:
                 # 模型只收 temperature=1（如 kimi-k3 思考模型）：锁定后立即
                 # 重试，不退避（参数错误退避重试没有意义）
                 if "400" in last_err and _TEMP_RE.search(last_err):
+                    self._temp_locked = True  # 本 client 记住，后续调用不再撞墙
                     req["temperature"] = 1
                     print("  ⚠️ 该模型只允许 temperature=1，锁定后重试")
                     continue
+                # 流式中断（D3）：丢弃已收增量，整请求重来；提示让用户分得清
+                # 「还在写」与「重试中」（T8）
+                if on_delta is not None and attempt < max_retries:
+                    print(f"  ⚠️ 流式中断，丢弃已收内容重试（{last_err[:60]}）")
             # 指数退避：2/4/8/16/32 秒；最后一次不再多睡
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
         print(f"  ⚠️ 模型空回（已重试 {max_retries} 次）：{last_err}")
         return ""
+
+    def _chat_stream(
+        self, req: Dict[str, Any], on_delta: Callable[[str], None]
+    ) -> Tuple[str, Optional[str], str]:
+        """流式请求（2.1，D1/D2）：边收边回调可打印增量。
+
+        返回 (raw 全文, finish_reason, reasoning 累积)：
+        - raw 含思考块（出口统一 _strip_think_blocks，数据侧与非流式同源）；
+        - 打印侧经 _ThinkFilter 增量过滤（思考不打印）；
+        - finish_reason 取最后一次非 None 值（流式只在末 chunk 返回）；
+        - reasoning_content 只累积不外发（Z2：供空回翻倍判定用）；
+        - 中途异常直接抛给外层重试（整请求重来，D3）。
+        """
+        stream = self.client.chat.completions.create(**req, stream=True)
+        parts: list = []
+        reasoning_parts: list = []
+        finish: Optional[str] = None
+        filt = _ThinkFilter()
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            finish = choice.finish_reason or finish
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            text = getattr(delta, "content", None) or ""
+            if text:
+                parts.append(text)
+                printable = filt.feed(text)
+                if printable:
+                    on_delta(printable)
+            reason = getattr(delta, "reasoning_content", None) or ""
+            if reason:
+                reasoning_parts.append(reason)
+        tail = filt.flush()
+        if tail:
+            on_delta(tail)
+        return "".join(parts).strip(), finish, "".join(reasoning_parts)

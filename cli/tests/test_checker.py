@@ -307,7 +307,7 @@ def test_load_baseline_combines_exemplar_and_human(tmp_settings, tmp_path):
     """exemplar 目录全量 + 人工正文目录（Z8）。"""
     _write(tmp_path, "文风基准/a.md", "他走了很久。风停了。")
     _write(tmp_path, "文风基准/b.txt", "她回来了。")
-    _write(tmp_path, "正文/新/1.md", "水开了。")
+    _write(tmp_path, "正文/1.md", "水开了。")
     _write(tmp_path, "文风基准/c.json", "不该被读取")
     base = load_baseline(tmp_settings)
     assert base is not None
@@ -333,7 +333,7 @@ def test_load_baseline_missing_dirs_returns_none(tmp_settings):
 def test_load_baseline_human_text_empty_reads_exemplar_only(tmp_settings, tmp_path):
     """human_text_subpath 留空 -> 只读 exemplar（不误扫 novel 根目录）。"""
     _write(tmp_path, "文风基准/a.md", "他走了很久。风停了。")
-    _write(tmp_path, "正文/新/ignored.md", "这段不应计入。")
+    _write(tmp_path, "正文/ignored.md", "这段不应计入。")
     s = dataclasses.replace(tmp_settings, human_text_subpath="")
     base = load_baseline(s)
     assert base is not None

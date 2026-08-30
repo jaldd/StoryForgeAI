@@ -54,6 +54,22 @@ def test_route_success():
     assert route == RouteResult(files=["5.txt", "10.txt", "13.txt"], reason="日常+退缩")
 
 
+def test_route_temperature_passthrough():
+    """temperature 参数透传给 LLM 调用（0.9 全量可配）；默认 0.2。"""
+    seen: dict = {}
+
+    class _Rec:
+        def chat(self, system, user, **kw):
+            seen.update(kw)
+            return '{"files": ["5.txt"], "reason": "r"}'
+
+    assert route_exemplars(_Rec(), "写第1章", TAGS, temperature=0.7) is not None
+    assert seen["temperature"] == 0.7
+    seen.clear()
+    assert route_exemplars(_Rec(), "写第1章", TAGS) is not None
+    assert seen["temperature"] == 0.2
+
+
 def test_route_fenced_json_and_dedup():
     """模型输出带 ``` 围栏 -> 剥掉再解析；files 重复去重保序。"""
     llm = FakeLLM(script=['```json\n{"files": ["1.txt", "1.txt", "5.txt"], "reason": "r"}\n```'])

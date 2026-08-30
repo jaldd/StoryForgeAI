@@ -1,6 +1,7 @@
 """rag 模块纯函数测试（不联网、不依赖 Chroma）。"""
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from novel_agent.rag import chunk_text, classify_type, load_documents
 
@@ -132,9 +133,8 @@ def test_add_remove_document(tmp_path):
     assert coll.count() == n
     # id 格式：{文件名}_{序号}
     assert all(i.startswith("人物.md_") for i in coll.data)
-    # metadata：source 绝对路径，type=character
-    src = str(novel / "人物.md")
-    assert all(v["metadata"]["source"] == src for v in coll.data.values())
+    # metadata：source 为相对 NOVEL_DIR 的路径（跨机可移植），type=character
+    assert all(v["metadata"]["source"] == "人物.md" for v in coll.data.values())
     assert all(v["metadata"]["type"] == "character" for v in coll.data.values())
     # remove：按 source 清空，返回删除数
     assert store.remove_document("人物.md") == n
@@ -232,3 +232,114 @@ def test_rebuild_corrupt_manifest_not_fatal(tmp_path):
     total = store.build_index(progress=None)
     assert total > 0
     assert store._collection_obj().count() == total
+
+
+def test_store_source_is_relative_to_novel_dir(tmp_path):
+    """source 存相对 NOVEL_DIR 的路径（而非绝对路径），跨机复制后 add/remove 仍能匹配。"""
+
+    def make_store(novel_dir):
+        from novel_agent.config import Settings
+        from novel_agent.rag import RAGStore
+        settings = Settings(ark_api_key="k", repo_root=tmp_path, novel_dir=novel_dir)
+        return RAGStore(settings=settings, client=FakeClient())
+
+    novel = tmp_path / "novel"
+    novel.mkdir()
+    (novel / "人物.md").write_text("林晚是女主。" * 200, encoding="utf-8")
+    store = make_store(str(novel))
+    store.add_document("人物.md", progress=None)
+    # 不含绝对路径前缀，即为相对路径；分类正确
+    assert {v["metadata"]["source"] for v in store._collection_obj().data.values()} == {"人物.md"}
+
+    # 不同 NOVEL_DIR 下，同一相对文件名得到相同 source -> 跨机复制后增删仍能按 source 匹配
+    novel2 = tmp_path / "another_path"
+    novel2.mkdir()
+    (novel2 / "人物.md").write_text("林晚是女主。" * 200, encoding="utf-8")
+    store2 = make_store(str(novel2))
+    store2.add_document("人物.md", progress=None)
+    assert {v["metadata"]["source"] for v in store2._collection_obj().data.values()} == {"人物.md"}
+    # 重跑 add 应清掉旧块再 upsert，不留孤儿（证明按相对 source 成功匹配删除）
+    n = store2.add_document("人物.md", progress=None)
+    assert store2._collection_obj().count() == n
+    # remove 同样按相对 source 匹配
+    assert store2.remove_document("人物.md") == n
+    assert store2._collection_obj().count() == 0
+
+
+def test_openai_embedding_omits_auth_when_no_key(tmp_path):
+    """openai provider：EMBED_API_KEY/ARK_API_KEY 皆空时本地服务免鉴权（不带 Authorization）。"""
+    from novel_agent.config import Settings
+    from novel_agent.rag import OpenAIEmbedding
+
+    novel = tmp_path / "novel"
+    novel.mkdir()
+
+    def fake_resp():
+        return type("R", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"data": [{"embedding": [0.1, 0.2]}]},
+        })()
+
+    # 无 key：不带 Authorization
+    s1 = Settings(repo_root=tmp_path, novel_dir=str(novel),
+                  embed_url="http://localhost:9999/v1/embeddings",
+                  embed_model="bge-m3", embed_provider="openai")
+    ef1 = OpenAIEmbedding(s1, sleep=0)
+    with patch("requests.post") as m:
+        m.return_value = fake_resp()
+        ef1.embed_documents(["你好"])
+        assert "Authorization" not in m.call_args.kwargs["headers"]
+
+    # 有 key：带 Authorization
+    s2 = Settings(repo_root=tmp_path, novel_dir=str(novel),
+                  embed_url="http://localhost:9999/v1/embeddings",
+                  embed_model="bge-m3", embed_provider="openai",
+                  embed_api_key="secret")
+    ef2 = OpenAIEmbedding(s2, sleep=0)
+    with patch("requests.post") as m:
+        m.return_value = fake_resp()
+        ef2.embed_documents(["你好"])
+        assert m.call_args.kwargs["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_ollama_embedding_uses_native_format(tmp_path):
+    """ollama provider：请求走 /api/embed 的 {model,input} 报文，解析 {"embeddings":[...]} 响应。"""
+    from novel_agent.config import Settings
+    from novel_agent.rag import OllamaEmbedding
+
+    novel = tmp_path / "novel"
+    novel.mkdir()
+
+    def fake_resp():
+        return type("R", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"embeddings": [[0.1, 0.2], [0.3, 0.4]]},
+        })()
+
+    s = Settings(repo_root=tmp_path, novel_dir=str(novel),
+                 embed_url="http://win:11434/api/embed",
+                 embed_model="bge-m3", embed_provider="ollama")
+    ef = OllamaEmbedding(s, sleep=0)
+    with patch("requests.post") as m:
+        m.return_value = fake_resp()
+        vecs = ef.embed_documents(["文本一", "文本二"])
+        # 请求报文应为 Ollama 原生格式（input 批量），且直连不走系统代理
+        body = m.call_args.kwargs["json"]
+        assert body["model"] == "bge-m3"
+        assert body["input"] == ["文本一", "文本二"]
+        assert m.call_args.kwargs["trust_env"] is False
+        # 响应解析为 List[List[float]]，顺序与输入一致
+        assert vecs == [[0.1, 0.2], [0.3, 0.4]]
+
+
+def test_make_embedding_selects_ollama():
+    """_make_embedding 按 provider 选出 OllamaEmbedding。"""
+    from novel_agent.config import Settings
+    from novel_agent.rag import RAGStore, OllamaEmbedding
+
+    s = Settings(repo_root="/tmp/sf", novel_dir="/tmp/x",
+                 embed_url="http://win:11434/api/embed",
+                 embed_provider="ollama")
+    store = RAGStore(settings=s)
+    ef = store._make_embedding()
+    assert isinstance(ef, OllamaEmbedding)

@@ -16,7 +16,8 @@ from typing import Any, List, Optional, Tuple
 
 from .config import Settings, get_settings
 
-__all__ = ["RAGStore", "chunk_text", "classify_type", "load_documents"]
+__all__ = ["RAGStore", "chunk_text", "classify_type", "load_documents",
+           "VolcanoEmbedding", "OpenAIEmbedding"]
 
 COLLECTION_NAME = "novel_kb"
 MANIFEST_NAME = "rebuild_manifest.json"  # 0.6：rebuild 块 id 清单，存 chroma_path 下
@@ -97,7 +98,7 @@ class VolcanoEmbedding:
             try:
                 resp = requests.post(
                     self.settings.embed_url,
-                    headers={"Authorization": f"Bearer {self.settings.require_api_key()}"},
+                    headers={"Authorization": f"Bearer {self.settings.require_embed_key()}"},
                     json={"model": self.settings.embed_model,
                           "input": [{"type": "text", "text": text}]},
                     timeout=60,
@@ -132,6 +133,137 @@ class VolcanoEmbedding:
         return "volcano_embedding"
 
 
+# ---------- OpenAI 兼容 embedding 适配器（SenseNova Kimi / OpenAI / 本地 vLLM 等）----------
+class OpenAIEmbedding:
+    """Chroma 适配器：OpenAI 兼容 /embeddings 接口（SenseNova Kimi、OpenAI、vLLM、Xinference 等）。
+
+    与 VolcanoEmbedding 接口一致（Chroma 在存/查时自动调用）。
+    - 请求：POST {embed_url}  [Authorization: Bearer {key}]  body {"input": [texts], "model": model}
+    - 响应：{"data": [{"embedding": [...]}, ...]}
+    - embed_url 应为完整端点（如 vLLM/Xinference 的 http://host:port/v1/embeddings）。
+    - key 可选：本地/局域网服务（无需鉴权）可不设 EMBED_API_KEY，此时不带 Authorization 头。
+    - 支持批量（一次传整批 texts），比逐条更高效。
+    - 注：Ollama 原生 /api/embeddings 的报文/响应格式不同，本适配器不直接兼容；
+      用 Ollama 请改用 Xinference/vLLM（OpenAI 兼容）或加 ollama provider。
+    """
+
+    def __init__(self, settings: Settings, max_workers: int = 3, sleep: float = 0.2):
+        self.settings = settings
+        self.max_workers = max_workers
+        self.sleep = sleep  # 成功后限速，主动压低 QPS，避免触发 429
+
+    def _embed_batch(self, texts: List[str], retries: int = 6) -> List[List[float]]:
+        import requests  # 惰性导入
+
+        last_err: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                # 本地/局域网 embedding 服务（vLLM/Xinference 等）通常不需要 key；
+                # 仅当配置了 EMBED_API_KEY（或回落 ARK_API_KEY）时才带 Authorization 头。
+                key = self.settings.embed_api_key or self.settings.ark_api_key
+                headers = {}
+                if key:
+                    headers["Authorization"] = f"Bearer {key}"
+                # 本地/局域网自建服务不走系统代理（Mac 上为连火山配的 http_proxy 会误伤局域网 IP）
+                resp = requests.post(
+                    self.settings.embed_url,
+                    headers=headers,
+                    json={"model": self.settings.embed_model, "input": texts},
+                    timeout=60,
+                    trust_env=False,
+                )
+                resp.raise_for_status()
+                if self.sleep:
+                    time.sleep(self.sleep)
+                data = resp.json().get("data")
+                if isinstance(data, list) and data:
+                    # 返回条数应与输入一致；单条返回（不应发生）则广播兜底
+                    if len(data) == len(texts):
+                        return [d["embedding"] for d in data]
+                    return [data[0]["embedding"] for _ in texts]
+                raise RuntimeError(f"未知的 embedding 响应结构：{resp.text[:200]}")
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5 * (2 ** attempt))  # 指数退避
+        raise RuntimeError(f"embedding 失败：{last_err}")
+
+    # Chroma 调用接口（三处都可能被调到，统一返回 List[List[float]]）
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._embed_batch(texts)
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        return self._embed_batch(input)
+
+    def embed_query(self, input: List[str]) -> List[List[float]]:
+        return self._embed_batch([input[0]])
+
+    def name(self) -> str:
+        return "openai_embedding"
+
+
+class OllamaEmbedding:
+    """Chroma 适配器：Ollama 原生 /api/embed 接口（本地嵌入，Windows/Mac 均可跑）。
+
+    与 VolcanoEmbedding / OpenAIEmbedding 接口一致（Chroma 在存/查时自动调用）。
+    - 请求：POST {embed_url}  [Authorization: Bearer {key}]  body {"model": model, "input": [texts]}（批量）
+    - 响应：{"embeddings": [[...], ...]}（与 OpenAI 的 {"data":[...]} 不同）
+    - embed_url 应为完整端点（如 http://host:11434/api/embed）。
+    - key 可选：Ollama 本地服务通常不需要 key，此时不带 Authorization 头。
+    - 不使用系统代理（trust_env=False），直连本地/局域网 Ollama，避免被 http_proxy 误伤。
+    """
+
+    def __init__(self, settings: Settings, max_workers: int = 3, sleep: float = 0.2):
+        self.settings = settings
+        self.max_workers = max_workers
+        self.sleep = sleep  # 成功后限速，主动压低 QPS，避免触发 429
+
+    def _embed_batch(self, texts: List[str], retries: int = 6) -> List[List[float]]:
+        import requests  # 惰性导入
+
+        last_err: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                # Ollama 本地服务通常不需要 key；仅配置时才带 Authorization 头
+                key = self.settings.embed_api_key or self.settings.ark_api_key
+                headers = {"Content-Type": "application/json"}
+                if key:
+                    headers["Authorization"] = f"Bearer {key}"
+                resp = requests.post(
+                    self.settings.embed_url,
+                    headers=headers,
+                    json={"model": self.settings.embed_model, "input": texts},
+                    timeout=60,
+                    trust_env=False,
+                )
+                resp.raise_for_status()
+                if self.sleep:
+                    time.sleep(self.sleep)
+                data = resp.json().get("embeddings")
+                if isinstance(data, list) and data:
+                    # 返回条数应与输入一致；单条返回（不应发生）则广播兜底
+                    if len(data) == len(texts):
+                        return [list(d) for d in data]
+                    return [list(data[0]) for _ in texts]
+                raise RuntimeError(f"未知的 Ollama embedding 响应结构：{resp.text[:200]}")
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5 * (2 ** attempt))  # 指数退避
+        raise RuntimeError(f"Ollama embedding 失败：{last_err}")
+
+    # Chroma 调用接口（三处都可能被调到，统一返回 List[List[float]]）
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._embed_batch(texts)
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        return self._embed_batch(input)
+
+    def embed_query(self, input: List[str]) -> List[List[float]]:
+        return self._embed_batch([input[0]])
+
+    def name(self) -> str:
+        return "ollama_embedding"
+
+
 # ---------- RAGStore ----------
 class RAGStore:
     """设定检索库：惰性建 Chroma，向量化存取 + 语义检索。
@@ -156,6 +288,23 @@ class RAGStore:
         self._collection: Any = None
 
     # -- 惰性初始化 --
+    def _make_embedding(self) -> Any:
+        """按配置选 embedding 适配器：
+
+        - EMBED_PROVIDER=ollama  -> Ollama 原生 /api/embed（本地部署，Windows/Mac 均可）
+        - EMBED_PROVIDER=openai  -> OpenAI 兼容（SenseNova Kimi / OpenAI / vLLM / Xinference）
+        - EMBED_PROVIDER=volcano -> 火山方舟 multimodal（默认）
+        - 空 -> 按 embed_url 域名推断（含 volces.com 即火山，否则 openai）
+        """
+        provider = self.settings.embed_provider
+        if not provider:
+            provider = "volcano" if "volces.com" in self.settings.embed_url else "openai"
+        if provider == "openai":
+            return OpenAIEmbedding(self.settings)
+        if provider == "ollama":
+            return OllamaEmbedding(self.settings)
+        return VolcanoEmbedding(self.settings)
+
     def _collection_obj(self) -> Any:
         if self._collection is None:
             import chromadb  # 惰性导入，纯函数单测无需付导入开销
@@ -165,7 +314,7 @@ class RAGStore:
                     path=str(self.settings.chroma_path)
                 )
             if self._embed_fn is None:
-                self._embed_fn = VolcanoEmbedding(self.settings)
+                self._embed_fn = self._make_embedding()
             self._collection = self._chroma_client.get_or_create_collection(
                 COLLECTION_NAME, embedding_function=self._embed_fn
             )
@@ -177,13 +326,14 @@ class RAGStore:
 
     # -- 建库 --
     def build_all_chunks(self) -> List[Tuple[str, str]]:
-        """把所有文档切成带出处的小块，返回 [(文本, 出处路径)]。"""
+        """把所有文档切成带出处的小块，返回 [(文本, 相对 NOVEL_DIR 的出处路径)]。"""
         exclude = [s.strip() for s in self.settings.index_exclude.split(",") if s.strip()]
         all_chunks: List[Tuple[str, str]] = []
         for path, text in load_documents(self.settings.doc_path, exclude=exclude):
+            src = self._to_store_source(path)  # 相对 NOVEL_DIR，跨机可移植
             for piece in chunk_text(text, self.settings.chunk_size, self.settings.chunk_overlap):
                 if piece.strip():
-                    all_chunks.append((piece, path))
+                    all_chunks.append((piece, src))
         return all_chunks
 
     # -- rebuild manifest（0.6 陈块精确清理）--
@@ -245,24 +395,38 @@ class RAGStore:
 
     # -- 单文件增删（手动操作，不受 NOVEL_INDEX_EXCLUDE 限制）--
     def _resolve_source(self, file_path: str) -> str:
-        """文件路径 -> source 用的绝对路径：相对路径按 NOVEL_DIR 解析，绝对路径原样。"""
+        """文件路径 -> 用于读文件的绝对路径：相对路径按 NOVEL_DIR 解析，绝对路径原样。"""
         p = Path(file_path).expanduser()
         if not p.is_absolute():
             p = self.settings.novel_path / p
         return str(p)
+
+    def _to_store_source(self, file_path: str) -> str:
+        """存进向量库的 source：相对 NOVEL_DIR 的路径（跨机可移植，不绑死绝对路径）。
+
+        - 先按 _resolve_source 解析成绝对路径，再 relative_to(NOVEL_DIR) 取相对路径；
+        - 不在 NOVEL_DIR 下的外部文件（如绝对路径传入）：退回绝对路径，保证仍可用。
+        """
+        abs_path = self._resolve_source(file_path)
+        try:
+            return Path(abs_path).relative_to(self.settings.novel_path).as_posix()
+        except ValueError:
+            return abs_path
 
     def add_document(self, file_path: str, progress=print) -> int:
         """手动加单个文件进向量库：读 -> 分块 -> 向量化 -> upsert。
 
         不检查 NOVEL_INDEX_EXCLUDE（用户手动加什么都行，常用于精修后的单章正文）。
         先删该文件旧块再 upsert，故精修后重跑也安全（块数变化不留孤儿块）。
-        id 用 "{文件名}_{块序号}"，metadata.source 存绝对路径。返回索引块数。
+        id 用 "{文件名}_{块序号}"，metadata.source 存相对 NOVEL_DIR 的路径（跨机可移植）。
+        返回索引块数。
         """
-        src = self._resolve_source(file_path)
-        path = Path(src)
+        abs_path = self._resolve_source(file_path)
+        path = Path(abs_path)
         if not path.is_file():
-            raise FileNotFoundError(src)
+            raise FileNotFoundError(abs_path)
         text = path.read_text(encoding="utf-8")
+        src = self._to_store_source(file_path)  # 相对 NOVEL_DIR，跨机可移植
         collection = self._collection_obj()
         # 先清掉该文件旧块，避免精修后块数变化留下孤儿
         collection.delete(where={"source": src})
@@ -281,8 +445,8 @@ class RAGStore:
         return len(chunks)
 
     def remove_document(self, file_path: str) -> int:
-        """删该文件在向量库里的所有块（按 source 绝对路径匹配）。返回删除的块数。"""
-        src = self._resolve_source(file_path)
+        """删该文件在向量库里的所有块（按 source 相对路径匹配）。返回删除的块数。"""
+        src = self._to_store_source(file_path)
         collection = self._collection_obj()
         before = collection.get(where={"source": src}) or {}
         n = len(before.get("ids", []) or [])

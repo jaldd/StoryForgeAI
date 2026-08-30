@@ -25,13 +25,13 @@ except ImportError:  # 未编译 readline 的环境：历史功能禁用，CLI �
     readline = None
 
 from .agent import NovelAgent
-from .checker import load_quality_rules
+from .checker import ai_flavor_score, load_baseline, load_quality_rules, run_checks
 from .config import Settings, get_settings
 from .harness import backtest_gate, compare, evaluate, replay, run_tests
 from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
-from .prompts import exemplar_info, load_exemplar
+from .prompts import exemplar_info, load_exemplar, load_recent_human
 from .rag import RAGStore
 from .routing import parse_tag_lines, route_exemplars
 from .state import PipelineState
@@ -115,8 +115,12 @@ def _route_exemplar_files(settings: Settings, task: str):
         return None, None
     profiles = load_profiles(settings)
     router_llm = LLMClient(settings=settings, profile=profiles.default)
+    temp = (
+        settings.router_temperature
+        if settings.router_temperature is not None else 0.2
+    )
     try:
-        route = route_exemplars(router_llm, task, tags)
+        route = route_exemplars(router_llm, task, tags, temperature=temp)
     except Exception as e:
         print(f"(样文路由失败，回落全量加载：{e})")
         return None, None
@@ -127,7 +131,7 @@ def _route_exemplar_files(settings: Settings, task: str):
     return route.files, route
 
 
-def _build_agent(settings: Settings, task: str = ""):
+def _build_agent(settings: Settings, task: str = "", need_style: bool = True):
     """构造 NovelAgent：加载文风金标准 + 写作指令 + 写作铁律 + 工作记忆，RAG 惰性。
 
     0.7：load_profiles 一次解析，双 LLMClient 注入（llm=default profile，
@@ -136,15 +140,27 @@ def _build_agent(settings: Settings, task: str = ""):
     1.1：质量规则 JSON 在装配点加载注入（非法 JSON fail-fast，A23）。
     exemplar-routing：task 非空且标签文件存在时先路由（一次廉价调用），按选中
     样文加载；路由任何失败回落现状（清单/全量）加载，永不阻塞写作。
+    1.5 滚动注入：exemplar 之后加载人工正文尾部 N 章（仅当 human_text_subpath
+    已配置；目录不存在/空返回空串，B2 零误伤），只传 writer（B5）。
+    need_style=False：exemplar/滚动语料/样文路由只被 writer 消费，精修/改/去AI
+    不走 writer，跳过加载省一次路由调用与文件 IO（行为零变化，纯省）。
     """
     only_files = None
     route = None
-    if task:
-        only_files, route = _route_exemplar_files(settings, task)
     exemplar = ""
-    # 0.5：exemplar 支持目录级（目录下全部 *.txt/*.md 按序拼接，超限截断）
-    if settings.exemplar_subpath and settings.exemplar_full.exists():
-        exemplar = load_exemplar(settings.exemplar_full, only_files=only_files)
+    if need_style:
+        if task:
+            only_files, route = _route_exemplar_files(settings, task)
+        # 0.5：exemplar 支持目录级（目录下全部 *.txt/*.md 按序拼接，超限截断）
+        if settings.exemplar_subpath and settings.exemplar_full.exists():
+            exemplar = load_exemplar(settings.exemplar_full, only_files=only_files)
+    recent_human = ""
+    if need_style and settings.human_text_subpath:
+        recent_human = load_recent_human(
+            settings.human_text_full,
+            n=settings.style_recent_n,
+            slice_chars=settings.style_slice_chars,
+        )
     instruction = _load_instruction(settings)
     rules = _load_rules(settings)
     quality_rules = load_quality_rules(settings)
@@ -160,6 +176,7 @@ def _build_agent(settings: Settings, task: str = ""):
         working_memory=wm,
         rules=rules,
         quality_rules=quality_rules,
+        recent_human=recent_human,
     )
     return agent, wm, route
 
@@ -206,6 +223,48 @@ def _gate_ok(score, rules) -> bool:
     return sum(w * s for w, s in hits) / wsum >= threshold
 
 
+# ---------- 去AI 判定链（1.6 style-loop，design §3.2）----------
+def _deai_pass(agent, state: PipelineState, record: Dict[str, Any], settings: Settings) -> None:
+    """de-AI 人味重写 pass（B9-B17）：超阈值 -> 重写 -> 复检分降才接受。
+
+    - 触发：质量规则 deai.enabled 且 AI 味分超 deai.threshold（默认 60）；
+      阈值未配置 -> 整段短路零行为变更（B18/Z2）；
+    - 输入：只取可定位 issue（quote 非空且为原文子串，B10；全部不可定位
+      -> skipped 留痕不空跑 LLM，B17）；
+    - 接受：after < before 严格小于（D5）；否则回退保留原稿（B13）；
+    - 留痕：state.deai {before, after, spans, accepted} 或 {before, skipped}（B14），
+      record.final_state 同步终态（D4：record 落盘即终态，评委评的就是改后稿）。
+    """
+    rules = load_quality_rules(settings)
+    deai_cfg = (rules or {}).get("deai") or {}
+    if not (deai_cfg.get("enabled") and state.final_chapter):
+        return
+    baseline = load_baseline(settings)
+    before = ai_flavor_score(state.final_chapter, rules, baseline)["score"]
+    if before <= deai_cfg.get("threshold", 60):
+        return  # 未超阈值：不留痕不空跑（B17）
+    issues = [
+        i for i in run_checks(state.final_chapter, rules)
+        if i.get("quote") and i["quote"] in state.final_chapter  # 只取可定位（B10/B17）
+    ]
+    if not issues:
+        state.deai = {"before": before, "skipped": "无可定位问题句"}
+        record["final_state"]["deai"] = state.deai
+        print(f"(AI味分 {before} 超阈值但无可定位问题句，跳过去AI重写)")
+        return
+    new_text, n_spans = agent.deai_refine(state.final_chapter, issues)
+    after = ai_flavor_score(new_text, rules, baseline)["score"]
+    accepted = after < before  # D5：严格小于才接受（ROADMAP 原话）
+    if accepted:
+        state.final_chapter = new_text
+        print(f"✅ 去AI重写：AI味分 {before} -> {after}（已接受，改 {n_spans} 段）")
+    else:
+        print(f"⚠️ 去AI重写未降分（{before} -> {after}），保留原稿")
+    state.deai = {"before": before, "after": after, "spans": n_spans, "accepted": accepted}
+    record["final_state"]["final_chapter"] = state.final_chapter
+    record["final_state"]["deai"] = state.deai
+
+
 # ---------- 命令处理 ----------
 def _do_write(task: str, settings: Settings) -> None:
     try:
@@ -229,6 +288,14 @@ def _do_write(task: str, settings: Settings) -> None:
     # exemplar-routing：路由结果进 run 记录（replay 可见，A5）
     if route is not None:
         record["exemplar_route"] = {"files": list(route.files), "reason": route.reason}
+
+    # ---- 1.6 de-AI 人味重写 pass（D4 时序：流水线 done 后、save_run/evaluate 前）----
+    # 无 deai 键 / enabled falsy -> 整段短路零行为变更（B18）；pass 是优化器：
+    # 任何异常 catch 打印后保留原稿继续走（失败不阻断主流程，design §6）。
+    try:
+        _deai_pass(agent, state, record, settings)
+    except Exception as e:
+        print(f"(去AI重写跳过：{e})")
 
     print("💾 落盘运行记录...")
     # 运行日志落盘（1.1：先落 run record，弃而不失数据，design §3.6）
@@ -398,9 +465,9 @@ def _do_refine(args: List[str], settings: Settings) -> None:
 
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
-    # exemplar-routing：精修也按文件名路由样文（task=精修：文件名；路由失败回落）
+    # 精修从 polisher 起，不走 writer -> 跳过 exemplar/滚动语料/路由（纯省，行为零变化）
     try:
-        agent, wm, _route = _build_agent(settings, task=f"精修：{file_path}")
+        agent, wm, _route = _build_agent(settings, task=f"精修：{file_path}", need_style=False)
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -467,6 +534,99 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
     _refine_postprocess(path, content, state, record, settings, agent, wm, file_path, action="重写")
 
 
+# ---------- 去AI 手动命令（1.6 style-loop，B15/D7/D8）----------
+def _deai_confirm(prompt: str) -> str:
+    """去AI确认缝（模块级，测试可替换，同 _gate_confirm 的 0.1 模式）。
+
+    EOF / Ctrl-C -> 返回 "n" 保守不存回。
+    """
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return "n"
+
+
+def _do_deai(args: List[str], settings: Settings) -> None:
+    """去AI <文件路径>：对已存章节手动跑人味重写（B15）。
+
+    - 读文件 -> run_checks 定位（可定位 issue 为空 -> 提示退出，不空烧，B17）；
+    - agent.deai_refine 重写 -> 前后 AI 味分对比展示（分不降也如实展示，
+      人不被阈值绑架，Z3；不设阈值门槛，与自动 pass 两口径分家）-> y/n 确认
+      -> 存回 + rag.add_document 更新索引（同 refine 尾处理）；
+    - 不落 run record（D8：非流水线 run，人是标尺当场拍板，
+      留痕 = 文件本身 + REPL 输出）。
+    """
+    if not args:
+        print("用法：去AI <文件路径>（相对 NOVEL_DIR 或绝对路径）")
+        return
+    try:
+        settings.require_novel_dir()
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+
+    file_path = " ".join(args)
+    print("🔧 构建 Agent...")
+    # 不路由不传 task（去AI 用不到 exemplar/滚动语料，构造副作用只是读文件，design §6）
+    try:
+        agent, _wm, _route = _build_agent(settings, need_style=False)
+    except RuntimeError as e:  # A23：装配错误命令层兜住，不崩 REPL
+        print(f"❌ {e}")
+        return
+    abs_path = agent.rag._resolve_source(file_path)
+    path = Path(abs_path)
+    if not path.is_file():
+        print(f"❌ 找不到文件：{file_path}")
+        return
+    # 逐字节保真：读 bytes 手动 decode（同 改 命令，防 universal newline 破坏 \r\n/BOM）
+    content = path.read_bytes().decode("utf-8")
+    if not content.strip():
+        print(f"⚠️ 文件为空，跳过：{file_path}")
+        return
+
+    rules = load_quality_rules(settings)
+    issues = [
+        i for i in run_checks(content, rules)
+        if i.get("quote") and i["quote"] in content  # 只取可定位（B10）
+    ]
+    if not issues:
+        print("无可定位问题句（质量规则未配置或无命中），跳过去AI。")
+        return
+
+    baseline = load_baseline(settings)
+    before = ai_flavor_score(content, rules, baseline)["score"]
+    print(f"🔧 开始去AI重写：{path.name}（AI味分 {before}/100，{len(issues)} 项可定位问题）\n")
+    try:
+        new_content, n_spans = agent.deai_refine(content, issues)
+    except Exception as e:
+        print(f"❌ 去AI重写失败：{e}")
+        return
+    after = ai_flavor_score(new_content, rules, baseline)["score"]
+    verdict = "（下降）" if after < before else "（未下降，请自行判断是否保留）"
+    print(f"\nAI味分：{before} -> {after}{verdict}（重写 {n_spans} 段）")
+
+    if new_content != content:
+        print("\n=== 去AI差异（原文 -> 重写后）===")
+        diff_text = "".join(difflib.unified_diff(
+            content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile="原文", tofile="重写后", n=1,
+        ))
+        print(diff_text if diff_text else "（无变化）")
+
+    answer = _deai_confirm("\n确认存回？(y/n)：").strip().lower()
+    if answer != "y":
+        print("已放弃，原文件未改动。")
+        return
+    path.write_bytes(new_content.encode("utf-8"))
+    print(f"✅ 已存回：{path}")
+    print("📚 更新向量库...")
+    try:
+        agent.rag.add_document(file_path)
+    except Exception as e:
+        print(f"(索引更新失败：{e})")
+
+
 def _span_text(blocks: List[Block], span: Tuple[int, int]) -> str:
     """区间覆盖的全部块的 body 拼接（块间空行），与 agent.partial_refine 的选区一致。"""
     index_of = {b.no: i for i, b in enumerate(blocks) if b.no is not None}
@@ -499,9 +659,9 @@ def _do_partial_flow(args: List[str], settings: Settings) -> None:
     """_do_partial 主体（参数与目录校验之后）。"""
     file_path = " ".join(args)  # 容忍路径含空格（同精修/重写）
     print("🔧 构建 Agent...")
-    # A7：改（局部精修）不路由不注入 exemplar（polisher_system 本就不带），零新增 token
+    # A7：改（局部精修）不走 writer -> 跳过 exemplar/滚动语料/路由（零新增 token）
     try:
-        agent, _, _ = _build_agent(settings)
+        agent, _, _ = _build_agent(settings, need_style=False)
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -606,7 +766,14 @@ def _do_partial_flow(args: List[str], settings: Settings) -> None:
         "config": {
             "mode": "partial-refine",
             "model": settings.model,
-            "temperature": 0.6,
+            # 局部精修实际走 polisher 温度（agent._temp 同款回落链），记录真值
+            "temperature": (
+                settings.polisher_temperature
+                if settings.polisher_temperature is not None
+                else settings.llm_temperature
+                if settings.llm_temperature is not None
+                else 0.6
+            ),
             "max_tokens": 4096,
         },
         "initial_state": {"task": task},
@@ -724,6 +891,21 @@ def _do_status(settings: Settings) -> None:
             print(f"人工语料：未找到 {settings.human_text_full}（AI 味基准不含人工语料）")
     else:
         print("人工语料：未配置（NOVEL_HUMAN_TEXT 为空）")
+    # 1.5 滚动注入状态行（B6/Z7：配置静默失效必须可发现）
+    if settings.style_recent_n <= 0:
+        print(f"滚动注入：已禁用（NOVEL_STYLE_RECENT_N=0）")
+    elif not settings.human_text_subpath:
+        print("滚动注入：未配置（NOVEL_HUMAN_TEXT 为空，本次不注入）")
+    elif settings.human_text_full.is_dir() and any(
+        q.is_file() and q.suffix.lower() in (".txt", ".md")
+        for q in settings.human_text_full.iterdir()
+    ):
+        print(
+            f"滚动注入：最近 {settings.style_recent_n} 章 · "
+            f"每章 {settings.style_slice_chars} 字"
+        )
+    else:
+        print("滚动注入：人工语料为空，本次不注入")
     # exemplar-routing：标签文件启用情况（不存在则不显示，不添噪音）
     tags = _load_exemplar_tags(settings)
     if tags:
@@ -797,6 +979,7 @@ def _print_help() -> None:
     print("  精修 <文件路径>   精修已有正文（润色->审稿->存回->更新索引，不写新场景）")
     print("  重写 <文件路径>   重写已有正文（writer参考原文重写->润色->审稿->存回，能大幅扩写）")
     print("  改 <文件路径>     局部精修（列出段落->选段 3/3-5/3,7->只润色选区->diff 确认->逐字节存回）")
+    print("  去AI <文件路径>   人味重写（定位问题句->重写->AI味分对比->y/n 确认->存回+更新索引）")
     print("  index            查看向量库；index rebuild 全量重建；index add/remove <路径> 单文件增删")
     print("  replay <run_id>  回放某次写作过程")
     print("  eval <run_id>    对某次写作打分")
@@ -851,6 +1034,8 @@ def main() -> None:
                 _do_rewrite(args, settings)
             elif cmd == "改":
                 _do_partial(args, settings)
+            elif cmd in ("去ai", "去AI"):
+                _do_deai(args, settings)
             elif cmd == "index":
                 _do_index(args, settings)
             elif cmd in ("状态", "status"):

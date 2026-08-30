@@ -221,6 +221,70 @@ def test_run_tests_old_record_without_scores_skips(sample_run, tmp_settings):
     assert "维度分" not in "\n".join(lines)
 
 
+# ---------- 1.6 style-loop：deai 留痕自洽性断言（T8）----------
+def _save_record_with_deai(tmp_settings, deai, run_id="run_deai"):
+    """写一份含 deai 留痕键的 run 记录。"""
+    from novel_agent.storage import save_run
+    record = {
+        "run_id": run_id, "task": "x", "timestamp": "", "config": {},
+        "initial_state": {}, "steps": [],
+        "final_state": {
+            "task": "x", "draft": "", "polished": "",
+            "feedback": "审稿通过：ok", "final_chapter": "风起了。他没说话。",
+            "round": 1, "next_agent": "done", "review_count": 0, "log": [],
+            "deai": deai,
+        },
+    }
+    save_run(record, tmp_settings)
+    return run_id
+
+
+def test_run_tests_deai_accepted_passes(tmp_settings):
+    """B16：accepted 且 after < before -> 留痕自洽，断言 PASS。"""
+    rid = _save_record_with_deai(
+        tmp_settings, {"before": 80, "after": 50, "spans": 2, "accepted": True})
+    lines = []
+    ok = run_tests(rid, tmp_settings, out=lines.append)
+    assert ok is True
+    assert "去AI留痕：accepted 时 after < before" in "\n".join(lines)
+    assert "PASS" in "\n".join(lines)
+
+
+def test_run_tests_deai_accepted_but_not_lowered_fails(tmp_settings):
+    """B16：伪造 after >= before 的 accepted 记录 -> 断言 FAIL（防 record 造假）。"""
+    rid = _save_record_with_deai(
+        tmp_settings, {"before": 50, "after": 80, "spans": 1, "accepted": True})
+    lines = []
+    ok = run_tests(rid, tmp_settings, out=lines.append)
+    assert ok is False
+    assert "FAIL" in "\n".join(lines)
+
+
+def test_run_tests_deai_not_accepted_skips_assertion(tmp_settings):
+    """B20：未接受（回退）的记录不触发该断言；旧记录无键不受影响。"""
+    from novel_agent.storage import save_run
+    rid = _save_record_with_deai(
+        tmp_settings, {"before": 80, "after": 85, "spans": 1, "accepted": False})
+    lines = []
+    ok = run_tests(rid, tmp_settings, out=lines.append)
+    assert ok is True
+    assert "去AI留痕" not in "\n".join(lines)  # 未 accepted -> 跳过
+
+    # 旧记录无 deai 键（B20）
+    save_run({
+        "run_id": "run_old", "task": "x", "timestamp": "", "config": {},
+        "initial_state": {}, "steps": [],
+        "final_state": {
+            "task": "x", "feedback": "审稿通过：ok",
+            "final_chapter": "风起了。", "next_agent": "done",
+        },
+    }, tmp_settings)
+    lines = []
+    ok = run_tests("run_old", tmp_settings, out=lines.append)
+    assert ok is True
+    assert "去AI留痕" not in "\n".join(lines)
+
+
 def test_evaluate_with_fake_llm(sample_run, tmp_settings, fake_llm):
     fake_llm.script = ['{"连贯性":4,"人物一致性":5,"剧情合理性":4,"理由":"稳"}']
     score = evaluate(sample_run, tmp_settings, llm=fake_llm, out=lambda s: None)

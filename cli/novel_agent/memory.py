@@ -74,11 +74,16 @@ class LongTermMemory:
     def __init__(self):
         self.summaries: List[str] = []
 
-    def summarize(self, old_messages: List, llm: LLMClient) -> str:
-        """把溢出的旧消息丢给 LLM 压成摘要，返回摘要文本（由调用方决定是否存）。"""
+    def summarize(
+        self, old_messages: List, llm: LLMClient, temperature: float = 0.3
+    ) -> str:
+        """把溢出的旧消息丢给 LLM 压成摘要，返回摘要文本（由调用方决定是否存）。
+
+        temperature 由调用方从 settings.summarizer_temperature 传入（0.9 全量可配）。
+        """
         text = "\n".join(str(m) for m in old_messages)
         return llm.chat(
-            SUMMARIZER_SYSTEM, text, max_tokens=1024, temperature=0.3
+            SUMMARIZER_SYSTEM, text, max_tokens=1024, temperature=temperature
         )
 
     def add_summary(self, text: str) -> None:

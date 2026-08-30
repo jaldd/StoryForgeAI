@@ -153,7 +153,7 @@ class Baseline:
 - 总分 = 可用组件按 `ai_score.weights` 线性加权；**缺失组件的权重重归一**（D6）。
 - 降级（A27）：基准语料总字数 < `min_baseline_chars`（默认 10000）-> freq 不可用、sentence 用内置默认基线，返回 `{"degraded": true}`；blacklist 未配置 -> 该组件不可用。
 - 返回形状：`{"score": 62, "components": {"blacklist": 45, "sentence": 70, "freq": 55}, "degraded": false}`。
-- 基准语料 = exemplar 目录全量（复用 `prompts._exemplar_files`，**不受 `EXEMPLAR_MAX_CHARS` 注入上限约束**，Z8）+ 人工正文目录（`settings.human_text_subpath`，默认 `正文/新`，env `NOVEL_HUMAN_TEXT`；1.5 的滚动注入属 style-loop，本 feature 只做统计消费）。
+- 基准语料 = exemplar 目录全量（复用 `prompts._exemplar_files`，**不受 `EXEMPLAR_MAX_CHARS` 注入上限约束**，Z8）+ 人工正文目录（`settings.human_text_subpath`，默认 `正文`，env `NOVEL_HUMAN_TEXT`；1.5 的滚动注入属 style-loop，本 feature 只做统计消费）。
 - 确定性：纯函数，同输入同输出（A25）。
 
 ### 3.2 reviewer schema 演进（A1-A3）
@@ -319,7 +319,7 @@ harness 新增 `backtest_gate(settings, out=print, limit=None)` + cli 命令 `�
 | 变量 | 作用 | 默认 | 解析 |
 |---|---|---|---|
 | `NOVEL_QUALITY_RULES` | 质量规则文件（相对 novel_dir） | `质量规则.json` | str，空 = 禁用 |
-| `NOVEL_HUMAN_TEXT` | 人工正文目录（AI 味基准语料，相对 novel_dir） | `正文/新` | str，空 = 不用人工语料 |
+| `NOVEL_HUMAN_TEXT` | 人工正文目录（AI 味基准语料，相对 novel_dir） | `正文` | str，空 = 不用人工语料 |
 
 `.env copy.example` 追加对应注释段（含一句「无此文件 = checker 与门禁不启用」）。
 

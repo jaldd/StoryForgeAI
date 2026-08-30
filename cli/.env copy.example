@@ -25,6 +25,15 @@ CLAUDE_MODEL=glm-5.2
 #     LLM_BASE_URL=https://api.sensenova.cn/compatible-mode/v2
 #     LLM_API_KEY=你的SenseNova密钥
 #     LLM_MODEL=按实际名称填写
+#
+# ---- Embedding（向量库；默认火山方舟，可切 OpenAI 兼容源如 SenseNova Kimi）----
+# 默认不配即火山（doubao-embedding-vision，与 ARK_API_KEY 共用）。
+# 切到 SenseNova/Kimi 的 embedding 时填以下四行（EMBED_API_KEY 可 = LLM_API_KEY）：
+#   EMBED_BASE_URL=https://token.sensenova.cn/v1/embeddings   # 完整 /embeddings 端点
+#   EMBED_MODEL=你用的 embedding 模型名（如 kimi-embedding）
+#   EMBED_API_KEY=你的SenseNova密钥                          # 未设则回落 ARK_API_KEY
+#   EMBED_PROVIDER=openai                                    # openai=OpenAI兼容；volcano=火山；空=按 URL 推断
+# 注：provider 留空时会按 embed_url 是否含 volces.com 自动推断（含=火山，否则=openai）。
 # 审稿留火山、写作单独换商：改用 WRITER_* 三行（用法同上），主配置不动。
 #
 # 生成类温度覆盖（写作侧整体；未设 = 调用点默认 0.8/0.6，零漂移）
@@ -35,6 +44,15 @@ CLAUDE_MODEL=glm-5.2
 # NOVEL_WRITER_TEMPERATURE=0.9
 # NOVEL_POLISHER_TEMPERATURE=0.5
 # NOVEL_REVIEWER_TEMPERATURE=0.3
+#
+# 辅助调用温度（0.9）：各角色独立，未设 = 括号内默认；fixer 属写作侧，也吃 NOVEL_TEMPERATURE 兜底
+# NOVEL_ROUTER_TEMPERATURE=0.1       # 样文路由（0.2）
+# NOVEL_FIXER_TEMPERATURE=0.4        # 修复定点/整文（0.5）
+# NOVEL_JUDGE_TEMPERATURE=0.2        # 评委 evaluate / 对比 is_better（0.2）
+# NOVEL_SUMMARIZER_TEMPERATURE=0.35  # 剧情摘要 / 长期记忆摘要（0.3）
+#
+# 注：kimi-k3 类模型只允许 temperature=1，客户端遇 400 会自动锁定（锁定后
+#     优先于一切配置），以上各键只在模型接受任意温度时生效。
 #
 # 思考模型推理深度（GLM-5.3 专属 low；max 深/high 中/low 浅；未设 = 不发送、走模型默认）
 # 生成调用浅思考实测省约 18 倍思考 token；审稿浅思考意见会变泛，深浅由你按效果取舍
@@ -74,6 +92,20 @@ NOVEL_DIR=/path/to/your/novel
 # 人工正文目录：AI 味基准语料之二（与文风基准目录合并统计；只读不写）。
 # 默认 正文/新；留空 = 不用人工语料（AI 味词频组件可能降级）。
 # NOVEL_HUMAN_TEXT=正文/新
+
+# ---- 文风闭环（1.5/1.6；滚动注入 + 去AI重写）----
+# 1.5 滚动注入：写作前取人工正文目录（NOVEL_HUMAN_TEXT 同一目录）按文件名序
+# 的尾部 N 章注入 writer prompt（学笔性，防文风漂移；只进 writer，不进润色/审稿）。
+# 每章只注入前 SLICE_CHARS 字（开篇最见笔性）。目录不存在/为空 -> 自动回落不注入。
+# NOVEL_STYLE_RECENT_N=3          # 尾部 N 章；默认 3；0 = 禁用注入
+# NOVEL_STYLE_SLICE_CHARS=1000    # 每章截前 N 字；默认 1000；0 = 不截断
+#
+# 1.6 去AI重写（de-AI pass）：一章流水线完成后 AI 味分超过阈值时，自动对
+# 问题句做一轮「人味重写」（情节不动只改表达），复检分下降才接受，否则保留原稿。
+# 开关在 质量规则.json 的 "deai" 键（enabled/threshold），例：
+#   "deai": {"enabled": true, "threshold": 60}
+# 无该键或 enabled 为 false = 完全不启用（零行为变更）。
+# 也可在 REPL 对已存章节手动发起：去AI <文件路径>（不设阈值，y/n 确认后存回）。
 
 # ---- Agent 运行时（可选；不设则默认放 <NOVEL_DIR>/.agent/ 下）----
 # NOVEL_RUNS_DIR=

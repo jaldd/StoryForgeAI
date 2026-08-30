@@ -86,6 +86,24 @@ def test_agent_temperature_env(monkeypatch):
         get_settings.cache_clear()
 
 
+def test_aux_temperature_env(monkeypatch):
+    """辅助角色温度 env 接线：ROUTER/FIXER/JUDGE/SUMMARIZER。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_ROUTER_TEMPERATURE", "0.1")
+    monkeypatch.setenv("NOVEL_FIXER_TEMPERATURE", "0.4")
+    monkeypatch.setenv("NOVEL_JUDGE_TEMPERATURE", "0.2")
+    monkeypatch.setenv("NOVEL_SUMMARIZER_TEMPERATURE", "0.35")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.router_temperature == 0.1
+        assert s.fixer_temperature == 0.4
+        assert s.judge_temperature == 0.2
+        assert s.summarizer_temperature == 0.35
+    finally:
+        get_settings.cache_clear()
+
+
 def test_runtime_dir_override(tmp_path):
     """显式 runs_dir / chroma_dir 覆盖默认 .agent 路径。"""
     s = Settings(
@@ -333,9 +351,9 @@ def test_llm_extra_non_object_fail_fast(monkeypatch):
 def test_quality_paths_default(tmp_settings):
     """A23/A27：质量规则与人工语料默认路径。"""
     assert tmp_settings.quality_rules_subpath == "质量规则.json"
-    assert tmp_settings.human_text_subpath == "正文/新"
+    assert tmp_settings.human_text_subpath == "正文"
     assert tmp_settings.quality_rules_full == tmp_settings.novel_path / "质量规则.json"
-    assert tmp_settings.human_text_full == tmp_settings.novel_path / "正文/新"
+    assert tmp_settings.human_text_full == tmp_settings.novel_path / "正文"
 
 
 def test_quality_rules_env_wiring(monkeypatch):
@@ -386,3 +404,84 @@ def test_no_llm_envs_keeps_current_behavior(monkeypatch):
         assert s.llm_temperature is None and s.llm_extra == {}
     finally:
         get_settings.cache_clear()
+
+
+# ---------- 1.5 滚动注入（style-loop T1）----------
+def test_style_injection_defaults():
+    """B1/B18：默认 recent_n=3、slice_chars=1000。"""
+    s = Settings(ark_api_key="k")
+    assert s.style_recent_n == 3
+    assert s.style_slice_chars == 1000
+
+
+def test_style_injection_env(monkeypatch):
+    """B1：NOVEL_STYLE_RECENT_N / NOVEL_STYLE_SLICE_CHARS 环境变量生效；0 值合法解析。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_STYLE_RECENT_N", "5")
+    monkeypatch.setenv("NOVEL_STYLE_SLICE_CHARS", "800")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.style_recent_n == 5
+        assert s.style_slice_chars == 800
+    finally:
+        get_settings.cache_clear()
+    # 0 值合法：0 = 禁用注入 / 不截断（B18 降级开关）
+    monkeypatch.setenv("NOVEL_STYLE_RECENT_N", "0")
+    monkeypatch.setenv("NOVEL_STYLE_SLICE_CHARS", "0")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.style_recent_n == 0
+        assert s.style_slice_chars == 0
+    finally:
+        get_settings.cache_clear()
+
+
+# ---------- 2.1/2.2 吞吐（throughput W1）----------
+def test_throughput_defaults():
+    """T21/T26：默认 stream=True、batch_max=10、chapter_plan_subpath=每章.md。"""
+    s = Settings(ark_api_key="k")
+    assert s.stream is True
+    assert s.batch_max == 10
+    assert s.chapter_plan_subpath == "每章.md"
+    assert s.plan_full == s.novel_path / "每章.md"
+
+
+def test_throughput_env(monkeypatch):
+    """T26：NOVEL_STREAM / NOVEL_BATCH_MAX / NOVEL_CHAPTER_PLAN 接线；0/空为合法降级值。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_STREAM", "0")
+    monkeypatch.setenv("NOVEL_BATCH_MAX", "5")
+    monkeypatch.setenv("NOVEL_CHAPTER_PLAN", "规划/章节表.md")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.stream is False
+        assert s.batch_max == 5
+        assert s.chapter_plan_subpath == "规划/章节表.md"
+        assert s.plan_full.name == "章节表.md"
+    finally:
+        get_settings.cache_clear()
+    # 章纲留空 = 禁用：plan_full 退回 novel_path（同 rules_subpath 空串先例）
+    monkeypatch.setenv("NOVEL_CHAPTER_PLAN", "")
+    monkeypatch.setenv("NOVEL_STREAM", "1")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.stream is True
+        assert s.chapter_plan_subpath == ""
+        assert s.plan_full == s.novel_path
+    finally:
+        get_settings.cache_clear()
+
+
+def test_plan_full_empty_subpath(tmp_settings):
+    """T14：chapter_plan_subpath 留空时 plan_full 退回 novel_path。"""
+    s = Settings(
+        ark_api_key="k",
+        repo_root=tmp_settings.repo_root,
+        novel_dir=tmp_settings.novel_dir,
+        chapter_plan_subpath="",
+    )
+    assert s.plan_full == s.novel_path

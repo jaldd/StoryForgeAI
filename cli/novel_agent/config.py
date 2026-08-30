@@ -70,6 +70,11 @@ class Settings:
     writer_temperature: Optional[float] = None
     polisher_temperature: Optional[float] = None
     reviewer_temperature: Optional[float] = None
+    # 辅助调用温度（None = 调用点默认；fixer 属写作侧，也吃 NOVEL_TEMPERATURE 兜底）
+    router_temperature: Optional[float] = None       # 样文路由（默认 0.2）
+    fixer_temperature: Optional[float] = None        # 修复定点/整文（默认 0.5）
+    judge_temperature: Optional[float] = None       # 评委 evaluate / 对比 is_better（默认 0.2）
+    summarizer_temperature: Optional[float] = None   # 剧情摘要 / 长期记忆摘要（默认 0.3）
     # 0.7：chat 请求体透传参数（NOVEL_LLM_EXTRA，JSON 对象，同名键 extra 赢）
     llm_extra: Dict[str, Any] = field(default_factory=dict)
     # 0.8：思考模型推理深度（NOVEL_REASONING_EFFORT，GLM-5.3 专属 low 有效；空 = 不发送该参数）
@@ -77,11 +82,15 @@ class Settings:
     # 0.8：生成类调用的推理深度（NOVEL_WRITER_REASONING_EFFORT；空 = 继承 NOVEL_REASONING_EFFORT）
     writer_reasoning_effort: str = ""
 
-    # --- Embedding（火山方舟 multimodal embedding，套餐内）---
+    # --- Embedding（默认火山方舟 multimodal embedding，套餐内；可切 OpenAI 兼容源）---
     embed_model: str = "doubao-embedding-vision"
     embed_url: str = (
         "https://ark.cn-beijing.volces.com/api/coding/v3/embeddings/multimodal"
     )
+    # 0.7：embedding 专用 key（EMBED_API_KEY，未设回落 ark_api_key；火山可共用同一 key）
+    embed_api_key: str = ""
+    # 适配器选择："volcano" | "openai" | "ollama" | 空=按 embed_url 域名推断（含 volces.com 即火山）
+    embed_provider: str = ""
 
     # --- 小说（仓库外，不硬编码）---
     novel_name: str = "本小说"            # NOVEL_NAME：prompt 里用的显示名
@@ -94,7 +103,7 @@ class Settings:
     instruction_subpath: str = "写作指令.md"  # NOVEL_INSTRUCTION（相对 novel_dir；留空则不加载写作指令全文）
     rules_subpath: str = "写作铁律.md"       # NOVEL_RULES（相对 novel_dir；留空则不加载铁律）
     quality_rules_subpath: str = "质量规则.json"  # NOVEL_QUALITY_RULES（相对 novel_dir；留空 = 禁用 checker 与门禁，1.1）
-    human_text_subpath: str = "正文/新"      # NOVEL_HUMAN_TEXT（AI 味基准的人工正文目录，相对 novel_dir；留空则只用文风基准）
+    human_text_subpath: str = "正文"      # NOVEL_HUMAN_TEXT（AI 味基准的人工正文目录，相对 novel_dir；留空则只用文风基准）
     index_exclude: str = "正文"          # NOVEL_INDEX_EXCLUDE：建索引时跳过的目录名（逗号分隔），默认排除正文（300章太慢）
 
     # --- Agent 运行时（默认放 novel_dir/.agent，可覆盖到别处）---
@@ -113,6 +122,15 @@ class Settings:
     max_rounds: int = 10
     max_reviews: int = 6  # 审稿最多打回次数，防死循环
     target_words: int = 1500  # NOVEL_TARGET_WORDS：单章目标字数（writer 写作/polisher 扩写共用口径）
+
+    # --- 文风闭环（1.5 滚动注入）---
+    style_recent_n: int = 3        # NOVEL_STYLE_RECENT_N：滚动注入取人工正文尾部 N 章；0 = 禁用
+    style_slice_chars: int = 1000  # NOVEL_STYLE_SLICE_CHARS：每章截前 N 字；0 = 不截断
+
+    # --- 吞吐（2.1 流式 / 2.2 批量连写）---
+    stream: bool = True            # NOVEL_STREAM：writer/polisher 流式输出；0 = 关（回到非流式现状）
+    batch_max: int = 10            # NOVEL_BATCH_MAX：批量连写单命令最大章数（token 护栏）
+    chapter_plan_subpath: str = "每章.md"  # NOVEL_CHAPTER_PLAN：每章规划文件（章纲）；留空 = 禁用
 
     # ---------- 路径解析 ----------
     def path(self, rel: str) -> Path:
@@ -166,6 +184,11 @@ class Settings:
         return self.novel_path / self.human_text_subpath if self.human_text_subpath else self.novel_path
 
     @property
+    def plan_full(self) -> Path:
+        """每章规划文件（章纲，2.2；留空退回 novel_path = 视为未配置）。"""
+        return self.novel_path / self.chapter_plan_subpath if self.chapter_plan_subpath else self.novel_path
+
+    @property
     def runs_path(self) -> Path:
         """run 日志目录：显式 runs_dir 优先，否则 <novel_dir>/.agent/runs。"""
         if self.runs_dir:
@@ -191,6 +214,16 @@ class Settings:
                 "未配置 ARK_API_KEY。请在 .env 或环境变量中设置 ARK_API_KEY（参考 cli/.env.example）。"
             )
         return self.ark_api_key
+
+    def require_embed_key(self) -> str:
+        """Embedding 鉴权：优先 EMBED_API_KEY，回落 ARK_API_KEY（火山可共用）。"""
+        key = self.embed_api_key or self.ark_api_key
+        if not key:
+            raise RuntimeError(
+                "未配置 Embedding API Key。请在 .env 设置 EMBED_API_KEY"
+                "（或回落 ARK_API_KEY）。参考 cli/.env.example。"
+            )
+        return key
 
     def require_novel_dir(self) -> Path:
         """用到小说内容时调用：novel_dir 未配置则给清晰错误。"""
@@ -220,6 +253,10 @@ def get_settings() -> Settings:
         writer_temperature=_env_float("NOVEL_WRITER_TEMPERATURE"),
         polisher_temperature=_env_float("NOVEL_POLISHER_TEMPERATURE"),
         reviewer_temperature=_env_float("NOVEL_REVIEWER_TEMPERATURE"),
+        router_temperature=_env_float("NOVEL_ROUTER_TEMPERATURE"),
+        fixer_temperature=_env_float("NOVEL_FIXER_TEMPERATURE"),
+        judge_temperature=_env_float("NOVEL_JUDGE_TEMPERATURE"),
+        summarizer_temperature=_env_float("NOVEL_SUMMARIZER_TEMPERATURE"),
         llm_extra=_env_json_object("NOVEL_LLM_EXTRA"),
         reasoning_effort=os.environ.get("NOVEL_REASONING_EFFORT", ""),
         writer_reasoning_effort=os.environ.get("NOVEL_WRITER_REASONING_EFFORT", ""),
@@ -231,10 +268,20 @@ def get_settings() -> Settings:
         instruction_subpath=os.environ.get("NOVEL_INSTRUCTION", "写作指令.md"),
         rules_subpath=os.environ.get("NOVEL_RULES", "写作铁律.md"),
         quality_rules_subpath=os.environ.get("NOVEL_QUALITY_RULES", "质量规则.json"),
-        human_text_subpath=os.environ.get("NOVEL_HUMAN_TEXT", "正文/新"),
+        human_text_subpath=os.environ.get("NOVEL_HUMAN_TEXT", "正文"),
         index_exclude=os.environ.get("NOVEL_INDEX_EXCLUDE", "正文"),
         runs_dir=os.environ.get("NOVEL_RUNS_DIR", ""),
         chroma_dir=os.environ.get("NOVEL_CHROMA_DIR", ""),
         target_words=int(os.environ.get("NOVEL_TARGET_WORDS", "1500")),
+        style_recent_n=int(os.environ.get("NOVEL_STYLE_RECENT_N", "3")),
+        style_slice_chars=int(os.environ.get("NOVEL_STYLE_SLICE_CHARS", "1000")),
+        stream=int(os.environ.get("NOVEL_STREAM", "1")) != 0,
+        batch_max=int(os.environ.get("NOVEL_BATCH_MAX", "10")),
+        chapter_plan_subpath=os.environ.get("NOVEL_CHAPTER_PLAN", "每章.md"),
+        embed_model=os.environ.get("EMBED_MODEL", "") or "doubao-embedding-vision",
+        embed_url=os.environ.get("EMBED_BASE_URL", "")
+        or "https://ark.cn-beijing.volces.com/api/coding/v3/embeddings/multimodal",
+        embed_api_key=os.environ.get("EMBED_API_KEY", ""),
+        embed_provider=os.environ.get("EMBED_PROVIDER", ""),
         repo_root=_repo_root(),
     )

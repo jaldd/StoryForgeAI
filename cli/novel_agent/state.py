@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 __all__ = ["PipelineState"]
 
@@ -22,13 +22,19 @@ class PipelineState:
     feedback: str = ""        # Reviewer 审稿意见
     final_chapter: str = ""   # 最终定稿
     outline: str = ""         # Writer 的构思说明（=== 分隔前的部分；无分隔符时为空）
+    plan: str = ""            # 本章规划（2.2 章纲要点；空 = 无规划自由写，T12）
 
     # -- 重写输入 --
-    source_content: str = ""   # 重写模式：已有内容（writer 作为参考自由重写）
+    source_content: str = ""  # 重写模式：已有内容（writer 作为参考自由重写）
 
     # -- 审核维度化（1.1 A4/A24）--
     scores: Dict[str, int] = field(default_factory=dict)  # reviewer 八维分（1-5）
     issues: List[dict] = field(default_factory=list)       # 结构化问题（checker/reviewer 同构）
+
+    # -- 去 AI 留痕（1.6 style-loop，B14）--
+    # 由 cli 层写入：{before, after, spans, accepted} 或 {before, skipped}；
+    # 只出现在 final_state（pass 在流水线 done 之后执行，不进 steps）。
+    deai: Dict[str, Any] = field(default_factory=dict)
 
     # -- 控制字段 --
     round: int = 0                 # 当前轮次，防死循环

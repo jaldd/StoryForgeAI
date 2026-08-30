@@ -120,7 +120,7 @@ specs/novel-agent-cli/    # spec-kit（本目录）
 <NOVEL_DIR>/
   总纲.md 人物.md 伏笔地图.md ...   # 设定
   文风基准/1.txt                     # exemplar
-  正文/新/...                        # 人工正文
+  正文/...                        # 人工正文
   正文/AI生成/...                    # Agent 产出
   .agent/{runs,chroma_db,working_memory.json}   # 运行时
 ```

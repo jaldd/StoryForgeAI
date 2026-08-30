@@ -12,6 +12,7 @@ from novel_agent.llm import (
     LLMClient,
     ModelProfile,
     Profiles,
+    _ThinkFilter,
     _strip_think_blocks,
     load_profiles,
 )
@@ -386,3 +387,232 @@ class TestTemperatureLock:
         )
         assert out == ""
         assert [kw["temperature"] for kw in spy.all_kwargs] == [0.8, 0.8, 0.8]
+
+    def test_lock_persists_across_calls(self, monkeypatch):
+        """锁定跨调用保持：第二次调用直接按 1 出门，不再撞 400。
+
+        真实场景：路由/fixer/评委/摘要各有写死温度（0.2/0.5/0.3），
+        同一 client 撞墙一次后这些调用点全部免撞。
+        """
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        spy = _ScriptedClient([_KIMI_TEMP_400, _FakeResp("甲"), _FakeResp("乙")])
+        profile = ModelProfile(base_url="u", api_key="k", model="kimi-k3")
+        llm = LLMClient(client=spy, profile=profile)
+        assert llm.chat("sys", "user", temperature=0.2) == "甲"   # 撞墙+锁定
+        assert llm.chat("sys", "user", temperature=0.5) == "乙"  # 不再撞
+        # 第 2 次调用只有 1 个请求：temperature 已是 1
+        assert [kw["temperature"] for kw in spy.all_kwargs] == [0.2, 1, 1]
+
+    def test_lock_overrides_call_site_temperature(self, monkeypatch):
+        """锁定后调用点显式温度（含配置的）被压成 1：模型约束最高。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        spy = _ScriptedClient([_FakeResp("x")])
+        profile = ModelProfile(base_url="u", api_key="k", model="kimi-k3")
+        llm = LLMClient(client=spy, profile=profile)
+        llm._temp_locked = True  # 直接预置（上一用例已验证锁定来源）
+        llm.chat("sys", "user", temperature=0.6)
+        assert spy.all_kwargs[0]["temperature"] == 1
+
+
+# ---------------- 2.1 流式（throughput W2：ThinkFilter + on_delta）----------------
+
+
+class _Chunk:
+    """最小伪流式 chunk：choices[0].delta.content / finish_reason。
+
+    reasoning 模拟思考型网关把思考放 delta.reasoning_content 的行为（Z2）。
+    """
+
+    def __init__(self, content: str = "", reasoning: str = "", finish=None):
+        delta = type("D", (), {"content": content, "reasoning_content": reasoning})()
+        self.choices = [type("C", (), {"delta": delta, "finish_reason": finish})()]
+
+
+class _EmptyChoicesChunk:
+    """choices 为空的 chunk（部分网关的 usage 尾块形态）。"""
+
+    def __init__(self):
+        self.choices = []
+
+
+class StreamSpyClient:
+    """伪 OpenAI client 的流式形态：create(stream=True) 返回 chunk 迭代器。
+
+    responses 的每个元素：chunk 列表 / 任意可迭代（含生成器，可模拟中途
+    抛错）/ Exception（在 create 时抛，模拟请求层失败）。
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.all_kwargs: list = []
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kwargs):
+        self.all_kwargs.append(kwargs)
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return iter(item)
+
+
+def _profile() -> ModelProfile:
+    return ModelProfile(base_url="u", api_key="k", model="m")
+
+
+class TestThinkFilter:
+    def test_split_at_any_point_loses_nothing(self):
+        """无思考块时任意切分零丢失：feed 输出 + flush == 原文。"""
+        text = "她推门进来，肩上落着雨。"
+        for cut in range(1, len(text)):
+            filt = _ThinkFilter()
+            got = filt.feed(text[:cut]) + filt.feed(text[cut:]) + filt.flush()
+            assert got == text
+
+    def test_complete_pair_not_printed(self):
+        filt = _ThinkFilter()
+        assert filt.feed(_THINK_OPEN + "内心戏" + _THINK_CLOSE) == ""
+        assert filt.feed("正文") == ""      # 尾部 hold-back：不足 7 字先不发
+        assert filt.flush() == "正文"
+
+    def test_unclosed_open_holds_back(self):
+        """未闭合思考前缀：之前的可打印，思考段全部扣住（流式截断形态）。"""
+        filt = _ThinkFilter()
+        assert filt.feed("正文A" + _THINK_OPEN + "思考") == "正文A"
+        assert filt.feed("继续思考") == ""
+        assert filt.flush() == ""
+
+    def test_open_tag_split_across_chunks(self):
+        """开标签被切在两个 delta：hold-back 防误放行（D2 坑位）。"""
+        filt = _ThinkFilter()
+        assert filt.feed("正文" + _THINK_OPEN[:3]) == ""       # 尾部不足 7 字先扣住
+        assert filt.feed(_THINK_OPEN[3:] + "思考") == "正文"    # 开标签拼齐，前缀放行
+        assert filt.feed("更多思考" + _THINK_CLOSE + "结尾") == ""  # 思考闭合，"结尾"不足 hold-back
+        assert filt.flush() == "结尾"
+
+    def test_pure_think_stream_prints_nothing(self):
+        filt = _ThinkFilter()
+        assert filt.feed(_THINK_OPEN + "全部是思考") == ""
+        assert filt.flush() == ""
+
+    def test_two_pairs_bracketing_text(self):
+        filt = _ThinkFilter()
+        raw = (
+            "a" + _THINK_OPEN + "x" + _THINK_CLOSE
+            + "b" + _THINK_OPEN + "y" + _THINK_CLOSE
+            + "c"
+        )
+        assert filt.feed(raw) == "ab"
+        assert filt.flush() == "c"
+
+
+class TestChatStream:
+    def test_normal_stream(self):
+        """正常流：返回拼接全文，on_delta 收到的打印流不含 hold-back 泄漏。"""
+        printed: list = []
+        spy = StreamSpyClient([
+            [_Chunk("你"), _Chunk("好"), _Chunk("，"), _Chunk("世", finish="stop")],
+        ])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", on_delta=printed.append
+        )
+        assert out == "你好，世"
+        assert spy.all_kwargs[0]["stream"] is True
+        # 打印流拼接 == 正文（思考过滤后），迟发被 flush 补齐
+        assert "".join(printed) == "你好，世"
+
+    def test_think_in_content_stream(self):
+        """思考块混在 content 增量里：打印侧过滤 + 返回值出口剥除（T2 双层）。"""
+        printed: list = []
+        chunks = [
+            _Chunk(_THINK_OPEN),
+            _Chunk("先想想剧情"),
+            _Chunk(_THINK_CLOSE + "正文内容"),
+            _Chunk("继续", finish="stop"),
+        ]
+        spy = StreamSpyClient([chunks])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", on_delta=printed.append
+        )
+        assert out == "正文内容继续"
+        assert "".join(printed) == "正文内容继续"
+
+    def test_reasoning_field_not_printed_not_in_content(self):
+        """delta.reasoning_content 只累积不外发（Z2）：不打印不进返回值。"""
+        printed: list = []
+        chunks = [
+            _Chunk(reasoning="思考片段一"),
+            _Chunk(reasoning="思考片段二", content="正"),
+            _Chunk("文", finish="stop"),
+        ]
+        spy = StreamSpyClient([chunks])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", on_delta=printed.append
+        )
+        assert out == "正文"
+        assert "".join(printed) == "正文"
+
+    def test_empty_choices_chunk_skipped(self):
+        """choices 为空的尾块（usage 块）不炸、不影响正文。"""
+        printed: list = []
+        chunks = [_Chunk("正文"), _EmptyChoicesChunk(), _Chunk(finish="stop")]
+        spy = StreamSpyClient([chunks])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", on_delta=printed.append
+        )
+        assert out == "正文"
+
+    def test_stream_empty_length_reasoning_doubles(self, monkeypatch):
+        """流式空回 + finish=length + reasoning 有输出 -> 翻倍整请求重试（T4）。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        printed: list = []
+        exhausted = [
+            _Chunk(reasoning="很长的思考" * 10),
+            _Chunk(finish="length"),
+        ]
+        ok = [_Chunk("正文内容"), _Chunk(finish="stop")]
+        spy = StreamSpyClient([exhausted, ok])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", max_tokens=2048, on_delta=printed.append
+        )
+        assert out == "正文内容"
+        assert spy.all_kwargs[0]["max_tokens"] == 2048
+        assert spy.all_kwargs[1]["max_tokens"] == 4096
+        assert "".join(printed) == "正文内容"  # 首轮空流零打印
+
+    def test_stream_midway_exception_retries_whole_request(self, monkeypatch):
+        """流式中途异常：丢弃已收增量，整请求按退避重试（T5/D3）。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        printed: list = []
+
+        def broken():
+            yield _Chunk("半截")
+            raise Exception("connection reset")
+
+        ok = [_Chunk("完整正文"), _Chunk(finish="stop")]
+        spy = StreamSpyClient([broken(), ok])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", max_retries=3, on_delta=printed.append
+        )
+        assert out == "完整正文"
+        # 中断轮已打印的"半截"被丢弃提示后重来，最终打印流以重试轮为准
+        assert "".join(printed).endswith("完整正文")
+
+    def test_no_on_delta_keeps_request_body_unchanged(self):
+        """on_delta=None：请求体不带 stream 键（现状逐字节回归，T10）。"""
+        spy = SpyClient()
+        LLMClient(client=spy, profile=_profile()).chat("sys", "user")
+        assert "stream" not in spy.kwargs
+
+    def test_stream_temp_400_locks_and_retries(self, monkeypatch):
+        """temperature 400 锁定对流式同样生效：锁定后重试温度为 1（T5）。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        ok = [_Chunk("正文"), _Chunk(finish="stop")]
+        spy = StreamSpyClient([_KIMI_TEMP_400, ok])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", temperature=0.2, on_delta=lambda s: None
+        )
+        assert out == "正文"
+        assert spy.all_kwargs[0]["temperature"] == 0.2
+        assert spy.all_kwargs[0]["stream"] is True
+        assert spy.all_kwargs[1]["temperature"] == 1
