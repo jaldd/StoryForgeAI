@@ -862,3 +862,302 @@ def test_deai_cmd_file_not_found(tmp_settings, fake_rag, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
     cli._do_deai([str(tmp_settings.novel_path / "不存在.md")], tmp_settings)
     assert "找不到文件" in capsys.readouterr().out
+
+
+# ---------- 2.2 _write_one 拆层（throughput W5，D9/T7/T17/T27）----------
+def _write_one_with(monkeypatch, tmp_settings, agent, task="写第5章：异乡风起", plan=""):
+    """替换 _build_agent / evaluate 后跑一次 _write_one，返回结局。"""
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    return cli._write_one(task, tmp_settings, plan=plan)
+
+
+def test_write_one_outcome_saved(tmp_settings, fake_rag, monkeypatch):
+    """结局枚举：正常定稿存盘 -> saved。"""
+    agent = WriteAgent(fake_rag)
+    assert _write_one_with(monkeypatch, tmp_settings, agent) == "saved"
+    assert len(list(tmp_settings.chapter_path.glob("*.md"))) == 1
+
+
+def test_write_one_outcome_rejected(tmp_settings, fake_rag, monkeypatch, capsys):
+    """结局枚举：未定稿（final_chapter 空）-> rejected（无存盘）。"""
+    agent = WriteAgent(fake_rag, final="", feedback="审稿不通过：弃")
+    assert _write_one_with(monkeypatch, tmp_settings, agent) == "rejected"
+    assert list(tmp_settings.chapter_path.glob("*.md")) == []
+
+
+def test_write_one_outcome_failed(tmp_settings, monkeypatch, capsys):
+    """结局枚举：agent.run 抛异常 -> failed（命令层兜住不崩）。"""
+    class BoomAgent(WriteAgent):
+        def run(self, task, run_id=None, temperature=0.9):
+            raise RuntimeError("网关 500")
+
+    assert _write_one_with(monkeypatch, tmp_settings, BoomAgent(None)) == "failed"
+    assert "创作失败" in capsys.readouterr().out
+
+
+def test_write_one_interrupted_no_save_no_wm(tmp_settings, fake_rag, monkeypatch, capsys):
+    """T7：Ctrl-C 落在 agent.run -> interrupted，不存盘不更新 wm。"""
+    class InterruptAgent(WriteAgent):
+        def run(self, task, run_id=None, temperature=0.9):
+            raise KeyboardInterrupt
+
+    wm = WorkingMemory()
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (InterruptAgent(fake_rag), wm, None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    assert cli._write_one("写第5章：异乡风起", tmp_settings) == "interrupted"
+    assert list(tmp_settings.chapter_path.glob("*.md")) == []  # 未存盘
+    assert wm.current_chapter is None  # 工作记忆未推进
+    out = capsys.readouterr().out
+    assert "已打断" in out
+
+
+def test_write_one_interrupted_in_post_run_stages(tmp_settings, fake_rag, monkeypatch, capsys):
+    """T7（D5 修订）：打断落在 agent.run 之后的评测阶段同样被整体兜住。"""
+    agent = WriteAgent(fake_rag)
+
+    def boom(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", boom)
+    assert cli._write_one("写第5章：异乡风起", tmp_settings) == "interrupted"
+    assert list(tmp_settings.chapter_path.glob("*.md")) == []  # 未走到存盘
+
+
+def test_write_one_gate_reject_by_answer_n(tmp_settings, fake_rag, monkeypatch, capsys):
+    """门禁弃 -> rejected（结局口径含审稿人工弃之后的门禁弃）。"""
+    agent = WriteAgent(fake_rag)
+    monkeypatch.setattr(cli, "load_quality_rules", lambda settings: {"eval_gate": {"enabled": True, "threshold": 3.5, "weights": {"剧情": 1}}})
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: {"剧情": 1})  # 低于阈值
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "n")
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    assert cli._write_one("写第5章：异乡风起", tmp_settings) == "rejected"
+    assert list(tmp_settings.chapter_path.glob("*.md")) == []
+
+
+def test_write_one_passes_plan_to_run(tmp_settings, fake_rag, monkeypatch):
+    """T12/T17：plan 透传进 agent.run。"""
+    seen = {}
+
+    class PlanAgent(WriteAgent):
+        def run(self, task, run_id=None, temperature=0.9, plan=""):
+            seen["plan"] = plan
+            return super().run(task, run_id, temperature)
+
+    _write_one_with(monkeypatch, tmp_settings, PlanAgent(fake_rag), plan="核心事件：X")
+    assert seen["plan"] == "核心事件：X"
+
+
+def test_do_write_thin_shell_unchanged(tmp_settings, fake_rag, monkeypatch, capsys):
+    """T27：_do_write 薄壳 -- 行为与拆层前一致（存盘 + 尾部展示照常打印）。"""
+    agent = WriteAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+    out = capsys.readouterr().out
+    assert "章节已存" in out and "=== 最终章节 ===" in out
+    assert len(list(tmp_settings.chapter_path.glob("*.md"))) == 1
+
+
+# ---------- 2.2 批量连写 + 分发（throughput W6，D10/D11/T13-T25）----------
+_BATCH_PLAN_MD = """# 每章规划
+
+| 章 | 标题 | 核心事件 | 天气 |
+| --- | --- | --- | --- |
+| 5 | 风起 | 主角遇袭 | 雨 |
+| 6 | 云涌 | 追查线索 | 晴 |
+| 7 | 山雨 | 入山 | 阴 |
+"""
+
+
+class _RecordingAgent(WriteAgent):
+    """替身 agent：记录 run(task, plan) 调用序（批量任务串与规划注入断言用）。"""
+
+    def __init__(self, rag):
+        super().__init__(rag)
+        self.runs = []
+
+    def run(self, task, run_id=None, temperature=0.9, plan=""):
+        self.runs.append((task, plan))
+        return super().run(task, run_id, temperature)
+
+
+def _mk_plan_file(tmp_settings, text=_BATCH_PLAN_MD):
+    tmp_settings.novel_path.mkdir(parents=True, exist_ok=True)
+    tmp_settings.plan_full.write_text(text, encoding="utf-8")
+
+
+def test_batch_plan_driven_titles_plans_continuity(tmp_settings, fake_rag, monkeypatch, capsys):
+    """无标题主路径：章纲供标题+规划；章间 wm.current_chapter 递增、每章入库各一次（T21）。"""
+    _mk_plan_file(tmp_settings)
+    wm = WorkingMemory()
+    agent = _RecordingAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
+    cli._do_write_batch("写第5-6章", tmp_settings, auto=False)
+
+    assert agent.runs == [
+        ("写第5章：风起", "核心事件：主角遇袭\n天气：雨"),
+        ("写第6章：云涌", "核心事件：追查线索\n天气：晴"),
+    ]
+    assert len(list(tmp_settings.chapter_path.glob("*.md"))) == 2  # 每章落盘
+    assert wm.current_chapter == 6  # 工作记忆章间推进（T21）
+    assert len(fake_rag.add_calls) == 2  # 每章 rag.add_document 各一次（T21）
+    out = capsys.readouterr().out
+    assert "批量连写：第5-6章，共 2 章" in out and "6-9 次" in out  # T24 预算提示
+
+
+def test_batch_missing_chapter_zero_calls(tmp_settings, monkeypatch, capsys):
+    """T14：无标题主路径缺章报错，零 _write_one 调用。"""
+    _mk_plan_file(tmp_settings)  # 只有 5-7 章
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda *a, **kw: called.append(a) or "saved")
+    cli._do_write_batch("写第5-9章", tmp_settings, auto=False)
+    assert called == []
+    assert "缺章" in capsys.readouterr().out
+
+
+def test_batch_template_fallback_ordinal_suffix(tmp_settings, fake_rag, monkeypatch):
+    """T13：带模板回落 = 模板+中文序数后缀；章纲存在该章则规划照注入。"""
+    _mk_plan_file(tmp_settings)
+    agent = _RecordingAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write_batch("写第5-6章：夜行", tmp_settings, auto=True)
+
+    assert agent.runs == [
+        ("写第5章：夜行（一）", "核心事件：主角遇袭\n天气：雨"),
+        ("写第6章：夜行（二）", "核心事件：追查线索\n天气：晴"),
+    ]
+
+
+def test_batch_default_confirm_n_stops(tmp_settings, monkeypatch, capsys):
+    """T18：默认模式章间确认 n -> 停止，已完成章保留（第二章零调用）。"""
+    _mk_plan_file(tmp_settings)
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append(task) or "saved")
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "n")
+    cli._do_write_batch("写第5-7章", tmp_settings, auto=False)
+    assert called == ["写第5章：风起"]
+    out = capsys.readouterr().out
+    assert "已停止批量，已完成章节保留" in out
+
+
+def test_batch_default_confirm_y_continues(tmp_settings, monkeypatch):
+    """T18：默认模式 y 连写全部章。"""
+    _mk_plan_file(tmp_settings)
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append(task) or "saved")
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
+    cli._do_write_batch("写第5-7章", tmp_settings, auto=False)
+    assert len(called) == 3
+
+
+def test_batch_auto_rejected_interrupts(tmp_settings, monkeypatch, capsys):
+    """T19：--auto 下 rejected -> 中断批量（fail-closed），后续章零调用。"""
+    _mk_plan_file(tmp_settings)
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append(task) or "rejected")
+    cli._do_write_batch("写第5-7章", tmp_settings, auto=True)
+    assert called == ["写第5章：风起"]
+    out = capsys.readouterr().out
+    assert "--auto 模式中断批量" in out and "已完成 0 章" in out
+
+
+def test_batch_failed_interrupts(tmp_settings, monkeypatch):
+    """T20：failed -> 中断批量（两模式同语义）。"""
+    _mk_plan_file(tmp_settings)
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append(task) or "failed")
+    cli._do_write_batch("写第5-7章", tmp_settings, auto=False)
+    assert len(called) == 1
+
+
+def test_batch_interrupted_interrupts(tmp_settings, monkeypatch, capsys):
+    """T22：interrupted -> 停止批量，已完成章节保留。"""
+    _mk_plan_file(tmp_settings)
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append(task) or "interrupted")
+    cli._do_write_batch("写第5-7章", tmp_settings, auto=True)
+    assert len(called) == 1
+    assert "已完成章节保留" in capsys.readouterr().out
+
+
+def test_batch_invalid_range_zero_calls(tmp_settings, monkeypatch, capsys):
+    """T23：起>止 / 跨度超 batch_max 报错零调用。"""
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append(task) or "saved")
+    cli._do_write_batch("写第7-5章", tmp_settings, auto=False)
+    cli._do_write_batch("写第5-20章", tmp_settings, auto=False)  # 16 章 > 默认 10
+    assert called == []
+    out = capsys.readouterr().out
+    assert "大于结束章号" in out
+    assert "NOVEL_BATCH_MAX" in out
+
+
+def test_batch_single_chapter_range_degenerates(tmp_settings, monkeypatch):
+    """T25：单章区间（5-5）退化为一次 _write_one（走章纲主路径）。"""
+    _mk_plan_file(tmp_settings)
+    called = []
+    monkeypatch.setattr(cli, "_write_one", lambda task, settings, plan="": called.append((task, plan)) or "saved")
+    cli._do_write_batch("写第5-5章", tmp_settings, auto=False)
+    assert called == [("写第5章：风起", "核心事件：主角遇袭\n天气：雨")]
+
+
+# ---------- 写作命令分发（D7/T15/互斥性）----------
+def _capture_dispatch(monkeypatch, tmp_settings):
+    """替换 _do_write/_do_write_batch，捕获分发去向。"""
+    got = {"one": [], "batch": []}
+    monkeypatch.setattr(cli, "_do_write", lambda task, settings, plan="": got["one"].append((task, plan)))
+    monkeypatch.setattr(cli, "_do_write_batch", lambda task, settings, auto: got["batch"].append((task, auto)))
+    return got
+
+
+def test_dispatch_range_goes_batch(tmp_settings, monkeypatch):
+    got = _capture_dispatch(monkeypatch, tmp_settings)
+    cli._dispatch_write("写第5-10章", tmp_settings)
+    assert got["batch"] == [("写第5-10章", False)]
+    assert got["one"] == []
+
+
+def test_dispatch_range_auto_suffix_stripped(tmp_settings, monkeypatch):
+    got = _capture_dispatch(monkeypatch, tmp_settings)
+    cli._dispatch_write("写第5-10章 --auto", tmp_settings)
+    assert got["batch"] == [("写第5-10章", True)]
+
+
+def test_dispatch_single_no_title_uses_plan(tmp_settings, monkeypatch):
+    """T15：写第6章 -> 章纲取标题与规划，等价于敲了带标题命令。"""
+    _mk_plan_file(tmp_settings)
+    got = _capture_dispatch(monkeypatch, tmp_settings)
+    cli._dispatch_write("写第6章", tmp_settings)
+    assert got["one"] == [("写第6章：云涌", "核心事件：追查线索\n天气：晴")]
+    assert got["batch"] == []
+
+
+def test_dispatch_single_no_title_missing_plan(tmp_settings, monkeypatch, capsys):
+    """T15：无标题且章纲缺章 -> 报错提示补标题，零调用。"""
+    _mk_plan_file(tmp_settings)  # 只有 5-7
+    got = _capture_dispatch(monkeypatch, tmp_settings)
+    cli._dispatch_write("写第9章", tmp_settings)
+    assert got["one"] == [] and got["batch"] == []
+    assert "无标题" in capsys.readouterr().out
+
+
+def test_dispatch_titled_single_never_batch(tmp_settings, monkeypatch):
+    """互斥护栏：写第5章：标题 不进批量、无章纲时零变化（现状 _do_write 直达）。"""
+    got = _capture_dispatch(monkeypatch, tmp_settings)
+    cli._dispatch_write("写第5章：异乡风起", tmp_settings)
+    assert got["batch"] == []
+    assert got["one"] == [("写第5章：异乡风起", "")]
+
+
+def test_dispatch_single_range_beats_no_title(tmp_settings, monkeypatch):
+    """分发序护栏：写第5-5章 走区间（退化单章），不被单章无标题分支截走。"""
+    _mk_plan_file(tmp_settings)
+    got = _capture_dispatch(monkeypatch, tmp_settings)
+    cli._dispatch_write("写第5-5章", tmp_settings)
+    assert got["batch"] == [("写第5-5章", False)]
+    assert got["one"] == []

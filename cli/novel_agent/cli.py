@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime
 import difflib
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -36,9 +37,12 @@ from .rag import RAGStore
 from .routing import parse_tag_lines, route_exemplars
 from .state import PipelineState
 from .storage import (
+    cn_numeral,
     list_runs,
     load_working_memory,
     parse_chapter_file,
+    parse_chapter_plan,
+    parse_chapter_range,
     parse_chapter_task,
     save_chapter,
     save_run,
@@ -177,6 +181,7 @@ def _build_agent(settings: Settings, task: str = "", need_style: bool = True):
         rules=rules,
         quality_rules=quality_rules,
         recent_human=recent_human,
+        stream=settings.stream,  # 2.1（T26）：NOVEL_STREAM 驱动 writer/polisher 流式
     )
     return agent, wm, route
 
@@ -265,100 +270,249 @@ def _deai_pass(agent, state: PipelineState, record: Dict[str, Any], settings: Se
     record["final_state"]["deai"] = state.deai
 
 
+# ---------- 章纲加载与渲染（2.2，D6/D12）----------
+def _load_chapter_plan(settings: Settings) -> Dict[int, Dict[str, Any]]:
+    """读章纲（NOVEL_CHAPTER_PLAN 指向的 markdown）并解析成 {章号: entry}。
+
+    未配置 / 文件不存在 / 读失败 -> 返回 {}（静默降级，对齐写作铁律缺失回落
+    空串的既有纪律；章纲解析一次、批量全程复用，不是每章重读文件）。
+    """
+    if not settings.chapter_plan_subpath:
+        return {}
+    try:
+        text = settings.plan_full.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    return parse_chapter_plan(text)
+
+
+def _render_notes(entry: Dict[str, Any]) -> str:
+    """notes (列名, 值) 对 -> 「列名：值」逐行（【本章规划】块正文，D12 渲染）。
+
+    空值列不占行（章纲里留空的格子不进 prompt 占位）。
+    """
+    return "\n".join(f"{name}：{value}" for name, value in entry.get("notes", []) if value)
+
+
 # ---------- 命令处理 ----------
-def _do_write(task: str, settings: Settings) -> None:
+def _write_one(task: str, settings: Settings, plan: str = "") -> str:
+    """单章写作一条龙（2.2，D9 拆层）：返回结局枚举，单章/批量共用。
+
+    - "saved"：章节已存盘（工作记忆/向量库已更新）；
+    - "rejected"：门禁弃 / 审稿人工弃（未存盘，运行日志已落）；
+    - "failed"：agent.run 抛异常 / 装配失败（批量侧应中断）；
+    - "interrupted"：Ctrl-C（D5 修订：整体兜底覆盖流式/评测/存盘全部阶段，
+      打断 = 本命令作废，不存盘不更新 wm；_gate_confirm/_confirm_unparseable
+      内已消化的 "n" 语义先于外层捕获，不受影响）。
+    """
     try:
-        settings.require_novel_dir()
-    except RuntimeError as e:
-        print(f"❌ {e}")
-        return
-    print("🔧 构建 Agent（加载设定/文风基准/写作指令）...")
-    try:
-        agent, wm, route = _build_agent(settings, task=task)
-    except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等装配错误，命令层兜住不崩 REPL
-        print(f"❌ {e}")
-        return
-    print(f"✍️  开始创作：{task}\n")
-    try:
-        state, record = agent.run(task)
-    except Exception as e:
-        print(f"❌ 创作失败：{e}")
-        return
-
-    # exemplar-routing：路由结果进 run 记录（replay 可见，A5）
-    if route is not None:
-        record["exemplar_route"] = {"files": list(route.files), "reason": route.reason}
-
-    # ---- 1.6 de-AI 人味重写 pass（D4 时序：流水线 done 后、save_run/evaluate 前）----
-    # 无 deai 键 / enabled falsy -> 整段短路零行为变更（B18）；pass 是优化器：
-    # 任何异常 catch 打印后保留原稿继续走（失败不阻断主流程，design §6）。
-    try:
-        _deai_pass(agent, state, record, settings)
-    except Exception as e:
-        print(f"(去AI重写跳过：{e})")
-
-    print("💾 落盘运行记录...")
-    # 运行日志落盘（1.1：先落 run record，弃而不失数据，design §3.6）
-    run_file = save_run(record, settings)
-
-    # 自动评测（1.1：从存盘后移到存盘前--门禁要用分；失败不阻断，豁免路径同样照跑留报告）
-    print("\n--- 自动评测 ---")
-    score = None
-    try:
-        score = evaluate(record["run_id"], settings, instruction=agent.instruction)
-    except Exception as e:
-        print(f"(评测跳过：{e})")
-
-    # 1.1 D8 豁免口径：强制定稿 / 人工确认 -> 跳过门禁判定直存（向量库/摘要照常）
-    exempt = "强制定稿" in state.feedback or "人工确认" in state.feedback
-    # 1.1 A30-A34：未豁免且已定稿且门禁不过 -> 人工确认，应答弃则不写章节文件
-    save = bool(state.final_chapter)
-    if save and not exempt and not _gate_ok(score, load_quality_rules(settings)):
-        answer = _gate_confirm("\n⚠️ 评测低于门禁阈值，仍保存本章？(y/n)：").strip().lower()
-        if answer != "y":
-            save = False
-            print("已放弃保存本章（运行日志已落，可 replay 查看）")
-
-    # 章节落盘 + 工作记忆更新
-    chapter_file = None
-    if save:
-        print("📖 保存章节 + 生成剧情摘要...")
-        chapter_file = save_chapter(state.final_chapter, task, record["run_id"], settings)
-        # 0.3：写完自动入库（新章立即进 RAG，后续章节检索得到前文，不靠手动 index add）
-        print("📚 更新向量库...")
         try:
-            agent.rag.add_document(str(chapter_file))
+            settings.require_novel_dir()
+        except RuntimeError as e:
+            print(f"❌ {e}")
+            return "failed"
+        print("🔧 构建 Agent（加载设定/文风基准/写作指令）...")
+        try:
+            agent, wm, route = _build_agent(settings, task=task)
+        except RuntimeError as e:  # 1.1 A23：质量规则非法 JSON 等装配错误，命令层兜住不崩 REPL
+            print(f"❌ {e}")
+            return "failed"
+        print(f"✍️  开始创作：{task}\n")
+        try:
+            # plan 非空才传：既有 FakeAgent（run(task) 签名）与真实 run 的 plan=""
+            # 缺省路径行为一致（W5 回归护栏：既有用例零改动）
+            if plan:
+                state, record = agent.run(task, plan=plan)
+            else:
+                state, record = agent.run(task)
         except Exception as e:
-            print(f"(索引更新失败：{e})")
-        num, _ = parse_chapter_task(task)
-        # 生成剧情摘要存入工作记忆，让后续章节记得前文（P1 连续性）
-        # 0.8：摘要调 agent.summarize_chapter（收编自裸调 agent.llm.chat），兜底仍留 UI 层
+            print(f"❌ 创作失败：{e}")
+            return "failed"
+
+        # exemplar-routing：路由结果进 run 记录（replay 可见，A5）
+        if route is not None:
+            record["exemplar_route"] = {"files": list(route.files), "reason": route.reason}
+
+        # ---- 1.6 de-AI 人味重写 pass（D4 时序：流水线 done 后、save_run/evaluate 前）----
+        # 无 deai 键 / enabled falsy -> 整段短路零行为变更（B18）；pass 是优化器：
+        # 任何异常 catch 打印后保留原稿继续走（失败不阻断主流程，design §6）。
         try:
-            summary = agent.summarize_chapter(state.final_chapter)
-        except Exception:
-            summary = task
-        wm.update_after_write(num, summary or task)
-        save_working_memory(wm, settings)
+            _deai_pass(agent, state, record, settings)
+        except Exception as e:
+            print(f"(去AI重写跳过：{e})")
 
-    # 打印流程日志
-    print("--- 流程日志 ---")
-    for line in state.log:
-        print(line)
-    print(f"\n运行日志：{run_file}")
-    if chapter_file:
-        print(f"章节已存：{chapter_file}")
-    print(f"共 {state.round} 轮，审稿：{state.feedback}")
+        print("💾 落盘运行记录...")
+        # 运行日志落盘（1.1：先落 run record，弃而不失数据，design §3.6）
+        run_file = save_run(record, settings)
 
-    print("\n=== 最终章节 ===")
-    # 0.1：弃稿/未定稿时明确提示未保存，而非只打印"(空)"；
-    # 1.1 A31：门禁弃同样展示内容但明示未保存
-    if chapter_file:
-        print(state.final_chapter)
-    elif state.final_chapter:
-        print(state.final_chapter)
-        print("（本章未保存，运行日志已落）")
-    else:
-        print("（本章未定稿，未保存）")
+        # 自动评测（1.1：从存盘后移到存盘前--门禁要用分；失败不阻断，豁免路径同样照跑留报告）
+        print("\n--- 自动评测 ---")
+        score = None
+        try:
+            score = evaluate(record["run_id"], settings, instruction=agent.instruction)
+        except Exception as e:
+            print(f"(评测跳过：{e})")
+
+        # 1.1 D8 豁免口径：强制定稿 / 人工确认 -> 跳过门禁判定直存（向量库/摘要照常）
+        exempt = "强制定稿" in state.feedback or "人工确认" in state.feedback
+        # 1.1 A30-A34：未豁免且已定稿且门禁不过 -> 人工确认，应答弃则不写章节文件
+        save = bool(state.final_chapter)
+        if save and not exempt and not _gate_ok(score, load_quality_rules(settings)):
+            answer = _gate_confirm("\n⚠️ 评测低于门禁阈值，仍保存本章？(y/n)：").strip().lower()
+            if answer != "y":
+                save = False
+                print("已放弃保存本章（运行日志已落，可 replay 查看）")
+
+        # 章节落盘 + 工作记忆更新
+        chapter_file = None
+        if save:
+            print("📖 保存章节 + 生成剧情摘要...")
+            chapter_file = save_chapter(state.final_chapter, task, record["run_id"], settings)
+            # 0.3：写完自动入库（新章立即进 RAG，后续章节检索得到前文，不靠手动 index add）
+            print("📚 更新向量库...")
+            try:
+                agent.rag.add_document(str(chapter_file))
+            except Exception as e:
+                print(f"(索引更新失败：{e})")
+            num, _ = parse_chapter_task(task)
+            # 生成剧情摘要存入工作记忆，让后续章节记得前文（P1 连续性）
+            # 0.8：摘要调 agent.summarize_chapter（收编自裸调 agent.llm.chat），兜底仍留 UI 层
+            try:
+                summary = agent.summarize_chapter(state.final_chapter)
+            except Exception:
+                summary = task
+            wm.update_after_write(num, summary or task)
+            save_working_memory(wm, settings)
+
+        # 打印流程日志
+        print("--- 流程日志 ---")
+        for line in state.log:
+            print(line)
+        print(f"\n运行日志：{run_file}")
+        if chapter_file:
+            print(f"章节已存：{chapter_file}")
+        print(f"共 {state.round} 轮，审稿：{state.feedback}")
+
+        print("\n=== 最终章节 ===")
+        # 0.1：弃稿/未定稿时明确提示未保存，而非只打印"(空)"；
+        # 1.1 A31：门禁弃同样展示内容但明示未保存
+        if chapter_file:
+            print(state.final_chapter)
+        elif state.final_chapter:
+            print(state.final_chapter)
+            print("（本章未保存，运行日志已落）")
+        else:
+            print("（本章未定稿，未保存）")
+        return "saved" if save else "rejected"
+    except KeyboardInterrupt:
+        print("\n⚠️ 已打断，本章未保存")
+        return "interrupted"
+
+
+def _do_write(task: str, settings: Settings, plan: str = "") -> None:
+    """单章写作命令（薄壳）：对外行为与拆层前一致（plan 透传是唯一增量，T27）。"""
+    _write_one(task, settings, plan=plan)
+
+
+def _do_write_batch(task: str, settings: Settings, auto: bool) -> None:
+    """批量连写（2.2，D10/D11，design §4.4）：区间章逐个走 _write_one。
+
+    - 无标题主路径：章纲逐章供标题 + 规划；缺章报错零 LLM 调用（T14）；
+    - 带模板回落：模板 + 中文序数后缀；章纲存在该章则规划照注入（T13）；
+    - 起止倒置 / 跨度超 batch_max：报错零调用（T23）；
+    - 默认章间 _gate_confirm 确认（y/n，T18）；--auto 下 rejected 即中断
+      （T19 fail-closed），failed/interrupted 两模式均中断（T20/T22）；
+    - 章间连续性零新逻辑（T21）：wm 更新 + rag.add_document 都在 _write_one
+      既有路径里，每章 _build_agent 重建（Z4：章间状态依赖要求重建）。
+    """
+    parsed = parse_chapter_range(task)
+    if parsed is None:
+        print(f"❌ 非法区间命令：{task}（示例：写第5-10章 / 写第5-10章：模板）")
+        return
+    start, end, base = parsed
+    if start > end:
+        print(f"❌ 区间无效：起始章号（{start}）大于结束章号（{end}）")
+        return
+    n = end - start + 1
+    if n > settings.batch_max:
+        print(f"❌ 跨度超上限：共 {n} 章 > NOVEL_BATCH_MAX={settings.batch_max}，请拆分命令")
+        return
+
+    plan_map = _load_chapter_plan(settings)
+    titles: Dict[int, str] = {}
+    plans: Dict[int, str] = {}
+    if base is None:
+        missing = [num for num in range(start, end + 1) if num not in plan_map]
+        if missing:
+            print(f"❌ 每章规划缺章：{missing}"
+                  f"（补齐 {settings.chapter_plan_subpath} 或命令带标题模板）")
+            return  # T14：缺章零 LLM 调用
+    for num in range(start, end + 1):
+        if base is None:
+            titles[num] = plan_map[num]["title"]
+            plans[num] = _render_notes(plan_map[num])
+        else:
+            titles[num] = f"{base}（{cn_numeral(num - start + 1)}）"  # T13 回落
+            if num in plan_map:
+                plans[num] = _render_notes(plan_map[num])  # 显式标题不豁免规划注入
+
+    mode = "，--auto 免确认" if auto else ""
+    print(f"📦 批量连写：第{start}-{end}章，共 {n} 章{mode}"
+          f"（每章约 6-9 次 LLM 调用，注意 token 预算）")  # T24
+    try:
+        for i, num in enumerate(range(start, end + 1), 1):
+            print(f"\n━━━ [批量 {i}/{n}] 第{num}章：{titles[num]} ━━━")
+            outcome = _write_one(f"写第{num}章：{titles[num]}", settings, plan=plans.get(num, ""))
+            if outcome in ("failed", "interrupted"):
+                if outcome == "interrupted":
+                    print("已停止批量，已完成章节保留。")
+                break  # T20/T22
+            if outcome == "rejected" and auto:
+                print(f"⛔ 第{num}章未过门禁，--auto 模式中断批量（已完成 {i - 1} 章）")
+                break  # T19 fail-closed
+            if i < n and not auto:
+                if _gate_confirm(f"\n继续写第{num + 1}章？(y/n)：").strip().lower() != "y":
+                    print("已停止批量，已完成章节保留。")  # T18
+                    break
+    except KeyboardInterrupt:
+        print("\n已停止批量，已完成章节保留。")
+
+
+# 单章无标题形态：写第N章（无冒号无标题，靠章纲供标题与规划，T15）
+_SINGLE_NO_TITLE_RE = re.compile(r"^写\s*第\s*(\d+)\s*章$")
+
+
+def _dispatch_write(line: str, settings: Settings) -> None:
+    """写作命令分发（2.2，D7 分发序）：
+
+    1. 剥 --auto 尾缀（一次性行为标志，非配置）；
+    2. 区间命令（含单章区间 5-5，退化 T25）-> _do_write_batch；
+    3. 单章无标题形态 -> 章纲取标题与规划，等价于敲了「写第N章：{章纲标题}」（T15）；
+    4. 其余 -> _do_write 现状零改动（含「写第5章：标题」带标题单章，不进批量）。
+    互斥性靠「先区间后单章」：单章带标题命令不匹配区间正则（无第二数字）。
+    """
+    task = line.strip()
+    auto = False
+    if task.endswith("--auto"):
+        auto = True
+        task = task[: -len("--auto")].strip()
+    if not task:
+        print("❌ 空命令（--auto 需跟在写作命令后，如：写第5-10章 --auto）")
+        return
+    if parse_chapter_range(task) is not None:
+        _do_write_batch(task, settings, auto)
+        return
+    m = _SINGLE_NO_TITLE_RE.match(task)
+    if m:
+        num = int(m.group(1))
+        entry = _load_chapter_plan(settings).get(num)
+        if entry is None:
+            print(f"❌ 第{num}章无标题：每章规划（{settings.chapter_plan_subpath}）缺该章，"
+                  f"或用「写第{num}章：标题」直接给标题")
+            return
+        _do_write(f"写第{num}章：{entry['title']}", settings, plan=_render_notes(entry))
+        return
+    _do_write(task, settings)
 
 
 def _refine_postprocess(
@@ -976,6 +1130,10 @@ def _do_backtest(args: List[str], settings: Settings) -> None:
 def _print_help() -> None:
     print("命令：")
     print("  写第N章：标题     走完整流程写一章（查设定->草稿->润色->审稿->打分门禁->存文件）")
+    print("  写第N章           无标题形态：从每章规划（NOVEL_CHAPTER_PLAN）取标题与本章规划")
+    print("  写第A-B章         批量连写区间章（章纲逐章供标题与规划，章间 y/n 确认）")
+    print("  写第A-B章 --auto  批量免确认连写（门禁不过/失败自动停，fail-closed）")
+    print("  写第A-B章：模板   批量回落：模板+中文序数后缀作标题，章纲规划照注入")
     print("  精修 <文件路径>   精修已有正文（润色->审稿->存回->更新索引，不写新场景）")
     print("  重写 <文件路径>   重写已有正文（writer参考原文重写->润色->审稿->存回，能大幅扩写）")
     print("  改 <文件路径>     局部精修（列出段落->选段 3/3-5/3,7->只润色选区->diff 确认->逐字节存回）")
@@ -1014,9 +1172,9 @@ def main() -> None:
             if not line:
                 continue
 
-            # 写作命令：以"写"开头（如"写第5章：异乡风起"）
+            # 写作命令：以"写"开头（单章/区间批量/章纲单章，分发序见 _dispatch_write）
             if line.startswith("写"):
-                _do_write(line, settings)
+                _dispatch_write(line, settings)
                 continue
 
             parts = line.split()

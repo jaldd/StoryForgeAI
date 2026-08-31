@@ -1304,3 +1304,103 @@ def test_writer_prompt_contains_recent_human(fake_rag, tmp_settings):
     agent2 = NovelAgent(llm=rec2, rag=fake_rag, settings=tmp_settings, working_memory=WorkingMemory())
     agent2._writer(PipelineState(task="写第1章：测试"))
     assert "近期人工正文" not in rec2.systems[0]
+
+
+# ---------- 2.1 流式接线 + 2.2 规划注入（throughput W3，D4/T6/T9/T12）----------
+class _StreamFakeLLM:
+    """模拟流式 LLM：chat 内把回复按 5 字分片回调 on_delta，再整体返回同一文本。
+
+    同一实例既可当非流式用（on_delta=None 时不回调），供流式/非流式结果对照。
+    """
+
+    def __init__(self, polisher_reply="【润色稿】风起了，林晚没说话。"):
+        self.polisher_reply = polisher_reply
+        self.kws = []
+
+    def chat(self, system, user, **kw):
+        self.kws.append(kw)
+        if "审查" in user:
+            text = '{"pass": true, "reason": "通过"}'
+        elif "润色" in user:
+            text = self.polisher_reply
+        else:
+            text = "【初稿】风起了，他站在路口。林晚没说话，雨下了一整夜。"
+        cb = kw.get("on_delta")
+        if cb is not None:
+            for i in range(0, len(text), 5):
+                cb(text[i:i + 5])
+        return text
+
+
+def test_stream_wiring_on_delta_not_none(tmp_settings, capsys):
+    """T6：stream=True 时 _writer/_polisher 传 on_delta=打印回调；角色头标（流式）（T8）。"""
+    rec = _SysRecorder(script=["构思。\n===\n正文。", "【润色稿】正文。"])
+    agent = NovelAgent(llm=rec, settings=tmp_settings, stream=True)
+    state = PipelineState(task="写第5章：异乡风起")
+    agent._writer(state)
+    agent._polisher(state)
+    assert rec.kws[0]["on_delta"] == agent._print_delta
+    assert rec.kws[1]["on_delta"] == agent._print_delta
+    out = capsys.readouterr().out
+    assert "写作中（流式）" in out and "润色中（流式）" in out
+
+
+def test_default_stream_on_delta_key_present_value_none(tmp_settings):
+    """T6：默认构造（stream 缺省）on_delta 键在、值为 None（与 D4 接线形态一致）。"""
+    rec = _SysRecorder(script=["构思。\n===\n正文。", "【润色稿】正文。"])
+    agent = NovelAgent(llm=rec, settings=tmp_settings)
+    state = PipelineState(task="写第5章：异乡风起")
+    agent._writer(state)
+    agent._polisher(state)
+    for kw in rec.kws:
+        assert "on_delta" in kw and kw["on_delta"] is None
+
+
+def test_stream_pipeline_result_identical_to_nonstream(tmp_settings):
+    """T9：分片回调流式 vs 非流式，=== 分离/润色清洗/字数保护结果一致。"""
+    agent_s = NovelAgent(llm=_StreamFakeLLM(), settings=tmp_settings,
+                         working_memory=WorkingMemory(), stream=True)
+    state_s, _ = agent_s.run("写第5章：异乡风起", plan="核心事件：主角遇袭")
+    agent_n = NovelAgent(llm=_StreamFakeLLM(), settings=tmp_settings,
+                         working_memory=WorkingMemory())
+    state_n, _ = agent_n.run("写第5章：异乡风起", plan="核心事件：主角遇袭")
+    assert state_s.outline == state_n.outline
+    assert state_s.polished == state_n.polished
+    assert state_s.final_chapter == state_n.final_chapter
+
+
+def test_stream_word_guard_triggers_same_as_nonstream(tmp_settings):
+    """T9：流式下润色过短同样触发字数保护保留初稿（后处理不被增量打印干扰）。"""
+    agent_s = NovelAgent(llm=_StreamFakeLLM(polisher_reply="短"), settings=tmp_settings,
+                         working_memory=WorkingMemory(), stream=True)
+    state_s, _ = agent_s.run("写第5章：异乡风起")
+    assert state_s.polished == state_s.draft
+    assert any("字数保护" in line for line in state_s.log)
+
+
+def test_run_plan_into_record_and_writer_prompt(fake_llm, fake_rag, tmp_settings):
+    """T12：plan 进 state/record，writer user_msg 含【本章规划】块；空 plan 不占位。"""
+    agent = NovelAgent(llm=fake_llm, rag=fake_rag, settings=tmp_settings,
+                       working_memory=WorkingMemory())
+    plan = "核心事件：主角遇袭。\n天气：雨。"
+    state, record = agent.run("写第5章：异乡风起", plan=plan)
+    assert state.plan == plan
+    assert record["final_state"]["plan"] == plan
+    writer_user = fake_llm.calls[0]
+    assert "【本章规划】" in writer_user
+    assert "核心事件：主角遇袭" in writer_user
+
+    before = len(fake_llm.calls)
+    agent.run("写第6章：无规划章", plan="")
+    assert "【本章规划】" not in fake_llm.calls[before]  # 空 plan 整块不占位
+
+
+def test_writer_source_content_branch_includes_plan(fake_rag, tmp_settings):
+    """T12：source_content（重写）分支同样注入【本章规划】。"""
+    rec = _SysRecorder(script=["构思。\n===\n正文。"])
+    agent = NovelAgent(llm=rec, rag=fake_rag, settings=tmp_settings)
+    state = PipelineState(task="重写第5章：异乡风起", source_content="旧正文。",
+                          plan="核心事件：主角遇袭。")
+    agent._writer(state)
+    assert "【本章规划】" in rec.users[0]
+    assert "核心事件：主角遇袭" in rec.users[0]

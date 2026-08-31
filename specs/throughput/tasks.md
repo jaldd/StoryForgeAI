@@ -7,11 +7,14 @@
 > style-loop 真车验收由用户执行中，不阻塞。
 > 回归基线：`cli/` 下 `python -m pytest tests/ -q` =
 > **397 passed / 0 failed / 1 deselected**（2026-08-30 实测），零新增失败。
+> 收口实测（2026-08-31）：**461 passed / 0 failed / 1 deselected**（W1-W7 全量，零新增失败）。
+> 待办：Z1 真车门槛--NOVEL_STREAM=1 ark 网关流式冒烟一章（用户执行），
+> 不兼容则 NOVEL_STREAM=0 兜底回退。
 > 行号锚点基于 2026-08-30 代码（style-loop 完成态），实现时以函数名为准。
 
 ## P0
 
-- [ ] **W1 config.py：流式/批量/章纲配置**
+- [x] **W1 config.py：流式/批量/章纲配置**
   改动：Settings（`config.py:53`）增 `stream: bool = True`（env `NOVEL_STREAM`，
   0 = 关）、`batch_max: int = 10`（env `NOVEL_BATCH_MAX`）与
   `chapter_plan_subpath: str = "每章.md"`（env `NOVEL_CHAPTER_PLAN`，留空 = 禁用）
@@ -21,7 +24,7 @@
   chapter_plan_subpath="每章.md"）、setenv 覆盖、`NOVEL_STREAM=0` 解析为
   False、`NOVEL_CHAPTER_PLAN=""` 解析为空串。T26。
 
-- [ ] **W2 llm.py：ThinkFilter 增量过滤 + chat 的 on_delta 流式路径**
+- [x] **W2 llm.py：ThinkFilter 增量过滤 + chat 的 on_delta 流式路径**
   改动：新增 `_ThinkFilter` 类（design §3.2：feed/flush、完整对剥离、未闭合
   前缀扣住、尾部 hold-back 防 `</th`+`ink>` 跨 chunk 截断）；`chat`
   （`llm.py:154`）增 `on_delta: Optional[Callable[[str], None]] = None` 参数，
@@ -40,7 +43,7 @@
   含思考块流、空流+length+reasoning 翻倍重试、中途异常退避重试、finish_reason
   仅末 chunk；非流式请求体断言无 stream 键。T1-T5/T8/T10。
 
-- [ ] **W3 agent.py + state.py + cli.py：流式接线 + 规划注入**
+- [x] **W3 agent.py + state.py + cli.py：流式接线 + 规划注入**
   改动：`NovelAgent.__init__`（`agent.py:250`）增 `stream: bool = False` 参数；
   新增 `_print_delta`（print end="" flush=True）；`_writer`（`agent.py:356`）与
   `_polisher`（`agent.py:395`）的 chat 调用追加
@@ -57,7 +60,7 @@
   `run(task, plan=...)` 时 state.plan 进 record、_writer 的 user_msg 含
   【本章规划】块、空 plan 不占位。T6/T9/T12。
 
-- [ ] **W4 storage.py：区间解析 + 章纲解析 + 中文序数纯函数**
+- [x] **W4 storage.py：区间解析 + 章纲解析 + 中文序数纯函数**
   改动：新增 `parse_chapter_range(task)`（标题可选：`写第5-10章` /
   `写第5-10章：模板`，分隔符 `-`/`-`/`~`/`至`）、`parse_chapter_plan(text)`
   （markdown 全表格扫描合并：列头兼容 标题/暂定标题、分隔行/脏行跳过、
@@ -69,7 +72,7 @@
   后者覆盖、notes 列名值对完整）；cn_numeral 1/2/10/11/20/21/99 抽查 +
   0/-1 抛错。T11/T16 + T13 回落基座。
 
-- [ ] **W5 cli.py：_do_write 拆层 _write_one + 规划透传 + 打断语义**
+- [x] **W5 cli.py：_do_write 拆层 _write_one + 规划透传 + 打断语义**
   改动：`_do_write`（`cli.py:266-358`）主体改名
   `_write_one(task, settings, plan: str = "") -> str` 返回结局（saved/
   rejected/failed/interrupted，design §4.3 表）；`agent.run` 改传
@@ -84,7 +87,7 @@
   返回 interrupted 且无 save_chapter/wm 更新；四种结局各自返回值正确；
   既有 _do_write 全部用例零改动保持绿（拆层回归护栏）。T7/T17/T27。
 
-- [ ] **W6 cli.py：_do_write_batch + REPL 分发 + 单章无标题增强**
+- [x] **W6 cli.py：_do_write_batch + REPL 分发 + 单章无标题增强**
   改动：新增 `_do_write_batch(task, settings, auto)`（design §4.4 骨架全量
   落地：校验起>止/超 batch_max 报错零调用、无标题主路径缺章报错零调用 T14、
   带模板回落序数后缀且章纲照注入 T13、预算提示 T24、逐章 `[批量 i/n]` 头、
@@ -102,7 +105,7 @@
   测试缝：FakeAgent/monkeypatch `_write_one` 返回值 + `_gate_confirm` 替换，
   与既有批量无关用例同模式。T11/T13/T14/T15/T17-T25。
 
-- [ ] **W7 `.env copy.example` + ROADMAP：配置注释与状态更新**
+- [x] **W7 `.env copy.example` + ROADMAP：配置注释与状态更新**
   改动：追加「吞吐（2.1/2.2）」注释段--`NOVEL_STREAM`（默认 1，0=关，
   含「writer/polisher 专属」说明）、`NOVEL_BATCH_MAX`（默认 10）、
   `NOVEL_CHAPTER_PLAN`（默认 每章.md，留空禁用，含章纲表格格式说明：

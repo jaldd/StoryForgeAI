@@ -263,9 +263,13 @@ class NovelAgent:
         quality_rules: Optional[dict] = None,
         writer_llm: Optional[LLMClient] = None,
         recent_human: str = "",
+        stream: bool = False,
     ):
         self.llm = llm
         self.rag = rag
+        # 2.1 流式（D4）：仅 writer/polisher 开流式（on_delta 打印增量）；
+        # 默认 False -> 直构测试与既有调用点零变化。
+        self.stream = stream
         self.exemplar = exemplar
         self.instruction = instruction
         # 1.5 滚动注入：人工正文尾部 N 章片段，只进 writer prompt（B5）。
@@ -353,9 +357,14 @@ class NovelAgent:
         return f"\n--- 当前写作状态（工作记忆）---\n{self.working_memory.snapshot()}"
 
     # ---------- 三个 Agent ----------
+    def _print_delta(self, text: str) -> None:
+        """流式增量打印（2.1，D4）：writer/polisher 的 on_delta 回调。"""
+        print(text, end="", flush=True)
+
     def _writer(self, state: PipelineState) -> None:
         """写手：查设定 + 调模型产出初稿（构思与正文按 === 分离，构思存入 state.outline）。"""
-        print("  ✍️  写作中（约30秒）...")
+        # 2.1（T8）：流式下角色头标注且正文前换行（增量打印自然接管屏幕）
+        print("  ✍️  写作中（流式）...\n" if self.stream else "  ✍️  写作中（约30秒）...")
         retrieved = self._retrieve(state.task)
         # 1.5：滚动人工正文只注入 writer（polisher/reviewer 零改动，B5）
         system = writer_system(
@@ -363,16 +372,26 @@ class NovelAgent:
             self.rules, self.recent_human,
         ) + self._working_context()
 
+        # 2.2 规划注入（D12）：章纲要点进 writer prompt（空串整块不占位）
+        plan_block = ""
+        if state.plan:
+            plan_block = (
+                "\n\n【本章规划】（按此展开本章，是写作依据；天气与矛盾种子是本章的既定设定）"
+                f"\n{state.plan}"
+            )
+
         if state.source_content:
             user_msg = (
                 f"参考以下已有内容，自由重写一个完整章节：{state.task}。目标约{self.target_words}字。"
                 "\n你可以自行决定参考多少，结构和情节可以调整，但要保留核心意图。"
                 f"\n\n【已有内容（参考）】\n{state.source_content}"
+                f"{plan_block}"
                 "\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
             )
         else:
             user_msg = (
                 f"写一段新章节：{state.task}。目标约{self.target_words}字。"
+                f"{plan_block}"
                 "\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
             )
 
@@ -381,7 +400,10 @@ class NovelAgent:
             user_msg,
             max_tokens=4096,
             temperature=self._temp("writer", 0.8),
+            on_delta=self._print_delta if self.stream else None,  # 键恒在（D4）
         )
+        if self.stream:
+            print()  # 流式正文结束补换行（T8）
         # 按 === 分隔：构思存入 state.outline（0.8 保留传递，供 polisher/reviewer/run 日志消费），正文进 draft
         outline, body = _split_writer_output(raw or "")
         state.outline = outline
@@ -394,7 +416,7 @@ class NovelAgent:
 
     def _polisher(self, state: PipelineState) -> None:
         """润色：查设定兜底，基于初稿润色。"""
-        print("  🔧 润色中（约30秒）...")
+        print("  🔧 润色中（流式）...\n" if self.stream else "  🔧 润色中（约30秒）...")
         retrieved = self._retrieve(state.task)
         system = polisher_system(
             self.novel_name, retrieved, self.instruction,
@@ -411,7 +433,10 @@ class NovelAgent:
             f"以下是初稿，请润色：\n\n{draft_safe}{outline_hint}",
             max_tokens=4096,
             temperature=self._temp("polisher", 0.6),
+            on_delta=self._print_delta if self.stream else None,  # 键恒在（D4）
         )
+        if self.stream:
+            print()  # 流式正文结束补换行（T8）
         if not raw:
             state.polished = state.draft
             state.log.append("[polisher] 模型未返回内容，已用初稿兜底")
@@ -826,12 +851,17 @@ class NovelAgent:
         task: str,
         run_id: Optional[str] = None,
         temperature: float = 0.9,
+        plan: str = "",
     ) -> Tuple[PipelineState, Dict[str, Any]]:
-        """跑完整流程（writer->polisher->checker->reviewer，打回统一进 fixer），返回 (state, record)。"""
+        """跑完整流程（writer->polisher->checker->reviewer，打回统一进 fixer），返回 (state, record)。
+
+        plan：本章规划（2.2 章纲要点，D12）——只注入 writer prompt 并随 state
+        进 record（asdict 自然落 final_state，replay 可见当时按什么规划写的）。
+        """
         if run_id is None:
             run_id = "run_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        state = PipelineState(task=task)
+        state = PipelineState(task=task, plan=plan)
         steps: List[dict] = []
         self._run_loop(state, self.agents, steps)
         return state, self._record(run_id, task, temperature, state, steps)

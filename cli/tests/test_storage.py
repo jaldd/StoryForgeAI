@@ -128,3 +128,127 @@ def test_working_memory_empty_when_absent(tmp_settings):
     wm = load_working_memory(tmp_settings)
     assert wm.current_chapter is None
     assert wm.unresolved_foreshadowing == []
+
+
+# ---------- 2.2 区间/章纲解析（throughput W4，D6/D7/T11/T13/T16）----------
+from novel_agent.storage import cn_numeral, parse_chapter_plan, parse_chapter_range  # noqa: E402
+
+
+def test_parse_chapter_range_plain():
+    assert parse_chapter_range("写第5-10章") == (5, 10, None)
+
+
+def test_parse_chapter_range_with_title():
+    assert parse_chapter_range("写第5-10章：异乡风起") == (5, 10, "异乡风起")
+
+
+def test_parse_chapter_range_fullwidth_colon():
+    assert parse_chapter_range("写第5-10章: 半 ascii 冒号") == (5, 10, "半 ascii 冒号")
+
+
+def test_parse_chapter_range_separator_variants():
+    for sep in ("-", "－", "–", "~", "～", "至"):
+        assert parse_chapter_range(f"写第3{sep}7章") == (3, 7, None), sep
+
+
+def test_parse_chapter_range_spaces_around_numbers():
+    assert parse_chapter_range("写第 5 - 10 章：模板") == (5, 10, "模板")
+
+
+def test_parse_chapter_range_no_match_single_chapter():
+    """单章命令不匹配区间正则（互斥靠分发「先区间后单章」）。"""
+    assert parse_chapter_range("写第5章：标题") is None
+    assert parse_chapter_range("写第5章") is None
+    assert parse_chapter_range("精修 /tmp/a.md") is None
+
+
+_PLAN_MD = """
+散文说明文字，不是表格。
+
+| 章 | 标题 | 核心事件 | 天气 | 矛盾种子 |
+| --- | --- | --- | --- | --- |
+| 5 | 风起 | 主角遇袭 | 雨 | 黑衣人 |
+| 6 | 云涌 | 追查线索 | 晴 | 内奸 |
+
+## 第二卷（分卷多表格）
+
+| 章 | 暂定标题 | 核心事件 |
+| --- | --- | --- |
+| 7 | 山雨 | 入山 |
+| 7 | 山雨欲来 | 入山遇伏 |
+
+| 人物 | 说明 |
+| --- | --- |
+| 林晚 | 女主（首列非章号，整表跳过） |
+
+正文行 | 夹杂竖线 | 但不以 | 开头（不是表格）
+"""
+
+
+def test_parse_chapter_plan_merge_and_notes():
+    plans = parse_chapter_plan(_PLAN_MD)
+    assert set(plans) == {5, 6, 7}
+    assert plans[5]["title"] == "风起"
+    assert plans[5]["notes"] == [
+        ("核心事件", "主角遇袭"), ("天气", "雨"), ("矛盾种子", "黑衣人"),
+    ]
+    # 分卷表格合并；「暂定标题」列头变体同样命中
+    assert plans[7]["title"] == "山雨欲来"  # 同章号后者覆盖（Z7）
+    # 首列非章号的表格（人物表）整表跳过
+    assert all("林晚" not in str(p) for p in plans.values())
+
+
+def test_parse_chapter_plan_dirty_rows_skipped():
+    md = """| 章 | 标题 | 核心事件 |
+| --- | --- | --- |
+| 五 | 中文数字行跳过 | x |
+| abc | 非整数跳过 | y |
+| 8 |  | 空标题保留（可被命令模板覆盖） |
+"""
+    plans = parse_chapter_plan(md)
+    assert set(plans) == {8}
+    assert plans[8]["title"] == ""
+    assert plans[8]["notes"] == [("核心事件", "空标题保留（可被命令模板覆盖）")]
+
+
+def test_parse_chapter_plan_row_shorter_than_header():
+    """行比列头短：缺的 notes 列补空串（不越界不丢行）。"""
+    md = """| 章 | 标题 | 核心事件 | 天气 |
+| --- | --- | --- | --- |
+| 9 | 短行 | 只有事件 |
+"""
+    plans = parse_chapter_plan(md)
+    assert plans[9]["notes"] == [("核心事件", "只有事件"), ("天气", "")]
+
+
+def test_parse_chapter_plan_chapter_forms():
+    """首列兼容「第5章」带章字形态（实际章纲的常见脏形态）。"""
+    md = """| 章 | 标题 |
+| --- | --- |
+| 第12章 | 带章字 |
+"""
+    plans = parse_chapter_plan(md)
+    assert plans == {12: {"title": "带章字", "notes": []}}
+
+
+def test_parse_chapter_plan_empty():
+    assert parse_chapter_plan("") == {}
+    assert parse_chapter_plan("没有表格的纯散文。") == {}
+
+
+def test_cn_numeral_spot_checks():
+    assert cn_numeral(1) == "一"
+    assert cn_numeral(2) == "二"
+    assert cn_numeral(9) == "九"
+    assert cn_numeral(10) == "十"
+    assert cn_numeral(11) == "十一"
+    assert cn_numeral(20) == "二十"
+    assert cn_numeral(21) == "二十一"
+    assert cn_numeral(99) == "九十九"
+
+
+def test_cn_numeral_out_of_range_raises():
+    import pytest
+    for bad in (0, -1, 100):
+        with pytest.raises(ValueError):
+            cn_numeral(bad)

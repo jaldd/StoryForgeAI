@@ -29,6 +29,14 @@ _MAX_TOKENS_CAP = 16384
 # 部分思考模型（如 kimi-k3）只允许 temperature=1：识别其 400 报错后锁定重试
 _TEMP_RE = re.compile(r"temperature", re.IGNORECASE)
 
+# OpenAI SDK chat.completions.create 认可的顶层 kwargs；其余走 extra_body 透传
+_OPENAI_KWARGS = frozenset({
+    "model", "messages", "max_tokens", "temperature", "top_p", "n", "stream",
+    "stop", "presence_penalty", "frequency_penalty", "logit_bias", "user",
+    "response_format", "seed", "tools", "tool_choice", "reasoning_effort",
+    "logprobs", "top_logprobs", "parallel_tool_calls",
+})
+
 
 def clean_text(s: str) -> str:
     """清洗：去控制字符（含 NUL），压缩多余换行。"""
@@ -229,7 +237,13 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
         }
-        req.update(self.profile.extra)  # 在内建 kwargs 之后：同名键 extra 赢（Z2）
+        # extra 里的标准 OpenAI 参数（reasoning_effort/max_tokens 等）进 req 顶层，
+        # 非标参数（thinking 等）进 extra_body 透传，否则 SDK 拒绝未知 kwarg
+        for _k, _v in self.profile.extra.items():
+            if _k in _OPENAI_KWARGS:
+                req[_k] = _v
+            else:
+                req.setdefault("extra_body", {})[_k] = _v
         # 翻倍从"生效值"起步（extra 覆盖后的）；显式配置不翻倍
         cur_max = req["max_tokens"]
         allow_double = "max_tokens" not in self.profile.extra
@@ -279,7 +293,7 @@ class LLMClient:
                 # 流式中断（D3）：丢弃已收增量，整请求重来；提示让用户分得清
                 # 「还在写」与「重试中」（T8）
                 if on_delta is not None and attempt < max_retries:
-                    print(f"  ⚠️ 流式中断，丢弃已收内容重试（{last_err[:60]}）")
+                    print(f"\n\n⚠️ 流式中断，丢弃已收内容重试（{last_err[:60]}）\n")
             # 指数退避：2/4/8/16/32 秒；最后一次不再多睡
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
