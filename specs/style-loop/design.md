@@ -138,7 +138,7 @@ if deai_cfg.get("enabled") and state.final_chapter:
         if issues:
             new_text, n_spans = agent.deai_refine(state.final_chapter, issues)
             after = ai_flavor_score(new_text, rules, baseline)["score"]
-            accepted = after < before                        # D5：严格小于才接受（ROADMAP 原话）
+            accepted = after < before                        # D5：严格小于才接受（早期规划原话）
             if accepted:
                 state.final_chapter = new_text
             state.deai = {"before": before, "after": after,
@@ -230,14 +230,14 @@ if deai_cfg.get("enabled") and state.final_chapter:
 
 ## 8. 决策表
 
-### 8.1 继承决策（ROADMAP 已拍板）
+### 8.1 继承决策（早期规划已拍板）
 
 | # | 决策 | 理由 |
 |---|---|---|
 | R1 | 阶段 1 拆两个 feature，本为后半 | 开放问题 3（2026-08-29 关闭） |
-| R2 | 滚动窗口 + 固定精选，不用语义检索 | ROADMAP 1.5：主题相似≠文风相似 |
-| R3 | 只传问题句不传整章 | ROADMAP 1.6 + 宪法 §4 token 预算 |
-| R4 | AI 味分下降才接受 | ROADMAP 1.6 原文 |
+| R2 | 滚动窗口 + 固定精选，不用语义检索 | 阶段 1.5 规划：主题相似≠文风相似 |
+| R3 | 只传问题句不传整章 | 阶段 1.6 规划 + 宪法 §4 token 预算 |
+| R4 | AI 味分下降才接受 | 阶段 1.6 规划原文 |
 
 ### 8.2 设计决策（本 design 拍板）
 
@@ -247,7 +247,7 @@ if deai_cfg.get("enabled") and state.final_chapter:
 | D2 | 管线复用 | a) deai_refine 自写一套；b) 与 _fixer 抽共用子过程 | **b** | 定位/回填/字数保护逻辑全同，两套实现必漂移 |
 | D3 | deai prompt 不注入语料 | a) 注入 exemplar 片段 | **不注入** | 意见已机械定位问题；再塞语料徒增 token |
 | D4 | pass 时序 | a) evaluate 后（改完稿评委分已旧）；b) save_run 与 evaluate 前 | **b** | 评委一次不多烧且评终稿；record 落盘即终态 |
-| D5 | 接受口径 | a) after < before；b) 降 N 分以上 | **a** | ROADMAP 原话「必须下降」；幅度阈值无数据支撑（T12 同理） |
+| D5 | 接受口径 | a) after < before；b) 降 N 分以上 | **a** | 早期规划原话「必须下降」；幅度阈值无数据支撑（T12 同理） |
 | D6 | 预算归属 | a) 占 review_count；b) 独立每章一轮 | **b** | pass 无打回语义；一轮封顶防空转 |
 | D7 | 手动命令落 record | a) 轻量 record；b) 不落 | **b** | 非流水线 run；人是标尺当场拍板，文件即产物 |
 | D8 | 不可定位 issue 处理 | a) 整文降级（fixer 同款）；b) 丢弃 | **b** | B10 只传问题句是硬约束；de-AI 是优化器可挑食（fixer 服务打回语义必须全消费，两角色差异点） |

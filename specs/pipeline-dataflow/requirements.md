@@ -1,6 +1,6 @@
 # 0.8 流水线数据流补漏（pipeline-dataflow）— 需求
 
-> 需求来源：`specs/ROADMAP.md` 0.8 条目（L93-108）。
+> 需求来源：阶段 0.8 规划条目。
 > 最高约束：`.specify/memory/constitution.md`。
 > 现状证据与详细设计见同目录 `design.md`；任务分解见 `tasks.md`。
 > 复核状态：2026-08-28 已完成代码级复核（file:line 证据全部核实，两处勘误成立），D1-D9 已拍板（全按推荐项，D9 含首章 `None` 边界），**可开工**。

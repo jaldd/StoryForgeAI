@@ -216,9 +216,11 @@ class LLMClient:
         """一次模型调用，返回生成文本；多次重试仍空则返回 ""。
 
         思考模型（GLM-5.3 等）的思考计入 max_tokens：预算被思考烧光时
-        finish_reason=length、content 为空，原样重试必然再空。此时翻倍
-        max_tokens 重试（上限 _MAX_TOKENS_CAP）；profile.extra 显式配了
-        max_tokens 则尊重配置不自动翻倍（Z2 逃生门精神）。
+        finish_reason=length、content 为空，原样重试必然再空；预算被思考
+        挤占大半时 content 非空但被拦腰截断（截断的 JSON 必然不可解析、
+        截断的正文必然不完整）。两种情况都翻倍 max_tokens 重试（上限
+        _MAX_TOKENS_CAP）；封顶或 extra 显式配 max_tokens 时尊重现状——
+        空回返回 ""，截断内容尽力返回（好过丢弃）。
         2.1 流式（D1）：on_delta 非空时请求 stream=True，每个可打印增量
         回调一次（思考块经 _ThinkFilter 过滤不打印）；返回值与非流式同源
         （收完组装 + 出口剥思考块）。on_delta=None 时请求体不带 stream 键，
@@ -262,24 +264,39 @@ class LLMClient:
                     reasoning = getattr(choice.message, "reasoning_content", None) or ""
                 else:
                     content, finish, reasoning = self._chat_stream(req, on_delta)
-                if content:
+                if content and finish != "length":
                     return _strip_think_blocks(content)
-                # 空回：finish_reason 可能是 content_filter / length / stop
+                # finish=length：输出被 max_tokens 截断（思考烧光预算=空回，
+                # 或思考挤占大半=正文拦腰截断）。截断不是偶发错误，翻倍
+                # 立刻重试（不走退避）
                 if (
                     finish == "length"
-                    and reasoning
+                    and (content or reasoning)
                     and allow_double
                     and cur_max < _MAX_TOKENS_CAP
                 ):
-                    # 思考烧光预算：不是偶发错误，翻倍立刻重试（不走退避）
                     cur_max = min(cur_max * 2, _MAX_TOKENS_CAP)
                     req["max_tokens"] = cur_max
-                    last_err = (
-                        f"思考耗尽 max_tokens，加大到 {cur_max} 重试"
-                        f"（思考已输出 {len(reasoning)} 字，正文为空）"
-                    )
-                    print(f"  ⚠️ {last_err}")
+                    if content:
+                        last_err = (
+                            f"输出被截断（已收 {len(content)} 字），"
+                            f"max_tokens 加大到 {cur_max} 重试"
+                        )
+                        if on_delta is not None:
+                            # 流式：半截内容已上屏，作废重打（同 D3 中断提示形态）
+                            print(f"\n\n⚠️ {last_err}，丢弃已收内容重试\n")
+                        else:
+                            print(f"  ⚠️ {last_err}")
+                    else:
+                        last_err = (
+                            f"思考耗尽 max_tokens，加大到 {cur_max} 重试"
+                            f"（思考已输出 {len(reasoning)} 字，正文为空）"
+                        )
+                        print(f"  ⚠️ {last_err}")
                     continue
+                if content:
+                    # 截断但无法翻倍（封顶/extra 显式配置）：截断内容尽力返回
+                    return _strip_think_blocks(content)
                 last_err = f"empty content, finish_reason={finish}"
             except Exception as e:  # 网络/限流/网关错误
                 last_err = str(e)

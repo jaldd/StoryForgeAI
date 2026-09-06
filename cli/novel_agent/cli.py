@@ -9,6 +9,7 @@
   eval <run_id>    对某次写作打分
   compare <a> <b>  对比两次写作效果
   状态             查看当前写到第几章、角色状态、未回收伏笔
+  伏笔             查看未回收伏笔；伏笔 删 N（标记回收）/ 伏笔 加 <描述> / 伏笔 已回收
   help / quit
 """
 from __future__ import annotations
@@ -19,11 +20,6 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-
-try:  # macOS 自带；启用后 input() 支持上下键切换历史命令
-    import readline
-except ImportError:  # 未编译 readline 的环境：历史功能禁用，CLI 照常可用
-    readline = None
 
 from .agent import NovelAgent
 from .checker import ai_flavor_score, load_baseline, load_quality_rules, run_checks
@@ -259,7 +255,7 @@ def _deai_pass(agent, state: PipelineState, record: Dict[str, Any], settings: Se
         return
     new_text, n_spans = agent.deai_refine(state.final_chapter, issues)
     after = ai_flavor_score(new_text, rules, baseline)["score"]
-    accepted = after < before  # D5：严格小于才接受（ROADMAP 原话）
+    accepted = after < before  # D5：严格小于才接受
     if accepted:
         state.final_chapter = new_text
         print(f"✅ 去AI重写：AI味分 {before} -> {after}（已接受，改 {n_spans} 段）")
@@ -381,8 +377,60 @@ def _write_one(task: str, settings: Settings, plan: str = "") -> str:
                 summary = agent.summarize_chapter(state.final_chapter)
             except Exception:
                 summary = task
-            wm.update_after_write(num, summary or task)
-            save_working_memory(wm, settings)
+            wm.update_after_write(num, summary or task)   # 既有：无条件在 try 外（A2）
+            # ---- 3.1 伏笔抽取回路（F12 开关；失败不更新列表、不阻断主流程，F3）----
+            if settings.foreshadow_enabled:
+                try:
+                    fo = agent.extract_foreshadowing(
+                        state.final_chapter, wm.unresolved_foreshadowing, chapter_no=num)
+                    wm.resolve_foreshadowing(fo["resolved"], num)   # 出列 -> 归档（A3/D8）
+                    # F16 同章重写覆盖：先清该章旧条目（两道守卫：num 为 None 不清洗、
+                    # manual 人工条目跳过），再追加本次抽取结果
+                    if num is not None:
+                        wm.unresolved_foreshadowing = [
+                            e for e in wm.unresolved_foreshadowing
+                            if e.get("chapter") != num or e.get("manual")
+                        ]
+                    for item in fo["new"]:
+                        wm.unresolved_foreshadowing.append(
+                            {"desc": item["desc"], "chapter": num})
+                    record["foreshadow"] = {
+                        "new": fo["new"], "resolved": fo["resolved"],
+                        "unresolved_after": len(wm.unresolved_foreshadowing)}
+                    save_run(record, settings)   # A1：抽取前已落盘过，补写一次留痕
+                    print(f"🧵 伏笔：+{len(fo['new'])} 回收 {len(fo['resolved'])}"
+                          f"（未回收 {len(wm.unresolved_foreshadowing)}）")
+                except Exception as e:
+                    print(f"(伏笔抽取跳过：{e})")
+                    # F4/Z8：失败也留痕，replay 分得清「这章没埋」与「抽取挂了」
+                    record["foreshadow"] = {"error": str(e)}
+                    try:
+                        save_run(record, settings)
+                    except Exception:
+                        pass                      # 补写失败仅吞掉，不反噬主流程
+            # ---- 3.2 角色弧光抽取回路（C12 开关；失败不更新状态、不阻断主流程，C3）----
+            # 与伏笔回路各自独立 try/except：一个失败不影响另一个已落的结果
+            if settings.arc_enabled:
+                try:
+                    ar = agent.extract_character_arc(
+                        state.final_chapter, wm.character_states, chapter_no=num)
+                    wm.update_character_states(ar["characters"], num)
+                    record["arc"] = {
+                        "updated": [c["name"] for c in ar["characters"]],
+                        "changed": [c["name"] for c in ar["characters"] if c.get("changed")],
+                        "total": len(wm.character_states)}
+                    save_run(record, settings)   # C4：补写一次留痕（同 run_id 覆盖）
+                    print(f"🎭 弧光：更新 {len(ar['characters'])} 角色"
+                          f"（跟踪 {len(wm.character_states)}）")
+                except Exception as e:
+                    print(f"(弧光抽取跳过：{e})")
+                    # C4/Z8：失败也留痕，replay 分得清「没动角色状态」与「抽取挂了」
+                    record["arc"] = {"error": str(e)}
+                    try:
+                        save_run(record, settings)
+                    except Exception:
+                        pass
+            save_working_memory(wm, settings)      # 既有：无条件在 try 外（A2）
 
         # 打印流程日志
         print("--- 流程日志 ---")
@@ -457,8 +505,10 @@ def _do_write_batch(task: str, settings: Settings, auto: bool) -> None:
                 plans[num] = _render_notes(plan_map[num])  # 显式标题不豁免规划注入
 
     mode = "，--auto 免确认" if auto else ""
+    # 3.3 Z2：planner 开启时每章 +1 次规划调用（口径诚实；默认关 = 既有 8-11 不变）
+    calls = "9-12" if settings.planner_enabled else "8-11"
     print(f"📦 批量连写：第{start}-{end}章，共 {n} 章{mode}"
-          f"（每章约 6-9 次 LLM 调用，注意 token 预算）")  # T24
+          f"（每章约 {calls} 次 LLM 调用，注意 token 预算）")  # T24（C13：含伏笔+弧光抽取调用）
     try:
         for i, num in enumerate(range(start, end + 1), 1):
             print(f"\n━━━ [批量 {i}/{n}] 第{num}章：{titles[num]} ━━━")
@@ -1003,11 +1053,170 @@ def _do_index(args: List[str], settings: Settings) -> None:
         print("  index remove <路径>   手动删某文件的所有块")
 
 
+def _print_unresolved(wm: WorkingMemory) -> None:
+    """打印未回收伏笔全量（`伏笔` 列表形态，F8：命令侧不截断）。"""
+    lines = wm.foreshadow_lines()
+    if not lines:
+        print("未回收伏笔：无（可 `伏笔 加 <描述>` 手动补录）")
+        return
+    print(f"未回收伏笔（共 {len(lines)} 条）：")
+    print("\n".join(lines))
+
+
+def _print_resolved(wm: WorkingMemory) -> None:
+    """打印已回收归档（`伏笔 已回收`，F15：误判可人工抄回）。"""
+    items = wm.resolved_foreshadowing
+    if not items:
+        print("已回收伏笔：无")
+        return
+    print(f"已回收伏笔（共 {len(items)} 条）：")
+    for i, entry in enumerate(items, 1):
+        chapter = entry.get("chapter")
+        resolved = entry.get("resolved_chapter")
+        buried = f"第{chapter}章埋" if isinstance(chapter, int) else "埋设章号未知"
+        paid = f"第{resolved}章收" if isinstance(resolved, int) else "回收章号未知"
+        print(f"  {i}.（{buried}，{paid}）{entry.get('desc', '')}")
+
+
+def _foreshadow_delete(wm: WorkingMemory, tokens: List[str], settings: Settings) -> None:
+    """`伏笔 删 N...`：出列入归档（与模型回收同路径），一次算索引集再删（Z4 防错位）。"""
+    if not tokens:
+        print("用法：伏笔 删 <编号>（多个编号空格分隔，如 `伏笔 删 2 5`）")
+        return
+    indices: List[int] = []
+    for token in tokens:
+        try:
+            indices.append(int(token))
+        except ValueError:
+            print(f"❌ 编号必须是数字：{token}")
+            return
+    moved = wm.resolve_foreshadowing(indices, wm.current_chapter)
+    if not moved:
+        print(f"⚠️ 没有有效编号，未作改动（当前共 {len(wm.unresolved_foreshadowing)} 条）")
+        return
+    save_working_memory(wm, settings)
+    print(f"✅ 已标记回收 {len(moved)} 条"
+          f"（`伏笔 已回收` 可查；误删可用 `伏笔 加 <描述>` 补回）")
+
+
+def _foreshadow_add(wm: WorkingMemory, tokens: List[str], settings: Settings) -> None:
+    """`伏笔 加 <描述>`：人工补录（manual 标记，不被同章覆盖清洗清掉，F16 守卫）。"""
+    desc = " ".join(tokens).strip()
+    if not desc:
+        print("用法：伏笔 加 <描述>")
+        return
+    wm.add_foreshadowing(desc, chapter=wm.current_chapter, manual=True)
+    save_working_memory(wm, settings)
+    where = f"（第{wm.current_chapter}章埋）" if wm.current_chapter is not None else "（章号未知）"
+    print(f"✅ 已补录 1 条{where}：{desc}")
+
+
+def _do_foreshadow(args: List[str], settings: Settings) -> None:
+    """伏笔命令（3.1 F9/F10/F15）：列表 / 删 N... / 加 <描述> / 已回收。
+
+    编号 = 列表序号（1 起）；删不是物理删除而是归档（一切「从清单消失」都可恢复）。
+    """
+    try:
+        settings.require_novel_dir()
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+    wm = load_working_memory(settings)
+    if not args:
+        _print_unresolved(wm)
+        return
+    sub, rest = args[0], args[1:]
+    if sub == "已回收":
+        _print_resolved(wm)
+    elif sub == "删":
+        _foreshadow_delete(wm, rest, settings)
+    elif sub == "加":
+        _foreshadow_add(wm, rest, settings)
+    else:
+        print(f"未知子命令：{sub}"
+              f"（用法：伏笔 / 伏笔 删 <编号> / 伏笔 加 <描述> / 伏笔 已回收）")
+
+
+def _print_characters(wm: WorkingMemory) -> None:
+    """打印跟踪角色全量（`角色` 列表形态，C8：命令侧不截断）。"""
+    if not wm.character_states:
+        print("跟踪角色：无（写一章后自动抽取出场主要角色）")
+        return
+    print(f"跟踪角色（共 {len(wm.character_states)} 个）：")
+    for name, entry in wm.character_states.items():
+        chapter = entry.get("chapter")
+        where = f"第{chapter}章" if isinstance(chapter, int) else "章号未知"
+        print(f"  {name}（{where}）：{entry.get('stage', '')}")
+        detail = "｜".join(
+            f"{label}：{entry[key]}"
+            for key, label in (("goal", "目标"), ("conflict", "冲突"), ("belief", "信念"))
+            if entry.get(key)
+        )
+        if detail:
+            print(f"    {detail}")
+        history = entry.get("history") or []
+        if history:
+            print(f"    历史变化 {len(history)} 次：{' -> '.join(h.get('stage', '') for h in history)}")
+
+
+def _character_delete(wm: WorkingMemory, args: List[str], settings: Settings) -> None:
+    """`角色 删 <名字>`：停止跟踪（直接移除不归档，Z4；再出场会被抽取重新发现）。"""
+    name = " ".join(args).strip()
+    if not name:
+        print("用法：角色 删 <名字>")
+        return
+    if wm.remove_character(name):
+        save_working_memory(wm, settings)
+        print(f"✅ 已停止跟踪：{name}（该角色再出场会被抽取重新发现）")
+    else:
+        print(f"⚠️ 没有这个角色：{name}（`角色` 可查看当前跟踪名单）")
+
+
+def _character_revise(wm: WorkingMemory, args: List[str], settings: Settings) -> None:
+    """`角色 改 <名字> <新阶段>`：人工修正当前阶段（D9：不打 manual，下章抽取在其基础上演进）。"""
+    if len(args) < 2:
+        print("用法：角色 改 <名字> <新阶段>")
+        return
+    name, stage = args[0], " ".join(args[1:]).strip()
+    if not stage:
+        print("用法：角色 改 <名字> <新阶段>")
+        return
+    if wm.revise_character_stage(name, stage, chapter=wm.current_chapter):
+        save_working_memory(wm, settings)
+        print(f"✅ 已修正 {name} 的当前阶段：{stage}")
+    else:
+        print(f"⚠️ 没有这个角色：{name}（`角色` 可查看当前跟踪名单）")
+
+
+def _do_character(args: List[str], settings: Settings) -> None:
+    """角色命令（3.2 C9/C10）：列表 / 删 <名字> / 改 <名字> <新阶段>。"""
+    try:
+        settings.require_novel_dir()
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+    wm = load_working_memory(settings)
+    if not args:
+        _print_characters(wm)
+        return
+    sub, rest = args[0], args[1:]
+    if sub == "删":
+        _character_delete(wm, rest, settings)
+    elif sub == "改":
+        _character_revise(wm, rest, settings)
+    else:
+        print(f"未知子命令：{sub}"
+              f"（用法：角色 / 角色 删 <名字> / 角色 改 <名字> <新阶段>）")
+
+
 def _do_status(settings: Settings) -> None:
     wm = load_working_memory(settings)
     print("=== 当前状态 ===")
     if wm.current_chapter is None:
         print("尚未创作任何章节。")
+        # F17：首章前手工补录的伏笔也要可见（只补伏笔块，不打整份 snapshot 免「第None章」噪音）
+        if wm.unresolved_foreshadowing:
+            _print_unresolved(wm)
     else:
         print(wm.snapshot())
     runs = list_runs(settings)
@@ -1064,6 +1273,11 @@ def _do_status(settings: Settings) -> None:
     tags = _load_exemplar_tags(settings)
     if tags:
         print(f"样文路由：启用（{len(tags)} 条标签 @ {settings.exemplar_tags_full}）")
+    # 3.3 planner：开关状态行（P12 可发现性）
+    if settings.planner_enabled:
+        print("planner：开（先规划节拍再写，reviewer 拿节拍当验收基准）")
+    else:
+        print("planner：关（writer 自行构思；NOVEL_PLANNER=1 开启）")
 
 
 def _do_replay(args: List[str], settings: Settings) -> None:
@@ -1145,6 +1359,13 @@ def _print_help() -> None:
     print("  test <run_id>    规则断言测试")
     print("  回测门禁 [条数]  历史runs跑评委回测门禁阈值（分数有缓存，命中不重烧）")
     print("  状态             查看当前写到第几章、角色状态、未回收伏笔")
+    print("  伏笔             查看未回收伏笔（编号+埋设章+描述）")
+    print("  伏笔 删 <编号>    标记已回收（出列入归档，`伏笔 已回收` 可查可找回；多个编号空格分隔）")
+    print("  伏笔 加 <描述>    手动补录一条（埋设章号取当前章，不被同章重写覆盖）")
+    print("  伏笔 已回收       查看已回收归档（描述 + 埋设章 + 回收章）")
+    print("  角色             查看跟踪角色（更新章+阶段+目标/冲突/信念+历史变化）")
+    print("  角色 删 <名字>    停止跟踪一个角色（再出场会被抽取重新发现）")
+    print("  角色 改 <名字> <新阶段>  人工修正当前阶段（下章抽取在其基础上演进）")
     print("  help / quit")
 
 
@@ -1152,6 +1373,13 @@ def _print_help() -> None:
 def main() -> None:
     settings = get_settings()
     history_file = os.path.expanduser("~/.novel_agent_history")
+    # 懒加载 readline（macOS 自带；启用后 input() 支持上下键切换历史命令）：
+    # 无 tty 环境（sandbox/CI/管道）import readline 会无限阻塞，故不能放模块顶部
+    # ——测试只 import 本模块不进 REPL，懒加载后无 tty 环境也能安全 import cli。
+    try:
+        import readline
+    except ImportError:  # 未编译 readline 的环境：历史功能禁用，CLI 照常可用
+        readline = None
     if readline:
         readline.set_history_length(1000)
         try:
@@ -1198,6 +1426,10 @@ def main() -> None:
                 _do_index(args, settings)
             elif cmd in ("状态", "status"):
                 _do_status(settings)
+            elif cmd == "伏笔":
+                _do_foreshadow(args, settings)
+            elif cmd == "角色":
+                _do_character(args, settings)
             elif cmd == "replay":
                 _do_replay(args, settings)
             elif cmd == "eval":

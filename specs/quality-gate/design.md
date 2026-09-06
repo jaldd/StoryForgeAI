@@ -347,7 +347,7 @@ harness 新增 `backtest_gate(settings, out=print, limit=None)` + cli 命令 `�
 
 | # | 决策 | 选项 | 拍板 | 来源 |
 |---|---|---|---|---|
-| D1 | 打回机制 | 修复式（fixer 保稿只改问题处）vs 维持从零重写 | **修复式** | ROADMAP 1.1 待定项 |
+| D1 | 打回机制 | 修复式（fixer 保稿只改问题处）vs 维持从零重写 | **修复式** | 阶段 1.1 规划待定项 |
 | D2 | 词表/阈值载体 | 独立 JSON vs 并入写作铁律.md | **独立 JSON（质量规则.json）** | 开放问题 1 |
 | D3 | 阶段 1 拆分 | 一个 feature vs 拆两个 | **拆两个：quality-gate（1.1-1.4）先行，style-loop（1.5/1.6）后行** | 开放问题 3 |
 
@@ -356,7 +356,7 @@ harness 新增 `backtest_gate(settings, out=print, limit=None)` + cli 命令 `�
 | # | 决策 | 选项 | 拍板 | 理由 |
 |---|---|---|---|---|
 | D4 | reviewer schema 演进 | a) 破坏式新 schema；b) 兼容演进（保留 pass/reason，新增 scores/issues 对象，旧输出归一化） | **b** | FakeLLM 旧脚本、旧 run 语义、线上旧模型输出全部免改；A5/A6 由 b 直接满足 |
-| D5 | 维度集与分向 | 6 既有 + 比喻密度 + 视角越界 = 8 维，全部 1-5、5=最好 | - | ROADMAP 1.1 点名后两维；分向与 EVALUATOR_RUBRIC 一致（run_tests 断言 1-5） |
+| D5 | 维度集与分向 | 6 既有 + 比喻密度 + 视角越界 = 8 维，全部 1-5、5=最好 | - | 阶段 1.1 规划点名后两维；分向与 EVALUATOR_RUBRIC 一致（run_tests 断言 1-5） |
 | D6 | AI 味分语义 | 0-100 越高越 AI；三组件线性加权；缺失组件权重重归一 | - | 方向直觉无歧义；重归一保证降级后仍在有效区间 |
 | D7 | 预算与逃生门 | checker 打回共享 review_count；checker 达上限放行（不强制定稿），由 reviewer 逃生门统一收口 | - | 单一强制定稿点防语义分裂；checker 放行必经 reviewer，最终仍被逃生门兜住 |
 | D8 | 门禁覆盖面 | _do_write 全量 + _refine_postprocess 仅 passed 自动存回分支；豁免路径（强制定稿/人工确认，feedback 字符串命中）直存不进门禁判定 | - | forced 有 is_better 二次判优、未通过分支不存回、人工确认是人拍板（A34）；豁免直存 = 向量库/摘要照常、evaluate 照跑留报告、仅跳过门禁判定；避免多重拦截摩擦 |
@@ -377,7 +377,7 @@ harness 新增 `backtest_gate(settings, out=print, limit=None)` + cli 命令 `�
 | Z6 | record config 增 quality_rules 布尔 | 可追溯该 run 是否带规则跑（回测筛样本）；门禁结果不进 record（评测本就不落盘，保持现状） |
 | Z7 | 状态命令显示规则/语料状态 | 规则文件缺失时 feature 静默失效，必须可发现 |
 | Z8 | 统计基准不受 EXEMPLAR_MAX_CHARS 限制 | 注入上限是 prompt 预算问题；统计要全量 |
-| Z9 | 独白 = 连续非对话行（含任意引号对即算对话行） | 词法代理（ROADMAP 1.2 口径：机械可查的才进 checker） |
+| Z9 | 独白 = 连续非对话行（含任意引号对即算对话行） | 词法代理（阶段 1.2 规划口径：机械可查的才进 checker） |
 | Z10 | 回测分数缓存 .agent/gate_backtest.json | 评委调用是真实成本，缓存避免重复烧 |
 
 ## 9. 已知局限（接受，不修）
@@ -386,5 +386,5 @@ harness 新增 `backtest_gate(settings, out=print, limit=None)` + cli 命令 `�
 - AI 味分的锚点与句长降级基线是经验值，回测校准后才可信；上线初期只展示不进门禁（A29）正是安全垫。
 - eval 门禁依赖 LLM 评委，方差大：阈值默认保守（3.5），REPL 人工确认兜底；分维收紧等历史数据（非目标 7）。
 - 低分确认弃时评委调用已烧（可接受：评委调用 ≪ writer 全链路）。
-- 回测需真实 LLM 评委跑历史 runs（ROADMAP「零成本」前提不成立，Z10 缓解）。
+- 回测需真实 LLM 评委跑历史 runs（早期规划「零成本」前提不成立，Z10 缓解）。
 - metaphor 双阈值（max_rate/max_adjacent_pairs）可能冗余，实跑后留一（P1 清理）。

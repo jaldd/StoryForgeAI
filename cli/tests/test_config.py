@@ -104,6 +104,154 @@ def test_aux_temperature_env(monkeypatch):
         get_settings.cache_clear()
 
 
+# ---------- 伏笔追踪（3.1 foreshadow，F11/F12/Z1）----------
+def test_foreshadow_defaults():
+    """默认：回路开、温度 None（走调用点 0.2）、cap 30。"""
+    from novel_agent.config import get_settings
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.foreshadow_enabled is True
+        assert s.foreshadow_temperature is None
+        assert s.foreshadow_cap == 30
+    finally:
+        get_settings.cache_clear()
+
+
+def test_foreshadow_env_overrides(monkeypatch):
+    """三个 env 都生效：0 = 关回路；温度可配；cap=0 = 不截断。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_FORESHADOW", "0")
+    monkeypatch.setenv("NOVEL_FORESHADOW_TEMPERATURE", "0.15")
+    monkeypatch.setenv("NOVEL_FORESHADOW_CAP", "0")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.foreshadow_enabled is False
+        assert s.foreshadow_temperature == 0.15
+        assert s.foreshadow_cap == 0
+    finally:
+        get_settings.cache_clear()
+
+
+def test_foreshadow_temperature_invalid_fails_fast(monkeypatch):
+    """温度非法值 fail-fast（同 _env_float 既有纪律）。"""
+    import pytest
+
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_FORESHADOW_TEMPERATURE", "abc")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError):
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+
+
+# ---------- 角色弧光（3.2 character-arc，C11/C12/Z1）----------
+def test_arc_defaults():
+    """默认：回路开、温度 None（走调用点 0.2）、cap 8。"""
+    from novel_agent.config import get_settings
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.arc_enabled is True
+        assert s.arc_temperature is None
+        assert s.arc_cap == 8
+    finally:
+        get_settings.cache_clear()
+
+
+def test_arc_env_overrides(monkeypatch):
+    """三个 env 都生效：0 = 关回路；温度可配；cap=0 = 不截断。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_ARC", "0")
+    monkeypatch.setenv("NOVEL_ARC_TEMPERATURE", "0.1")
+    monkeypatch.setenv("NOVEL_ARC_CAP", "0")
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.arc_enabled is False
+        assert s.arc_temperature == 0.1
+        assert s.arc_cap == 0
+    finally:
+        get_settings.cache_clear()
+
+
+def test_arc_temperature_invalid_fails_fast(monkeypatch):
+    """温度非法值 fail-fast（同 _env_float 既有纪律）。"""
+    import pytest
+
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_ARC_TEMPERATURE", "abc")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError):
+            get_settings()
+    finally:
+        get_settings.cache_clear()
+
+
+# ---------- 卷对齐落盘（volume-align，V5/Z1）----------
+def test_volume_align_default_off():
+    """默认关（opt-in）：现状平铺落盘零变化。"""
+    from novel_agent.config import get_settings
+    get_settings.cache_clear()
+    try:
+        assert get_settings().volume_align is False
+    finally:
+        get_settings.cache_clear()
+
+
+def test_planner_default_off():
+    """3.3 planner 默认关（opt-in）：现状 writer 自行构思零变化。"""
+    from novel_agent.config import get_settings
+    get_settings.cache_clear()
+    try:
+        assert get_settings().planner_enabled is False
+        assert get_settings().planner_temperature is None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_planner_env_overrides(monkeypatch):
+    """NOVEL_PLANNER=1 开 / =0 关；NOVEL_PLANNER_TEMPERATURE 覆盖默认。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_PLANNER", "1")
+    monkeypatch.setenv("NOVEL_PLANNER_TEMPERATURE", "0.4")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().planner_enabled is True
+        assert get_settings().planner_temperature == 0.4
+    finally:
+        get_settings.cache_clear()
+    monkeypatch.setenv("NOVEL_PLANNER", "0")
+    monkeypatch.delenv("NOVEL_PLANNER_TEMPERATURE", raising=False)
+    get_settings.cache_clear()
+    try:
+        assert get_settings().planner_enabled is False
+        assert get_settings().planner_temperature is None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_volume_align_env_overrides(monkeypatch):
+    """NOVEL_VOLUME_ALIGN=1 开 / =0 关。"""
+    from novel_agent.config import get_settings
+    monkeypatch.setenv("NOVEL_VOLUME_ALIGN", "1")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().volume_align is True
+    finally:
+        get_settings.cache_clear()
+    monkeypatch.setenv("NOVEL_VOLUME_ALIGN", "0")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().volume_align is False
+    finally:
+        get_settings.cache_clear()
+
+
 def test_runtime_dir_override(tmp_path):
     """显式 runs_dir / chroma_dir 覆盖默认 .agent 路径。"""
     s = Settings(

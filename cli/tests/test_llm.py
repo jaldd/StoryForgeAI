@@ -12,6 +12,7 @@ from novel_agent.llm import (
     LLMClient,
     ModelProfile,
     Profiles,
+    _MAX_TOKENS_CAP,
     _ThinkFilter,
     _strip_think_blocks,
     load_profiles,
@@ -351,6 +352,62 @@ class TestThinkingModelDoubling:
         assert out == ""
         assert [kw["max_tokens"] for kw in spy.all_kwargs] == [2048, 2048, 2048]
 
+    def test_truncated_content_doubles_and_succeeds(self, monkeypatch):
+        """非空截断（finish=length + content 半截 JSON）：翻倍重试后成功。
+
+        真车案例：伏笔抽取 JSON 被 max_tokens 拦腰截断 -> 不可解析。
+        """
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        truncated = _FakeResp('{"new": [{"desc": "半截', finish="length")
+        ok = _FakeResp('{"new": [], "resolved": []}')
+        spy = _ScriptedClient([truncated, ok])
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=2048
+        )
+        assert out == '{"new": [], "resolved": []}'
+        assert spy.all_kwargs[0]["max_tokens"] == 2048
+        assert spy.all_kwargs[1]["max_tokens"] == 4096
+
+    def test_truncated_content_without_reasoning_doubles(self, monkeypatch):
+        """非空截断且无 reasoning_content：截断本身即证据，同样翻倍。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        truncated = _FakeResp("半截正文", finish="length", reasoning="")
+        ok = _FakeResp("完整正文")
+        spy = _ScriptedClient([truncated, ok])
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=2048
+        )
+        assert out == "完整正文"
+        assert spy.all_kwargs[1]["max_tokens"] == 4096
+
+    def test_truncated_content_at_cap_returns_partial(self, monkeypatch):
+        """截断但已封顶：不再翻倍，截断内容尽力返回（好过空串）。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        truncated = _FakeResp("半截正文", finish="length")
+        spy = _ScriptedClient([truncated, truncated])
+        profile = ModelProfile(base_url="u", api_key="k", model="m")
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=_MAX_TOKENS_CAP, max_retries=3
+        )
+        assert out == "半截正文"
+        assert len(spy.all_kwargs) == 1  # 尽力返回，不再消耗重试
+
+    def test_truncated_content_extra_config_returns_partial(self, monkeypatch):
+        """extra 显式配 max_tokens：尊重配置不翻倍，截断内容尽力返回（Z2）。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        truncated = _FakeResp("半截正文", finish="length")
+        spy = _ScriptedClient([truncated, truncated])
+        profile = ModelProfile(
+            base_url="u", api_key="k", model="m", extra={"max_tokens": 8192}
+        )
+        out = LLMClient(client=spy, profile=profile).chat(
+            "sys", "user", max_tokens=1024, max_retries=3
+        )
+        assert out == "半截正文"
+        assert [kw["max_tokens"] for kw in spy.all_kwargs] == [8192]
+
 
 # ---------------- 思考模型：temperature=1 锁定 ----------------
 
@@ -579,6 +636,22 @@ class TestChatStream:
         assert spy.all_kwargs[0]["max_tokens"] == 2048
         assert spy.all_kwargs[1]["max_tokens"] == 4096
         assert "".join(printed) == "正文内容"  # 首轮空流零打印
+
+    def test_stream_truncated_content_doubles(self, monkeypatch):
+        """流式非空截断：翻倍重试，已上屏半截内容作废，打印流以重试轮为准。"""
+        monkeypatch.setattr("novel_agent.llm.time.sleep", lambda s: None)
+        printed: list = []
+        truncated = [_Chunk("半截正文"), _Chunk(finish="length")]
+        ok = [_Chunk("完整正文"), _Chunk(finish="stop")]
+        spy = StreamSpyClient([truncated, ok])
+        out = LLMClient(client=spy, profile=_profile()).chat(
+            "sys", "user", max_tokens=2048, on_delta=printed.append
+        )
+        assert out == "完整正文"
+        assert spy.all_kwargs[0]["max_tokens"] == 2048
+        assert spy.all_kwargs[1]["max_tokens"] == 4096
+        # 首轮半截已打印但作废，最终打印流以重试轮收尾
+        assert "".join(printed).endswith("完整正文")
 
     def test_stream_midway_exception_retries_whole_request(self, monkeypatch):
         """流式中途异常：丢弃已收增量，整请求按退避重试（T5/D3）。"""

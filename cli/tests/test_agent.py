@@ -1,4 +1,8 @@
 """agent 模块测试：状态机流程，用 fake LLM/RAG 不联网。"""
+import dataclasses
+
+import pytest
+
 from novel_agent.agent import NovelAgent, parse_review, parse_review_full
 from novel_agent.config import Settings
 from novel_agent.memory import WorkingMemory
@@ -633,7 +637,7 @@ def test_polisher_consumes_outline(fake_llm, fake_rag, tmp_settings):
     )
     agent.run("写第5章：异乡风起")
     assert "构思：风起，他站在路口。" in fake_llm.calls[1]  # calls[1] = polisher
-    assert "writer 构思" in fake_llm.calls[1]
+    assert "本章构思/节拍" in fake_llm.calls[1]  # 3.3 Z3：中性文案（planner 节拍同走此链）
 
 
 def test_reviewer_consumes_outline(fake_llm, fake_rag, tmp_settings):
@@ -1404,3 +1408,440 @@ def test_writer_source_content_branch_includes_plan(fake_rag, tmp_settings):
     agent._writer(state)
     assert "【本章规划】" in rec.users[0]
     assert "核心事件：主角遇袭" in rec.users[0]
+
+
+# ---------- 伏笔抽取（3.1 foreshadow，D1/D2/D7/D8/F1/F3/F5/F11）----------
+def _fs_agent(llm, fake_rag, tmp_settings, wm=None, **settings_kw):
+    """构造只测抽取的 agent；settings_kw 覆盖配置（cap / 温度）。"""
+    settings = dataclasses.replace(tmp_settings, **settings_kw) if settings_kw else tmp_settings
+    return NovelAgent(
+        llm=llm, rag=fake_rag, settings=settings, working_memory=wm or WorkingMemory(),
+    )
+
+
+def test_extract_foreshadowing_normal(fake_rag, tmp_settings):
+    """F1/F11：单次调用返回 new + resolved；清单带编号；max_tokens=2048、温度默认 0.2。"""
+    rec = _SysRecorder(['{"new": [{"desc": "抽屉里的怀表停在十点"}], "resolved": [2]}'])
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [
+        {"desc": "旧线一", "chapter": 3},
+        {"desc": "旧线二", "chapter": 4},
+    ]
+    agent = _fs_agent(rec, fake_rag, tmp_settings, wm)
+    fo = agent.extract_foreshadowing("本章正文。", wm.unresolved_foreshadowing, chapter_no=5)
+
+    assert fo["new"] == [{"desc": "抽屉里的怀表停在十点", "chapter": 5}]
+    assert fo["resolved"] == [2]
+    assert "1.（第3章埋）旧线一" in rec.users[0]      # 编号与传入顺序一致（D2）
+    assert "2.（第4章埋）旧线二" in rec.users[0]
+    assert "本章正文。" in rec.users[0]
+    assert rec.kws[0]["max_tokens"] == 2048          # Z6：推理预算，不是 1024
+    assert rec.kws[0]["temperature"] == 0.2          # Z2：判定侧默认，不吃写作侧兜底
+
+
+def test_extract_foreshadowing_fenced_and_noisy(fake_rag, tmp_settings):
+    """F3 反例：```json 围栏 + 前后杂文字仍能解析（复用 _extract_json 容错）。"""
+    rec = _SysRecorder(['好的，结果如下：\n```json\n{"new": [], "resolved": [1]}\n```\n以上。'])
+    agent = _fs_agent(rec, fake_rag, tmp_settings)
+    fo = agent.extract_foreshadowing("正文。", [{"desc": "旧线", "chapter": 1}])
+    assert fo["resolved"] == [1] and fo["new"] == []
+
+
+def test_extract_foreshadowing_unparseable_raises(fake_rag, tmp_settings):
+    """F3：非法 JSON / 空返回 / 缺键 -> 整体抛异常（不做部分采信）。"""
+    for bad in ["不是 JSON", "", '{"new": []}']:
+        rec = _SysRecorder([bad])
+        agent = _fs_agent(rec, fake_rag, tmp_settings)
+        with pytest.raises(ValueError):
+            agent.extract_foreshadowing("正文。", [{"desc": "旧线", "chapter": 1}])
+
+
+def test_extract_foreshadowing_resolved_bounds(fake_rag, tmp_settings):
+    """D2：越界/重复/非整数编号静默丢弃，保留合法编号。"""
+    rec = _SysRecorder(['{"new": [], "resolved": [1, 1, 99, 0, "2", true, 2]}'])
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [{"desc": "v1", "chapter": 1}, {"desc": "v2", "chapter": 2}]
+    agent = _fs_agent(rec, fake_rag, tmp_settings, wm)
+    fo = agent.extract_foreshadowing("正文。", wm.unresolved_foreshadowing)
+    assert fo["resolved"] == [1, 2]
+
+
+def test_extract_foreshadowing_dedup(fake_rag, tmp_settings):
+    """D7：与既有清单同串的跳过；new 内部自身重复也跳过（机械去重）。"""
+    payload = ('{"new": [{"desc": "怀表"}, {"desc": "新线"}, {"desc": "新线"}], '
+               '"resolved": []}')
+    rec = _SysRecorder([payload])
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [{"desc": "怀表", "chapter": 3}]
+    agent = _fs_agent(rec, fake_rag, tmp_settings, wm)
+    fo = agent.extract_foreshadowing("正文。", wm.unresolved_foreshadowing, chapter_no=4)
+    assert fo["new"] == [{"desc": "新线", "chapter": 4}]
+
+
+def test_extract_foreshadowing_empty_list_all_new(fake_rag, tmp_settings):
+    """坑位：清单为空也要返回全 new（prompt 里「（无）」，不能连 new 一起空）。"""
+    rec = _SysRecorder(['{"new": [{"desc": "第一条线"}], "resolved": []}'])
+    agent = _fs_agent(rec, fake_rag, tmp_settings)
+    fo = agent.extract_foreshadowing("正文。", [], chapter_no=1)
+    assert "（无）" in rec.users[0]
+    assert fo["new"] == [{"desc": "第一条线", "chapter": 1}]
+
+
+def test_extract_foreshadowing_temperature_override(fake_rag, tmp_settings):
+    """F11：NOVEL_FORESHADOW_TEMPERATURE 覆盖调用点默认。"""
+    rec = _SysRecorder(['{"new": [], "resolved": []}'])
+    agent = _fs_agent(rec, fake_rag, tmp_settings, foreshadow_temperature=0.15)
+    agent.extract_foreshadowing("正文。", [])
+    assert rec.kws[0]["temperature"] == 0.15
+
+
+def test_working_context_cap_truncates(fake_rag, tmp_settings):
+    """F8/D10：注入侧按 cap 截断，取尾部且保留原编号。"""
+    wm = WorkingMemory()
+    wm.current_chapter = 5
+    wm.unresolved_foreshadowing = [{"desc": f"v{i}", "chapter": i} for i in range(1, 4)]
+    agent = _fs_agent(_SysRecorder([]), fake_rag, tmp_settings, wm, foreshadow_cap=2)
+    ctx = agent._working_context()
+
+    assert "（第1章埋）v1" not in ctx
+    assert "  2.（第2章埋）v2" in ctx and "  3.（第3章埋）v3" in ctx  # 原编号，不重排
+    assert "共 3 条，仅注入最近 2 条" in ctx
+
+
+# ---------- 角色弧光抽取（3.2 character-arc，C1/C3/C5/C11/D1/D2）----------
+def test_extract_character_arc_normal(fake_rag, tmp_settings):
+    """C1/C11：单次调用返回 characters；清单每角色一行；max_tokens=2048、温度默认 0.2。"""
+    payload = ('{"characters": [{"name": "林晚", "stage": "复仇决心初动摇",'
+               '"goal": "查清真相", "conflict": "复仇与良知", "belief": "真相值得代价",'
+               '"changed": true}]}')
+    rec = _SysRecorder([payload])
+    wm = WorkingMemory()
+    wm.update_character_states(
+        [{"name": "林晚", "stage": "蒙冤受屈", "goal": "活下去",
+          "conflict": "", "belief": "天理昭昭", "changed": True}], chapter_no=3)
+    agent = _fs_agent(rec, fake_rag, tmp_settings, wm)
+    ar = agent.extract_character_arc("本章正文。", wm.character_states, chapter_no=5)
+
+    assert ar["characters"] == [
+        {"name": "林晚", "stage": "复仇决心初动摇", "goal": "查清真相",
+         "conflict": "复仇与良知", "belief": "真相值得代价", "changed": True},
+    ]
+    assert "林晚（第3章）：蒙冤受屈" in rec.users[0]     # 清单名字与 dict 键逐字一致（D2）
+    assert "本章正文。" in rec.users[0]
+    assert rec.kws[0]["max_tokens"] == 2048             # Z6：推理预算
+    assert rec.kws[0]["temperature"] == 0.2             # Z2：判定侧默认，不吃写作侧兜底
+    assert "角色弧光审计员" in rec.systems[0]
+    assert "清单原名" in rec.systems[0]                  # D2：防命名分裂
+    assert "不超过 6 个" in rec.systems[0]               # C5：软上限文案
+
+
+def test_extract_character_arc_fenced_and_noisy(fake_rag, tmp_settings):
+    """C3 反例：```json 围栏 + 前后杂文字仍能解析（复用 _extract_json 容错）。"""
+    rec = _SysRecorder(['好的：\n```json\n{"characters": []}\n```\n以上。'])
+    agent = _fs_agent(rec, fake_rag, tmp_settings)
+    ar = agent.extract_character_arc("正文。", {})
+    assert ar["characters"] == []
+
+
+def test_extract_character_arc_unparseable_raises(fake_rag, tmp_settings):
+    """C3：非法 JSON / 空返回 / 缺 characters 键 -> 整体抛异常（不做部分采信）。"""
+    for bad in ["不是 JSON", "", '{"new": []}']:
+        rec = _SysRecorder([bad])
+        agent = _fs_agent(rec, fake_rag, tmp_settings)
+        with pytest.raises(ValueError):
+            agent.extract_character_arc("正文。", {})
+
+
+def test_extract_character_arc_invalid_entries_dropped(fake_rag, tmp_settings):
+    """边界：缺 name/stage 的条目与非 dict 条目丢弃，合法条目保留。"""
+    payload = ('{"characters": ["脏字符串", {"stage": "缺名字"}, {"name": "沈砚"},'
+               '{"name": "林晚", "stage": "复仇决心初动摇", "changed": true}]}')
+    rec = _SysRecorder([payload])
+    agent = _fs_agent(rec, fake_rag, tmp_settings)
+    ar = agent.extract_character_arc("正文。", {})
+    assert ar["characters"] == [
+        {"name": "林晚", "stage": "复仇决心初动摇", "goal": "",
+         "conflict": "", "belief": "", "changed": True},
+    ]
+
+
+def test_extract_character_arc_empty_states_all_new(fake_rag, tmp_settings):
+    """坑位：清单为空也要返回正文出场角色（prompt 里「（无）」，不能连角色一起空）。"""
+    payload = ('{"characters": [{"name": "林晚", "stage": "蒙冤受屈",'
+               '"goal": "活下去", "conflict": "", "belief": "天理昭昭", "changed": false}]}')
+    rec = _SysRecorder([payload])
+    agent = _fs_agent(rec, fake_rag, tmp_settings)
+    ar = agent.extract_character_arc("正文。", {}, chapter_no=1)
+    assert "（无）" in rec.users[0]
+    assert ar["characters"][0]["name"] == "林晚"
+
+
+def test_extract_character_arc_temperature_override(fake_rag, tmp_settings):
+    """C11：NOVEL_ARC_TEMPERATURE 覆盖调用点默认。"""
+    rec = _SysRecorder(['{"characters": []}'])
+    agent = _fs_agent(rec, fake_rag, tmp_settings, arc_temperature=0.1)
+    agent.extract_character_arc("正文。", {})
+    assert rec.kws[0]["temperature"] == 0.1
+
+
+def test_working_context_arc_cap_truncates(fake_rag, tmp_settings):
+    """C8/D10：注入侧按 arc_cap 截断（更新章倒序），抽取输入不受影响。"""
+    wm = WorkingMemory()
+    wm.current_chapter = 5
+    wm.update_character_states(
+        [{"name": "甲", "stage": "一", "changed": False}], chapter_no=1)
+    wm.update_character_states(
+        [{"name": "乙", "stage": "二", "changed": False}], chapter_no=2)
+    wm.update_character_states(
+        [{"name": "丙", "stage": "三", "changed": False}], chapter_no=3)
+    agent = _fs_agent(_SysRecorder([]), fake_rag, tmp_settings, wm, arc_cap=2)
+    ctx = agent._working_context()
+
+    assert "丙（第3章）：三" in ctx and "乙（第2章）：二" in ctx   # 最近更新优先
+    assert "甲（第1章）" not in ctx
+    assert "共 3 角色，仅注入最近更新 2 个" in ctx
+
+
+# ---------------- 3.3 planner：规划角色（P1-P8） ----------------
+BEATS = (
+    "【场景序列】\n1. 山道/黄昏/两人相遇/克制/600字\n"
+    "【伏笔操作】收「怀表停在十点」；埋「山那边的灯」\n"
+    "【角色弧光推进】林晚：蒙冤受屈 -> 决心初动摇\n"
+    "【结尾钩子】灯亮了，她没回头"
+)
+
+
+def _planner_agent(llm, fake_rag, tmp_settings, wm=None, **settings_kw):
+    """构造 planner 测试 agent；settings_kw 覆盖配置（开关 / 温度）。"""
+    settings = dataclasses.replace(tmp_settings, **settings_kw) if settings_kw else tmp_settings
+    return NovelAgent(
+        llm=llm, rag=fake_rag, settings=settings, working_memory=wm or WorkingMemory(),
+    )
+
+
+def test_planner_in_agents_map(fake_rag, tmp_settings):
+    """P1：planner 是状态机真角色（agents map 成员）。"""
+    agent = _planner_agent(_SysRecorder([]), fake_rag, tmp_settings)
+    assert "planner" in agent.agents
+    assert agent.agents["planner"] == agent._planner
+
+
+def test_run_starts_at_planner_when_enabled(fake_rag, tmp_settings):
+    """P1：开关开时 run 起点是 planner；关时起点是 writer（现状）。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, record = agent.run("写第5章：异乡风起")
+    assert record["steps"][0]["agent"] == "planner"          # P6：steps 留痕
+    assert state.outline == BEATS                            # P2：节拍存 outline
+
+    rec2 = _SysRecorder(["【初稿】风起了。", "【润色】风起了。",
+                         '{"pass": true, "reason": "通过"}'])
+    agent2 = _planner_agent(rec2, fake_rag, tmp_settings)    # 默认关
+    _, record2 = agent2.run("写第5章：异乡风起")
+    assert all(s["agent"] != "planner" for s in record2["steps"])  # P4：现状零变化
+
+
+def test_planner_fills_outline_and_writer_consumes(fake_rag, tmp_settings):
+    """P2/P7：writer prompt 含节拍块、无构思请求、章纲不双注入（D7）。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, _ = agent.run("写第5章：异乡风起", plan="章纲要点：山道相遇")
+    writer_user = rec.users[1]                               # calls[0]=planner, [1]=writer
+    assert "【本章节拍（planner 规划，按此展开写作）】" in writer_user
+    assert BEATS in writer_user
+    assert "请直接写正文，不要再写构思说明" in writer_user   # 不再请求构思
+    assert "【本章规划】" not in writer_user                 # D7：节拍已消化章纲
+    assert "planner" in rec.users[0] or "节拍" in rec.users[0]  # planner 调用含任务
+
+
+def test_planner_prompt_contains_plan_and_context(fake_rag, tmp_settings):
+    """P5：planner 输入汇合任务 + 章纲 + 工作记忆快照 + 检索。"""
+    wm = WorkingMemory()
+    wm.update_after_write(4, "前情", ["怀表停在十点"])
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, wm=wm, planner_enabled=True)
+    agent.run("写第5章：异乡风起", plan="章纲要点：山道相遇")
+    planner_user = rec.users[0]
+    assert "写第5章：异乡风起" in planner_user
+    assert "章纲要点：山道相遇" in planner_user              # 章纲进 planner
+    assert "怀表停在十点" in rec.systems[0]                  # 工作记忆快照进 system
+    assert "林晚是在场的女主" in rec.systems[0]              # RAG 检索进 system
+
+
+def test_planner_empty_response_falls_back(fake_rag, tmp_settings):
+    """P3：空回降级——outline 空、writer 走现状分支（请求构思 + 章纲直注）。"""
+    rec = _SysRecorder(["", "构思。\n===\n风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, _ = agent.run("写第5章：异乡风起", plan="章纲要点：山道相遇")
+    assert state.outline == "构思。"                         # writer 构思兜底
+    assert any("未返回内容" in l for l in state.log)
+    writer_user = rec.users[1]
+    assert "请先用一段话说明构思" in writer_user             # 现状分支
+    assert "【本章规划】" in writer_user                     # 章纲直注（D7 反例）
+
+
+def test_planner_exception_falls_back(fake_rag, tmp_settings):
+    """P3/Z4：chat 异常视同空回降级，不中断 run。"""
+
+    class BoomLLM(_SysRecorder):
+        def chat(self, system, user, **kw):
+            self.systems.append(system)
+            self.users.append(user)
+            self.kws.append(kw)
+            if not self.script or self.script[0] == "BOOM":
+                if self.script:
+                    self.script.pop(0)
+                raise RuntimeError("网络炸了")
+            return self.script.pop(0)
+
+    rec = BoomLLM(["BOOM", "构思。\n===\n风起了。", "【润色】风起了。",
+                   '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, _ = agent.run("写第5章：异乡风起")
+    assert state.final_chapter                                # run 走完未中断
+    assert any("调用失败" in l for l in state.log)
+    assert state.outline == "构思。"                          # writer 构思兜底
+
+
+def test_planner_beats_not_overwritten_by_writer(fake_rag, tmp_settings):
+    """P8：writer 残余 === 构思不覆盖 planner 节拍（节拍是唯一真源）。"""
+    rec = _SysRecorder([BEATS, "残余构思。\n===\n风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, _ = agent.run("写第5章：异乡风起")
+    assert state.outline == BEATS                             # 未被覆盖
+    assert state.draft == "风起了。"                          # === 前残余被剥
+
+
+def test_planner_temperature_chain(fake_rag, tmp_settings):
+    """P10：planner_temperature > NOVEL_TEMPERATURE 兜底 > 调用点默认 0.5。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings,
+                           planner_enabled=True, planner_temperature=0.3)
+    agent.run("写第5章：异乡风起")
+    assert rec.kws[0]["temperature"] == 0.3                   # 单代理键赢
+
+    rec2 = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                         '{"pass": true, "reason": "通过"}'])
+    agent2 = _planner_agent(rec2, fake_rag, tmp_settings,
+                            planner_enabled=True, llm_temperature=0.7)
+    agent2.run("写第5章：异乡风起")
+    assert rec2.kws[0]["temperature"] == 0.7                  # 写作侧兜底
+
+    rec3 = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                         '{"pass": true, "reason": "通过"}'])
+    agent3 = _planner_agent(rec3, fake_rag, tmp_settings, planner_enabled=True)
+    agent3.run("写第5章：异乡风起")
+    assert rec3.kws[0]["temperature"] == 0.5                  # 调用点默认
+
+
+def test_planner_max_tokens_2048(fake_rag, tmp_settings):
+    """Z1：宪法 §4 推理预算，max_tokens=2048。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    agent.run("写第5章：异乡风起")
+    assert rec.kws[0]["max_tokens"] == 2048
+
+
+def test_planner_no_streaming(fake_rag, tmp_settings):
+    """design §5：planner 不走 streaming（on_delta 不传）。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings,
+                           planner_enabled=True, stream=True)
+    agent.run("写第5章：异乡风起")
+    assert "on_delta" not in rec.kws[0] or rec.kws[0]["on_delta"] is None
+
+
+def test_planner_not_in_refine(fake_rag, tmp_settings):
+    """P9：refine 路径不触发 planner（refine_agents 不含 planner）。"""
+    rec = _SysRecorder(["【润色】风起了。", '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, record = agent.refine("要精修的稿。", "精修：x.md")
+    assert all(s["agent"] != "planner" for s in record["steps"])
+    assert state.outline == ""                                # refine 无构思链
+
+
+def test_rewrite_planner_off_current_behavior(fake_rag, tmp_settings):
+    """P16：planner 关时 rewrite 起点是 writer（现状零变化）。"""
+    rec = _SysRecorder(["构思。\n===\n风起了。", "【润色】风起了。",
+                         '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings)       # 默认关
+    state, record = agent.rewrite("要重写的稿。", "重写：x.md")
+    assert all(s["agent"] != "planner" for s in record["steps"])
+    assert state.outline == "构思。"                         # writer 自行构思
+
+
+def test_rewrite_planner_on_starts_at_planner(fake_rag, tmp_settings):
+    """P13：planner 开时 rewrite 起点是 planner，节拍存 outline。"""
+    rec = _SysRecorder([BEATS, "构思。\n===\n风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, record = agent.rewrite("要重写的稿。", "重写：x.md")
+    assert record["steps"][0]["agent"] == "planner"           # P13：起点 planner
+    assert state.outline == BEATS                            # 节拍存 outline
+    assert record["steps"][1]["agent"] == "writer"           # planner 后接 writer
+
+
+def test_rewrite_planner_user_injects_source_content(fake_rag, tmp_settings):
+    """P14/D10：rewrite 路径 planner_user 收到 source_content + 重写模式指令。"""
+    src = "原文第一段。原文第二段。"
+    rec = _SysRecorder([BEATS, "构思。\n===\n风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    agent.rewrite(src, "重写：x.md")
+    planner_user_msg = rec.users[0]                           # calls[0]=planner
+    assert "【原文（重写参考，节拍的结构基础）】" in planner_user_msg
+    assert src in planner_user_msg
+    assert "重写任务" in planner_user_msg                    # D9：基于原文结构
+
+
+def test_rewrite_planner_on_writer_consumes_beats(fake_rag, tmp_settings):
+    """P7：rewrite + planner on → writer user_msg 含节拍块、无构思请求、仍有原文参考。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    agent.rewrite("要重写的稿。", "重写：x.md")
+    writer_user = rec.users[1]                               # calls[0]=planner, [1]=writer
+    assert "【本章节拍（planner 规划，按此展开写作）】" in writer_user
+    assert BEATS in writer_user
+    assert "请直接写正文，不要再写构思说明" in writer_user   # 不再请求构思
+    assert "【已有内容（参考）】" in writer_user             # rewrite 仍有原文参考
+
+
+def test_rewrite_planner_empty_fallback(fake_rag, tmp_settings):
+    """P15：planner 空回 → 降级 log + writer 走现状分支（自行构思）。"""
+    rec = _SysRecorder(["", "构思。\n===\n风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    state, _ = agent.rewrite("要重写的稿。", "重写：x.md")
+    assert any("未返回内容" in l for l in state.log)         # 降级 log
+    assert state.outline == "构思。"                         # writer 自行构思兜底
+
+
+def test_planner_user_no_source_content_byte_identical():
+    """P16：source_content 为空时 planner_user 输出与 T8 前逐字节一致。"""
+    from novel_agent.prompts import planner_user
+    task, plan, tw = "写第5章：异乡风起", "章纲要点：山道相遇", 3000
+    with_src = planner_user(task, plan, tw, "")
+    without_param = planner_user(task, plan, tw)             # 不传 source_content
+    assert with_src == without_param                          # 默认值一致
+    assert "原文" not in with_src                             # 无原文块
+    assert "重写任务" not in with_src                          # 无重写模式指令
+
+
+def test_planner_beats_reach_polisher_reviewer(fake_rag, tmp_settings):
+    """P2：节拍经既有 outline_hint 链进 polisher（意图基准）与 reviewer（验收基准）。"""
+    rec = _SysRecorder([BEATS, "【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = _planner_agent(rec, fake_rag, tmp_settings, planner_enabled=True)
+    agent.run("写第5章：异乡风起")
+    assert "本章构思/节拍" in rec.users[2]                    # polisher（Z3 中性文案）
+    assert "本章构思/节拍" in rec.users[3]                    # reviewer（Z3 中性文案）
+    assert BEATS in rec.users[3]                              # 节拍全文进验收基准

@@ -1,7 +1,7 @@
 # 需求：文风基准按章路由（exemplar-routing）
 
 > Feature: `exemplar-routing`
-> 遵循 `.specify/memory/constitution.md`；对应 `specs/ROADMAP.md` 0.5b 的动态化延伸（阶段 1.5 的前置实验）。
+> 遵循 `.specify/memory/constitution.md`；对应阶段 0.5b 规划的动态化延伸（阶段 1.5 的前置实验）。
 
 ---
 

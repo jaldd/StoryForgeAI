@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Settings, get_settings
-from .memory import WorkingMemory
+from .memory import (
+    WorkingMemory,
+    normalize_character_states,
+    normalize_foreshadowing,
+    normalize_resolved,
+)
 
 __all__ = [
     "parse_chapter_task",
@@ -165,12 +170,17 @@ def parse_chapter_file(path: Path) -> Tuple[Optional[int], str]:
 
     匹配 save_chapter 落盘格式「第05章-标题.md」（按「-」分隔，零填充章号）；
     同名追加 run_id 后缀的「第05章-标题-run_xxx.md」同样匹配（标题取到第一个后缀前）。
+    卷对齐格式「第一卷-38.md」（卷名-卷内章号，volume-align V6）返回 (38, "")；
+    判定序：既有格式先、卷格式后（防「第05章-标题2」类标题以数字结尾的误判，D5）。
     不匹配 -> (None, stem)，调用方按「无章号」处理（如跳过工作记忆刷新，A21）。
     """
     stem = path.stem
     m = re.match(r"第\s*0*(\d+)\s*章\s*-\s*(.+)", stem)
     if m:
         return int(m.group(1)), m.group(2).strip()
+    m = re.match(r"^(.+?)-(\d{1,4})$", stem)  # 卷名-NN（懒匹配，锚定结尾）
+    if m:
+        return int(m.group(2)), ""
     return None, stem
 
 
@@ -216,15 +226,34 @@ def save_chapter(
     run_id: str,
     settings: Optional[Settings] = None,
 ) -> Path:
-    """把定稿存到 docs/.../正文/AI生成/。
+    """把定稿存到章节目录（NOVEL_CHAPTER_SUBDIR）。
 
-    文件名：第05章-异乡风起.md（解析失败则用 run_id）。
+    平铺模式（默认）：文件名 第05章-异乡风起.md（解析失败则用 run_id）；
     同名已存在时不覆盖，追加 run_id 后缀保留历史。
+
+    卷对齐模式（NOVEL_VOLUME_ALIGN=1，volume-align V1-V4）：前提 subdir 指到
+    当前卷目录（如 正文/第一卷）；文件名 {卷名}-{NN}.md（卷名 = subdir 末段，
+    不含标题），头行 ## 第{中文数字}章 {标题}（对齐人工原稿约定），**直接覆盖**
+    已有文件（重写工作流：git diff 即比对，run record 另存全文双保险）；
+    章号解析不出（番外）回落平铺命名不覆盖。
     """
     settings = settings or get_settings()
     settings.chapter_path.mkdir(parents=True, exist_ok=True)
 
     num, title = parse_chapter_task(task)
+    if num is not None and settings.volume_align:
+        vol = Path(settings.chapter_subdir).name
+        path = settings.chapter_path / f"{vol}-{num:02d}.md"
+        try:
+            cn = cn_numeral(num)
+        except ValueError:
+            cn = str(num)  # >99 回落阿拉伯数字（V2），不崩
+        body = _strip_leading_title(final_chapter)
+        header = f"## 第{cn}章 {title}".rstrip() + "\n\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header + body)
+        return path
+
     if num is not None:
         base = f"第{num:02d}章-{title}"
     else:
@@ -261,6 +290,7 @@ def save_working_memory(
         "current_chapter": wm.current_chapter,
         "character_states": wm.character_states,
         "unresolved_foreshadowing": wm.unresolved_foreshadowing,
+        "resolved_foreshadowing": wm.resolved_foreshadowing,
         "last_plot_point": wm.last_plot_point,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -277,7 +307,16 @@ def load_working_memory(settings: Optional[Settings] = None) -> WorkingMemory:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         wm.current_chapter = data.get("current_chapter")
-        wm.character_states = data.get("character_states", {}) or {}
-        wm.unresolved_foreshadowing = data.get("unresolved_foreshadowing", []) or []
+        # 3.2 C6：条目非 dict 或缺 stage 丢弃，不因一条脏数据拒载整个文件
+        wm.character_states = normalize_character_states(
+            data.get("character_states", {})
+        )
+        # 3.1 F6：旧版纯字符串列表 -> dict 条目；脏元素丢弃，不因一条脏数据拒载整个文件
+        wm.unresolved_foreshadowing = normalize_foreshadowing(
+            data.get("unresolved_foreshadowing", [])
+        )
+        wm.resolved_foreshadowing = normalize_resolved(
+            data.get("resolved_foreshadowing", [])
+        )
         wm.last_plot_point = data.get("last_plot_point")
     return wm

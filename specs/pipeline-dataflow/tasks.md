@@ -48,7 +48,7 @@
   - 验证：`replay(sample_run, tmp_settings, out=capturer)`（sample_run 含 director step、无 outline 字段）正常输出全部步骤与最终章节；`evaluate` 读 `final_state.next_agent/feedback`（`harness.py:168/177`）不受影响（跑一个新 record 过 evaluate 冒烟）。
 
 - [ ] **T10 文档与叙述清理 + 全量回归** —— A2
-  - 改动：`agent.py:1/126/450/484` docstring 四角色->三角色表述；`README.md` 等仓库文档 grep `director` 逐处修正（只改表述，不改 ROADMAP、不动其他 specs/）。
+  - 改动：`agent.py:1/126/450/484` docstring 四角色->三角色表述；`README.md` 等仓库文档 grep `director` 逐处修正（只改表述，不改早期规划、不动其他 specs/）。
   - 验证：`grep -rn -i "director" cli/ README.md` 复核仅剩历史 run JSON 样例与 git 历史中的合法残留；`cd cli && PYTHONPATH=.deps python -m pytest` 全量跑，对照存量 3 失败之外零新增失败。
 
 ## P1（收编外延与记忆刷新）
@@ -93,5 +93,5 @@
 
 ## 人工验收项（不进 pytest，端到端）
 
-- ROADMAP:108「同一任务可配出 2000+ 字章节」：`.env` 配 `NOVEL_TARGET_WORDS=2200`，真实模型跑一次 `write`，观察正文长度与是否出现截断腰斩（风险与边界见 design §6）。
-- ROADMAP:108「reviewer 的伏笔维度能引用前文」：连续写第 2 章后回看 run record 中 reviewer 的意见是否引用了工作记忆中的伏笔/进度信息。
+- 早期规划「同一任务可配出 2000+ 字章节」：`.env` 配 `NOVEL_TARGET_WORDS=2200`，真实模型跑一次 `write`，观察正文长度与是否出现截断腰斩（风险与边界见 design §6）。
+- 早期规划「reviewer 的伏笔维度能引用前文」：连续写第 2 章后回看 run record 中 reviewer 的意见是否引用了工作记忆中的伏笔/进度信息。

@@ -20,15 +20,21 @@ from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, build_context_pair, split_paragraphs
 from .prompts import (
+    ARC_SYSTEM,
     COMPARE_SYSTEM,
+    FORESHADOW_SYSTEM,
     PARTIAL_REFINE_SUFFIX,
     PLOT_SUMMARY_SYSTEM,
+    arc_user,
     deai_system,
     deai_user,
     fixer_system,
     fixer_user,
     fixer_whole_user,
+    foreshadow_user,
     partial_refine_user,
+    planner_system,
+    planner_user,
     polisher_system,
     reviewer_system,
     writer_system,
@@ -292,6 +298,7 @@ class NovelAgent:
         self.review_confirm = review_confirm
 
         self.agents: Dict[str, Callable[[PipelineState], None]] = {
+            "planner": self._planner,
             "writer": self._writer,
             "polisher": self._polisher,
             "checker": self._checker,
@@ -304,14 +311,14 @@ class NovelAgent:
         """调用点温度（0.9 全量可配）：单代理 NOVEL_<KIND>_TEMPERATURE >
         NOVEL_TEMPERATURE（写作侧兜底）> 调用点默认。
 
-        - kind ∈ {writer, polisher, reviewer, router, fixer, judge, summarizer}；
-        - 写作侧（writer/polisher/fixer，走 writer_llm）多一档 NOVEL_TEMPERATURE 兜底；
+        - kind ∈ {writer, polisher, reviewer, router, fixer, judge, summarizer, planner}；
+        - 写作侧（writer/polisher/fixer/planner，走 writer_llm）多一档 NOVEL_TEMPERATURE 兜底；
         - reviewer/judge/summarizer（走主 llm）与 router 只看自己的键和默认值。
         """
         per = getattr(self.settings, f"{kind}_temperature", None)
         if per is not None:
             return per
-        if kind in ("writer", "polisher", "fixer") and self.settings.llm_temperature is not None:
+        if kind in ("writer", "polisher", "fixer", "planner") and self.settings.llm_temperature is not None:
             return self.settings.llm_temperature
         return default
 
@@ -354,12 +361,53 @@ class NovelAgent:
         """
         if self.working_memory is None or self.working_memory.current_chapter is None:
             return ""
-        return f"\n--- 当前写作状态（工作记忆）---\n{self.working_memory.snapshot()}"
+        # 3.1 F8：注入侧带 cap 护栏（截断只影响注入，不影响抽取判定的全量清单）
+        cap = getattr(self.settings, "foreshadow_cap", 30)
+        # 3.2 C8：弧光注入护栏同款（截断只影响注入，不影响抽取输入清单）
+        arc_cap = getattr(self.settings, "arc_cap", 8)
+        text = self.working_memory.snapshot(cap=cap, arc_cap=arc_cap)
+        return f"\n--- 当前写作状态（工作记忆）---\n{text}"
 
     # ---------- 三个 Agent ----------
     def _print_delta(self, text: str) -> None:
         """流式增量打印（2.1，D4）：writer/polisher 的 on_delta 回调。"""
         print(text, end="", flush=True)
+
+    def _planner(self, state: PipelineState) -> None:
+        """规划师（3.3 planner）：汇合章纲/伏笔/弧光/长度目标，产出本章节拍（先于 writer）。
+
+        - 节拍存 state.outline（构思前移，D2：polisher/reviewer 既有消费面零改动）；
+        - chat 包 try/except（Z4）：planner 在 _run_loop 状态机内运行，异常会
+          中断整个 run，须自包；异常/空回视同降级（P3），writer 走现状分支；
+        - rewrite 路径（T8）：source_content 非空时节拍基于原文结构（D9），
+          降级逻辑同款（P15）；
+        - 不走 streaming（design §5：节拍非正文，无需逐 token 输出）。
+        """
+        print("  📋 规划节拍中（约20秒）...")
+        retrieved = self._retrieve(state.task)
+        system = planner_system(
+            self.novel_name, retrieved, self.instruction, self.rules,
+        ) + self._working_context()
+        try:
+            raw = self.writer_llm.chat(
+                system,
+                planner_user(  # T8：rewrite 路径带原文（D9/D10，节拍基于原文结构）
+                    state.task, state.plan, self.target_words,
+                    state.source_content or "",
+                ),
+                max_tokens=2048,  # Z1：宪法 §4 推理预算
+                temperature=self._temp("planner", 0.5),
+            )
+        except Exception as e:  # 异常视同空回降级，不中断 run（Z4）
+            raw = ""
+            state.log.append(f"[planner] ⚠️ 节拍规划调用失败：{e}")
+        beats = _strip_code_fence(raw or "").strip()
+        if beats:
+            state.outline = beats
+            state.log.append(f"[planner] 节拍完成，{len(beats)} 字")
+        else:
+            state.log.append("[planner] ⚠️ 节拍规划未返回内容，回落 writer 自行构思")
+        state.next_agent = "writer"
 
     def _writer(self, state: PipelineState) -> None:
         """写手：查设定 + 调模型产出初稿（构思与正文按 === 分离，构思存入 state.outline）。"""
@@ -372,12 +420,29 @@ class NovelAgent:
             self.rules, self.recent_human,
         ) + self._working_context()
 
-        # 2.2 规划注入（D12）：章纲要点进 writer prompt（空串整块不占位）
+        # 2.2 规划注入（D12）：章纲要点进 writer prompt（空串整块不占位）；
+        # 3.3 D7：planner 节拍已消化章纲时不双注入（节拍是唯一真源）
         plan_block = ""
-        if state.plan:
+        if state.plan and not state.outline:
             plan_block = (
                 "\n\n【本章规划】（按此展开本章，是写作依据；天气与矛盾种子是本章的既定设定）"
                 f"\n{state.plan}"
+            )
+
+        # 3.3 P7：planner 节拍注入（outline 已填 = 按节拍写；未填 = 现状自行构思）
+        beats_block = ""
+        if state.outline:
+            beats_block = (
+                f"\n\n【本章节拍（planner 规划，按此展开写作）】\n{state.outline}"
+            )
+
+        # 构思请求行二选一（D6：按 outline 是否已填，与 planner 开关解耦）
+        if state.outline:
+            draft_request = "\n请直接写正文，不要再写构思说明。"
+        else:
+            draft_request = (
+                "\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），"
+                "然后用 === 分隔，再写正文。"
             )
 
         if state.source_content:
@@ -385,14 +450,14 @@ class NovelAgent:
                 f"参考以下已有内容，自由重写一个完整章节：{state.task}。目标约{self.target_words}字。"
                 "\n你可以自行决定参考多少，结构和情节可以调整，但要保留核心意图。"
                 f"\n\n【已有内容（参考）】\n{state.source_content}"
-                f"{plan_block}"
-                "\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
+                f"{plan_block}{beats_block}"
+                f"{draft_request}"
             )
         else:
             user_msg = (
                 f"写一段新章节：{state.task}。目标约{self.target_words}字。"
-                f"{plan_block}"
-                "\n请先用一段话说明构思（涉及人物、情绪走向、场景细节），然后用 === 分隔，再写正文。"
+                f"{plan_block}{beats_block}"
+                f"{draft_request}"
             )
 
         raw = self.writer_llm.chat(
@@ -406,7 +471,8 @@ class NovelAgent:
             print()  # 流式正文结束补换行（T8）
         # 按 === 分隔：构思存入 state.outline（0.8 保留传递，供 polisher/reviewer/run 日志消费），正文进 draft
         outline, body = _split_writer_output(raw or "")
-        state.outline = outline
+        if not state.outline:  # P8：planner 节拍是唯一真源，writer 残余构思不覆盖
+            state.outline = outline
         state.draft = body
         if not state.draft:
             state.draft = f"（初稿兜底）{state.task}"
@@ -424,10 +490,10 @@ class NovelAgent:
         ) + self._working_context()
         # 防止 GLM 把 --- 当结束标记截断，预处理换掉，润色后换回
         draft_safe = state.draft.replace("\n---\n", "\n【场景分隔】\n")
-        # 0.8：writer 构思传给 polisher（润色不跑偏意图）
+        # 0.8：writer 构思传给 polisher（润色不跑偏意图）；3.3 Z3：文案中性化（planner 节拍同走此链）
         outline_hint = ""
         if state.outline:
-            outline_hint = f"\n\n【writer 构思（润色时保持此意图，不要跑偏）】\n{state.outline}"
+            outline_hint = f"\n\n【本章构思/节拍（润色时保持此意图，不要跑偏）】\n{state.outline}"
         raw = self.writer_llm.chat(
             system,
             f"以下是初稿，请润色：\n\n{draft_safe}{outline_hint}",
@@ -504,10 +570,10 @@ class NovelAgent:
         print("  🔍 审稿中（约10秒）...")
         retrieved = self._retrieve(state.task, with_prior=False)
         system = reviewer_system(self.novel_name, retrieved, self.instruction, self.rules) + self._working_context()
-        # 0.8：writer 构思作为验收基准（正文是否实现了该构思）
+        # 0.8：writer 构思作为验收基准（正文是否实现了该构思）；3.3 Z3：文案中性化（planner 节拍同走此链）
         outline_hint = ""
         if state.outline:
-            outline_hint = f"\n\n【writer 构思（验收基准：请审查正文是否实现了该构思）】\n{state.outline}"
+            outline_hint = f"\n\n【本章构思/节拍（验收基准：请审查正文是否实现了该构思/节拍）】\n{state.outline}"
         result = self.llm.chat(
             system,
             f"请审查以下稿件：\n\n{state.polished}{outline_hint}",
@@ -759,6 +825,123 @@ class NovelAgent:
             max_tokens=max_tokens, temperature=self._temp("summarizer", 0.3),
         )
 
+    def extract_foreshadowing(
+        self,
+        chapter_text: str,
+        unresolved: List[dict],
+        chapter_no: Optional[int] = None,
+    ) -> dict:
+        """伏笔抽取（3.1，D1/D2/D8）：一次调用同时完成「找新伏笔」与「判旧伏笔是否回收」。
+
+        - 输入：本章定稿正文 + 带编号的未回收清单（编号 = 列表序，1 起，与回报协议同源）；
+        - 输出：{"new": [{"desc", "chapter"}], "resolved": [编号...], "raw": 原始返回}；
+        - resolved 越界/重复/非整数编号静默丢弃；new 与既有 desc 完全同串的跳过（D7）；
+          new 内部自身重复也跳过；
+        - 空返回 / 剥围栏后仍非法 / 缺 new 或 resolved 键 -> 抛异常（F3 整体放弃，
+          不做部分采信：半次更新比不更新更难推理）；
+        - max_tokens=2048（Z6）：推理模型思考计入预算，30 条判定 + 多条自包含描述比
+          审稿 JSON 更长，1024 偏紧；
+        - ≤5 条是 prompt 软约束，模型返回超限时全收不截断（截断会丢真伏笔，F5）。
+        """
+        def _desc(item) -> str:
+            if isinstance(item, str):
+                return item
+            return str(item.get("desc") or "") if isinstance(item, dict) else ""
+
+        lines = []
+        for i, entry in enumerate(unresolved or [], 1):
+            chapter = entry.get("chapter") if isinstance(entry, dict) else None
+            prefix = f"（第{chapter}章埋）" if isinstance(chapter, int) else ""
+            lines.append(f"{i}.{prefix}{_desc(entry)}")
+
+        raw = self.llm.chat(
+            FORESHADOW_SYSTEM,
+            foreshadow_user(chapter_text, lines),
+            max_tokens=2048,
+            temperature=self._temp("foreshadow", 0.2),
+        )
+        if not raw or not raw.strip():
+            raise ValueError("抽取返回为空")
+        data = _extract_json(_strip_code_fence(raw))
+        if not isinstance(data, dict) or "new" not in data or "resolved" not in data:
+            raise ValueError(f"抽取返回不可解析：{(raw or '')[:80]!r}")
+
+        existing = {_desc(e).strip() for e in (unresolved or [])}
+        new_items: List[dict] = []
+        for item in data.get("new") or []:
+            desc = item.get("desc") if isinstance(item, dict) else item
+            desc = str(desc or "").strip()
+            if not desc or desc in existing:
+                continue
+            existing.add(desc)  # new 内部自身重复也跳过
+            entry = {"desc": desc}
+            if chapter_no is not None:
+                entry["chapter"] = chapter_no
+            new_items.append(entry)
+
+        total = len(unresolved or [])
+        resolved: List[int] = []
+        for no in data.get("resolved") or []:
+            if isinstance(no, bool) or not isinstance(no, int):
+                continue
+            if 1 <= no <= total and no not in resolved:
+                resolved.append(no)
+        return {"new": new_items, "resolved": resolved, "raw": raw}
+
+    def extract_character_arc(
+        self,
+        chapter_text: str,
+        character_states: Dict[str, dict],
+        chapter_no: Optional[int] = None,
+    ) -> dict:
+        """角色弧光抽取（3.2，D1/D2/D5）：一次调用完成「更新出场角色状态 + 发现
+        新角色 + 判定阶段是否实质变化」三件事。
+
+        - 输入：本章定稿正文 + 既有角色状态清单（全量，截断只影响注入不影响抽取）；
+        - 输出：{"characters": [{name, stage, goal, conflict, belief, changed}],
+          "raw": 原始返回}；名字同串覆盖/异串新键的机械判定在 memory 侧（D2）；
+        - 空返回 / 剥围栏后仍非法 / 缺 characters 键 -> 抛异常（C3 整体放弃，
+          不做部分采信：错误状态污染后续所有章 prompt，比空着更糟）；
+        - max_tokens=2048（Z6）：推理模型思考计入预算，6 角色 × 4 字段的 JSON
+          比伏笔描述长；
+        - ≤6 个主要角色是 prompt 软约束，模型返回超限时全收不截断（C5）。
+        """
+        lines = []
+        for name, entry in (character_states or {}).items():
+            chapter = entry.get("chapter") if isinstance(entry, dict) else None
+            prefix = f"（第{chapter}章）" if isinstance(chapter, int) else ""
+            lines.append(f"{name}{prefix}：{entry.get('stage', '')}")
+
+        raw = self.llm.chat(
+            ARC_SYSTEM,
+            arc_user(chapter_text, lines),
+            max_tokens=2048,
+            temperature=self._temp("arc", 0.2),
+        )
+        if not raw or not raw.strip():
+            raise ValueError("弧光抽取返回为空")
+        data = _extract_json(_strip_code_fence(raw))
+        if not isinstance(data, dict) or "characters" not in data:
+            raise ValueError(f"弧光抽取返回不可解析：{(raw or '')[:80]!r}")
+
+        characters: List[dict] = []
+        for item in data.get("characters") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            stage = str(item.get("stage") or "").strip()
+            if not name or not stage:
+                continue
+            characters.append({
+                "name": name,
+                "stage": stage,
+                "goal": str(item.get("goal") or ""),
+                "conflict": str(item.get("conflict") or ""),
+                "belief": str(item.get("belief") or ""),
+                "changed": bool(item.get("changed")),
+            })
+        return {"characters": characters, "raw": raw}
+
     def is_better(self, original: str, refined: str) -> bool:
         """对比原文与润色版（0.8 从 cli._is_better 收编）：润色后是否更好。
 
@@ -857,11 +1040,16 @@ class NovelAgent:
 
         plan：本章规划（2.2 章纲要点，D12）——只注入 writer prompt 并随 state
         进 record（asdict 自然落 final_state，replay 可见当时按什么规划写的）。
+        3.3 planner：NOVEL_PLANNER=1 时先规划再写（planner 汇合章纲/伏笔/
+        弧光/字数产节拍存 outline，构思前移；refine 不触发，rewrite 同触发
+        见 rewrite()，T8）。
         """
         if run_id is None:
             run_id = "run_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         state = PipelineState(task=task, plan=plan)
+        if self.settings.planner_enabled:
+            state.next_agent = "planner"  # P1：planner 是状态机真角色
         steps: List[dict] = []
         self._run_loop(state, self.agents, steps)
         return state, self._record(run_id, task, temperature, state, steps)
@@ -909,7 +1097,8 @@ class NovelAgent:
         """重写已有正文：走 writer->polisher->checker->reviewer，writer 参考原文自由重写。
 
         - state.source_content = 传入的正文（writer 作为参考）
-        - state.next_agent = "writer"（直接从 writer 起）
+        - state.next_agent = "planner"（NOVEL_PLANNER=1 时，T8：节拍基于原文
+          结构——场景提取->重排/增强，不从零规划）/ "writer"（默认，现状）
         - checker/reviewer 打回统一进 fixer（与 run 一致）
         与 run() 的区别：writer 拿到已有内容作为参考，而非从零创作。
         与 refine() 的区别：走 writer 而非 polisher，能大幅扩写/重构。
@@ -919,7 +1108,10 @@ class NovelAgent:
 
         state = PipelineState(task=task)
         state.source_content = content
-        state.next_agent = "writer"
+        if self.settings.planner_enabled:
+            state.next_agent = "planner"  # T8/P13：重写先规划（节拍基于原文结构）
+        else:
+            state.next_agent = "writer"  # P16：现状
         state.log.append(f"[rewrite] 重写开始，参考原文 {len(content)} 字")
 
         steps: List[dict] = []

@@ -9,7 +9,7 @@
 换成别家 key，写章时 RAG 的 embedding（同一个 key + 火山 embed_url）当场崩--chat 与
 embedding 的鉴权必须解耦。
 
-ROADMAP 0.7（specs/ROADMAP.md L78-L91）要求三层能力：
+阶段 0.7 规划要求三层能力：
 
 1. **provider 可换**：`LLM_BASE_URL` / `LLM_API_KEY` 接入 env（key 回落 `ARK_API_KEY`
    兼容现状），embedding 配置独立不动。SenseNova（`api.sensenova.cn/compatible-mode/v2`）
@@ -21,7 +21,7 @@ ROADMAP 0.7（specs/ROADMAP.md L78-L91）要求三层能力：
    固定值，因其要稳定出 JSON）、`NOVEL_LLM_EXTRA`（JSON 原样透传给 chat 请求体的额外
    参数；真实用例：Kimi-K3 顶层参数 `reasoning_effort` 调档，零代码改动）。
 
-抽象形状（ROADMAP 已定，不在本 feature 讨论范围）：**轻量策略层**。OpenAI 兼容协议本身
+抽象形状（早期规划已定，不在本 feature 讨论范围）：**轻量策略层**。OpenAI 兼容协议本身
 就是策略抽象（同一段代码不同参数=不同策略），不上 Provider 抽象基类/策略注册表/插件
 机制。实体就两个：`llm.py` 内 `ModelProfile` dataclass + `load_profiles()`。
 
@@ -121,7 +121,7 @@ test_runtime_dir_override / test_defaults 共 3 个存量失败）。
 
 ## 4. 非目标
 
-- 不引入 Provider 抽象基类 / 策略注册表 / 插件机制（ROADMAP 已拍板轻量策略层）；
+- 不引入 Provider 抽象基类 / 策略注册表 / 插件机制（早期规划已拍板轻量策略层）；
 - 不改动 embedding 配置（embed_url / embed_model / 其鉴权，rag.py 零改动）；
 - 不为各家 provider 的专有参数逐项建模配置（一切走 `NOVEL_LLM_EXTRA` 透传）；
 - 不做分角色 extra 差异化（`WRITER_LLM_EXTRA` 留作未来逃生门，见 design §9）；

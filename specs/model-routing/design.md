@@ -60,7 +60,7 @@ def load_profiles(settings: Optional[Settings] = None) -> Profiles:
 - **温度覆盖用 None 哨兵**：`profile.temperature is None` 表示「不覆盖」，chat() 用
   调用点传入的温度现值。主配置 profile 的 temperature 恒为 None，意味着
   NOVEL_TEMPERATURE 物理上无法影响审稿/评分调用（A12 由构造保证，而非靠调用点自觉）。
-- **空字符串回落**：`or` 语义天然满足 ROADMAP 的「空=回落主配置」，且三个 WRITER_*
+- **空字符串回落**：`or` 语义天然满足早期规划的「空=回落主配置」，且三个 WRITER_*
   变量各自独立回落（A7），配了 URL 不配 key 是合法形态。
 - **extra 同值进两个 profile**：NOVEL_LLM_EXTRA 语义是「全局 chat 层行为参数」。
   分角色差异化（WRITER_LLM_EXTRA）是已知局限，见 §12。
@@ -86,7 +86,7 @@ def load_profiles(settings: Optional[Settings] = None) -> Profiles:
 **解析值**而非原始 env（例：只配 `ARK_API_KEY` + `WRITER_MODEL=kimi-k3`，writer 的
 api_key 回落到 ARK key）。
 
-`LLM_MODEL` 是本设计自主引入的变量（ROADMAP 只点名 LLM_BASE_URL/LLM_API_KEY）：换
+`LLM_MODEL` 是本设计自主引入的变量（早期规划只点名 LLM_BASE_URL/LLM_API_KEY）：换
 provider 不换模型名几乎不可能成立（火山网关模型名与 Kimi/SenseNova 各不相同），不接
 env 则 provider 可换是残缺配置面。`CLAUDE_MODEL` 保留为回落以兼容现状。此项可否决，
 见 §11。
@@ -395,19 +395,19 @@ profiles = load_profiles(self.settings)     # Z5：重算，不读注入对象
 | # | 决策 | 选项 | 拍板 | 理由 |
 |---|---|---|---|---|
 | D1 | 思考块清洗位置与范围 | a) llm.py chat() 出口统一剥（完整对 + 未闭合前缀，含未闭合）；b) 各调用点自行剥；c) 扩大标签集（`<reasoning>` 等） | **a** | 调用点模式已被 `_strip_code_fence` 仅挂 partial_refine 证明有漏网；思考块是协议层产物应在出口剥（顺带保护 reviewer 的 JSON 解析）；标签集先只收思考块标签（Kimi/GLM 实际返回形态），遇到新标签再加，避免盲扫误伤正文。c 的完整清单建议实测 SenseNova/Kimi 后定 |
-| D2 | Kimi K3 reasoning_effort 调档示例放哪 | a) `.env copy.example` 注释；b) 操作手册 | **a** | 项目当前没有操作手册载体；ROADMAP 定位它是 env 级调教实验参数，用户找配置第一眼看 .env copy.example；给一行注释掉的示例并标注「仅 Kimi-K3」即可 |
+| D2 | Kimi K3 reasoning_effort 调档示例放哪 | a) `.env copy.example` 注释；b) 操作手册 | **a** | 项目当前没有操作手册载体；早期规划定位它是 env 级调教实验参数，用户找配置第一眼看 .env copy.example；给一行注释掉的示例并标注「仅 Kimi-K3」即可 |
 | D3 | run 记录 config 怎么体现各角色模型 | a) 扁平键（model + writer_model + llm_temperature）；b) 嵌套 config["llm"]={...} | **a** | replay 整字典打印自动展示新键、compare 显式读键零改动；扁平是 0.8 的先例（target_words 直进 config）；嵌套会让旧工具读不到 sibling 键。形状见 §5 |
-| D4 | max_tokens 是否按 profile 可配 + 宪法 §4 怎么改写 | a) 不建字段，代码内固定值不变，需要时 NOVEL_LLM_EXTRA 透传覆盖；b) ModelProfile 加 max_tokens 字段 | **a** | b 会引入「profile 配了 max_tokens 时调用点预算失效」的双轨语义；a 用 extra 赢的既有机制零成本覆盖（`{"max_tokens": 8192}`），且 §4 改写为「经验值 + 换模型须实测 + 透传逃生门」与 ROADMAP「max_tokens 语义必须实测」的口径一致 |
+| D4 | max_tokens 是否按 profile 可配 + 宪法 §4 怎么改写 | a) 不建字段，代码内固定值不变，需要时 NOVEL_LLM_EXTRA 透传覆盖；b) ModelProfile 加 max_tokens 字段 | **a** | b 会引入「profile 配了 max_tokens 时调用点预算失效」的双轨语义；a 用 extra 赢的既有机制零成本覆盖（`{"max_tokens": 8192}`），且 §4 改写为「经验值 + 换模型须实测 + 透传逃生门」与早期规划「max_tokens 语义必须实测」的口径一致 |
 | D5 | ModelProfile 不配温度时回落什么 | a) 回落调用点现值（0.8/0.6/0.6）；b) 各角色内置统一默认 | **a** | A4/A11 要求未配置时行为与现状完全一致，b 必然改变现值；a 用 temperature=None 哨兵实现，主配置 profile 恒 None 顺带物理保证 A12 |
 
 ## 11. 自主补充决策（用户未点名；评审会话已全部采纳）
 
 | # | 决策 | 理由 |
 |---|---|---|
-| Z1 | 引入 `LLM_MODEL` env（ROADMAP 未点名） | 换 provider 必换模型名，不接 env 则 provider 可换残缺；CLAUDE_MODEL 保留为回落兼容现状 |
+| Z1 | 引入 `LLM_MODEL` env（早期规划未点名） | 换 provider 必换模型名，不接 env 则 provider 可换残缺；CLAUDE_MODEL 保留为回落兼容现状 |
 | Z2 | extra 与内建参数同名时 extra 赢（req.update 顺序） | 透传的字面语义；同时构成 max_tokens 覆盖的零代码逃生门（支撑 D4-a） |
-| Z3 | record 新增 `llm_temperature` 键（ROADMAP 只要求模型可见） | NOVEL_TEMPERATURE 本就为配 compare 做 A/B 而生，温度不进记录则 A/B 无法归因 |
-| Z4 | NOVEL_LLM_EXTRA 同值进 default 与 writer 两个 profile | ROADMAP 的 Kimi 用例是整 provider 切换（三处生成 + 审稿同商）；分角色差异化列为非目标（WRITER_LLM_EXTRA 逃生门，§12） |
+| Z3 | record 新增 `llm_temperature` 键（早期规划只要求模型可见） | NOVEL_TEMPERATURE 本就为配 compare 做 A/B 而生，温度不进记录则 A/B 无法归因 |
+| Z4 | NOVEL_LLM_EXTRA 同值进 default 与 writer 两个 profile | 早期规划的 Kimi 用例是整 provider 切换（三处生成 + 审稿同商）；分角色差异化列为非目标（WRITER_LLM_EXTRA 逃生门，§12） |
 | Z5 | `_record` 从 load_profiles(settings) 重算而非读注入对象 | FakeLLM 注入无 profile 属性；直构 Settings 测试确定性；生产路径两者同源 |
 
 ## 12. 已知局限（接受，不修）

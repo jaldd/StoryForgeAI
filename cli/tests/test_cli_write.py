@@ -6,14 +6,16 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+from pathlib import Path
 
 from novel_agent import cli
 from novel_agent.config import Settings
 from novel_agent.llm import load_profiles
 from novel_agent.memory import WorkingMemory
 from novel_agent.state import PipelineState
-from novel_agent.storage import load_run, load_working_memory
+from novel_agent.storage import load_run, load_working_memory, save_working_memory
 
 
 class WriteAgent:
@@ -1006,7 +1008,8 @@ def test_batch_plan_driven_titles_plans_continuity(tmp_settings, fake_rag, monke
     assert wm.current_chapter == 6  # 工作记忆章间推进（T21）
     assert len(fake_rag.add_calls) == 2  # 每章 rag.add_document 各一次（T21）
     out = capsys.readouterr().out
-    assert "批量连写：第5-6章，共 2 章" in out and "6-9 次" in out  # T24 预算提示
+    # T24 预算提示（C13：口径含伏笔+弧光抽取调用，7-10 -> 8-11）
+    assert "批量连写：第5-6章，共 2 章" in out and "8-11 次" in out
 
 
 def test_batch_missing_chapter_zero_calls(tmp_settings, monkeypatch, capsys):
@@ -1161,3 +1164,572 @@ def test_dispatch_single_range_beats_no_title(tmp_settings, monkeypatch):
     cli._dispatch_write("写第5-5章", tmp_settings)
     assert got["batch"] == [("写第5-5章", False)]
     assert got["one"] == []
+
+
+# ---------- 伏笔抽取回路（3.1 foreshadow，F2/F3/F4/F13/F16/Z8）----------
+class ForeshadowAgent(_RecordingAgent):
+    """替身 agent：extract_foreshadowing 按 result 返回或抛错，并记录调用入参。
+
+    继承 _RecordingAgent：run() 收 plan 关键字（批量路径会传）。
+    """
+
+    def __init__(self, rag, result=None):
+        super().__init__(rag)
+        self.result = result if result is not None else {"new": [], "resolved": []}
+        self.extract_calls = []
+
+    def extract_foreshadowing(self, chapter_text, unresolved, chapter_no=None):
+        self.extract_calls.append({
+            "chapter_no": chapter_no,
+            "descs": [e.get("desc") if isinstance(e, dict) else e for e in (unresolved or [])],
+        })
+        if isinstance(self.result, Exception):
+            raise self.result
+        return dict(self.result)
+
+
+def _run_extract(monkeypatch, tmp_settings, agent, wm, task="写第5章：异乡风起"):
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write(task, tmp_settings)
+
+
+def test_write_extracts_and_records(tmp_settings, fake_rag, monkeypatch, capsys):
+    """F1/F2/F4：抽取成功 -> new 入 wm / resolved 出列入归档 / record 留痕且落盘可查。"""
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [{"desc": "怀表停在十点", "chapter": 3}]
+    agent = ForeshadowAgent(fake_rag, {"new": [{"desc": "林晚没拆那封信"}], "resolved": [1]})
+    _run_extract(monkeypatch, tmp_settings, agent, wm)
+
+    assert wm.unresolved_foreshadowing == [{"desc": "林晚没拆那封信", "chapter": 5}]
+    # F15：回收不是物理删除，而是进归档（可人工找回）
+    assert wm.resolved_foreshadowing == [
+        {"desc": "怀表停在十点", "chapter": 3, "resolved_chapter": 5}
+    ]
+    assert agent.extract_calls[0]["chapter_no"] == 5
+    assert agent.extract_calls[0]["descs"] == ["怀表停在十点"]   # 抽取拿全量清单
+
+    saved = load_run("run_20260828_000001", tmp_settings)         # A1：补写后真读得到
+    # 留痕为抽取原始返回（替身直返，未经真实解析；真实调用的新条目会带 chapter）
+    assert saved["foreshadow"]["new"] == [{"desc": "林晚没拆那封信"}]
+    assert saved["foreshadow"]["resolved"] == [1]
+    assert saved["foreshadow"]["unresolved_after"] == 1
+    assert "🧵 伏笔：+1 回收 1（未回收 1）" in capsys.readouterr().out
+
+
+def test_write_extract_failure_keeps_progress(tmp_settings, fake_rag, monkeypatch, capsys):
+    """F3/A2/Z8：抽取抛异常 -> 伏笔不变、进度与摘要照常落盘、record 留 error 键。"""
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [{"desc": "怀表停在十点", "chapter": 3}]
+    agent = ForeshadowAgent(fake_rag, RuntimeError("网关 502"))
+    _run_extract(monkeypatch, tmp_settings, agent, wm)
+
+    assert wm.unresolved_foreshadowing == [{"desc": "怀表停在十点", "chapter": 3}]
+    assert wm.resolved_foreshadowing == []
+    assert wm.current_chapter == 5 and wm.last_plot_point == "摘要：风起。"  # A2：进度未被吞
+    assert load_working_memory(tmp_settings).current_chapter == 5            # 且已落盘
+
+    saved = load_run("run_20260828_000001", tmp_settings)
+    assert saved["foreshadow"] == {"error": "网关 502"}          # Z8：分得清「没埋」与「挂了」
+    out = capsys.readouterr().out
+    assert "伏笔抽取跳过：网关 502" in out
+
+
+def test_write_foreshadow_disabled_zero_calls(tmp_settings, fake_rag, monkeypatch):
+    """F12：NOVEL_FORESHADOW=0 -> 零抽取调用，record 不留 foreshadow 键。"""
+    settings = dataclasses.replace(tmp_settings, foreshadow_enabled=False)
+    agent = ForeshadowAgent(fake_rag)
+    _run_extract(monkeypatch, settings, agent, WorkingMemory())
+
+    assert agent.extract_calls == []
+    assert "foreshadow" not in load_run("run_20260828_000001", settings)
+    assert load_working_memory(settings).current_chapter == 5     # 写作主流程不受影响
+
+
+def test_write_same_chapter_rerun_overwrites(tmp_settings, fake_rag, monkeypatch):
+    """F16：同章重写覆盖该章旧条目；manual 人工条目不被清洗。"""
+    wm = WorkingMemory()
+    agent = ForeshadowAgent(fake_rag, {"new": [{"desc": "A"}, {"desc": "B"}], "resolved": []})
+    _run_extract(monkeypatch, tmp_settings, agent, wm)
+    assert [e["desc"] for e in wm.unresolved_foreshadowing] == ["A", "B"]
+    wm.add_foreshadowing("人工补的线", chapter=5, manual=True)
+
+    agent.result = {"new": [{"desc": "A2"}], "resolved": []}       # 重跑第 5 章
+    _run_extract(monkeypatch, tmp_settings, agent, wm)
+    assert [e["desc"] for e in wm.unresolved_foreshadowing] == ["人工补的线", "A2"]
+
+
+def test_write_num_none_keeps_untagged_entries(tmp_settings, fake_rag, monkeypatch):
+    """F16 守卫：任务串解析不出章号（num=None）时不清洗，无章号旧条目不被抹掉。"""
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [{"desc": "旧版字符串数据", "chapter": None}]
+    agent = ForeshadowAgent(fake_rag, {"new": [{"desc": "番外新线"}], "resolved": []})
+    _run_extract(monkeypatch, tmp_settings, agent, wm, task="写一段番外")
+
+    descs = [e["desc"] for e in wm.unresolved_foreshadowing]
+    assert descs == ["旧版字符串数据", "番外新线"]       # 追加，不清洗
+    assert agent.extract_calls[0]["chapter_no"] is None
+
+
+def test_batch_foreshadow_continuity(tmp_settings, fake_rag, monkeypatch):
+    """C1/F2：批量两章走「落盘 -> 再读回」链，第二章抽取输入含第一章新增的伏笔。"""
+    _mk_plan_file(tmp_settings)
+    agent = ForeshadowAgent(fake_rag, {"new": [{"desc": "第一章埋的线"}], "resolved": []})
+    # 同真实 _build_agent：每章重建 agent、wm 重新读盘（非同实例传递）
+    monkeypatch.setattr(
+        cli, "_build_agent",
+        lambda settings, task="", need_style=True: (agent, load_working_memory(settings), None),
+    )
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
+    cli._do_write_batch("写第5-6章", tmp_settings, auto=False)
+
+    assert len(agent.extract_calls) == 2
+    assert agent.extract_calls[0]["descs"] == []                       # 首章清单空
+    assert agent.extract_calls[1]["descs"] == ["第一章埋的线"]           # 章间连续性
+    wm = load_working_memory(tmp_settings)
+    assert [e["chapter"] for e in wm.unresolved_foreshadowing] == [5, 6]  # 埋设章号逐章记录
+
+
+# ---------- 伏笔 REPL 命令（3.1 F9/F10/F15/F17/D6/Z4）----------
+def test_foreshadow_command_lists_and_adds(tmp_settings, capsys):
+    """F9/F10：列表 -> 加（manual 标记 + 落盘）-> 再列表可见。"""
+    cli._do_foreshadow([], tmp_settings)
+    assert "未回收伏笔：无" in capsys.readouterr().out
+
+    cli._do_foreshadow(["加", "抽屉里的怀表停在十点"], tmp_settings)
+    out = capsys.readouterr().out
+    assert "已补录 1 条" in out and "抽屉里的怀表停在十点" in out
+
+    wm = load_working_memory(tmp_settings)
+    assert wm.unresolved_foreshadowing == [
+        {"desc": "抽屉里的怀表停在十点", "chapter": None, "manual": True}  # 首章前 current_chapter 为空
+    ]
+    cli._do_foreshadow([], tmp_settings)
+    listed = capsys.readouterr().out
+    assert "未回收伏笔（共 1 条）：" in listed and "1.抽屉里的怀表停在十点" in listed
+
+
+def test_foreshadow_delete_archives(tmp_settings, capsys):
+    """F15：删 = 出列入归档（不物理删除）；多编号一次给全不错位。"""
+    wm = WorkingMemory()
+    wm.current_chapter = 5
+    wm.unresolved_foreshadowing = [{"desc": f"v{i}", "chapter": i} for i in range(1, 5)]
+    save_working_memory(wm, tmp_settings)
+
+    cli._do_foreshadow(["删", "2", "4"], tmp_settings)
+    assert "已标记回收 2 条" in capsys.readouterr().out
+
+    wm2 = load_working_memory(tmp_settings)
+    assert [e["desc"] for e in wm2.unresolved_foreshadowing] == ["v1", "v3"]  # 一次结算不错位
+    assert [e["desc"] for e in wm2.resolved_foreshadowing] == ["v2", "v4"]
+    assert all(e["resolved_chapter"] == 5 for e in wm2.resolved_foreshadowing)
+
+    cli._do_foreshadow(["已回收"], tmp_settings)
+    out = capsys.readouterr().out
+    assert "已回收伏笔（共 2 条）：" in out and "（第2章埋，第5章收）v2" in out
+
+
+def test_foreshadow_delete_invalid_input(tmp_settings, capsys):
+    """F9 边界：非数字编号与越界编号都不改数据，只提示。"""
+    wm = WorkingMemory()
+    wm.unresolved_foreshadowing = [{"desc": "v1", "chapter": 1}]
+    save_working_memory(wm, tmp_settings)
+
+    cli._do_foreshadow(["删", "abc"], tmp_settings)
+    assert "编号必须是数字" in capsys.readouterr().out
+    cli._do_foreshadow(["删", "99"], tmp_settings)
+    assert "没有有效编号" in capsys.readouterr().out
+    assert load_working_memory(tmp_settings).unresolved_foreshadowing == [
+        {"desc": "v1", "chapter": 1}]
+
+
+def test_foreshadow_command_requires_novel_dir(capsys):
+    """F9：NOVEL_DIR 未配置 -> 报错不崩。"""
+    cli._do_foreshadow([], Settings(ark_api_key="k", repo_root=Path(".")))
+    assert "NOVEL_DIR" in capsys.readouterr().out
+
+
+def test_foreshadow_unknown_subcommand(tmp_settings, capsys):
+    """F9：未知子命令给用法提示，不改数据。"""
+    cli._do_foreshadow(["乱敲"], tmp_settings)
+    assert "未知子命令" in capsys.readouterr().out
+
+
+def test_status_shows_foreshadow_before_first_chapter(tmp_settings, capsys):
+    """F17：首章前（current_chapter 为空）手工补录的伏笔在 `状态` 可见，且无「第None章」噪音。"""
+    wm = WorkingMemory()
+    wm.add_foreshadowing("人工补的线", chapter=None, manual=True)
+    save_working_memory(wm, tmp_settings)
+
+    cli._do_status(tmp_settings)
+    out = capsys.readouterr().out
+    assert "尚未创作任何章节。" in out
+    assert "人工补的线" in out
+    assert "第None章" not in out                 # 只补伏笔块，不打整份 snapshot
+
+
+def test_help_lists_foreshadow_commands(capsys):
+    """F9：help 增行（列表/删/加/已回收）。"""
+    cli._print_help()
+    out = capsys.readouterr().out
+    assert "伏笔             查看未回收伏笔" in out
+    assert "伏笔 删 <编号>" in out and "伏笔 加 <描述>" in out and "伏笔 已回收" in out
+
+
+def test_main_loop_dispatches_foreshadow(tmp_settings, monkeypatch, capsys):
+    """F9：主循环把「伏笔 ...」分发到 _do_foreshadow（args 原样透传）。"""
+    got = []
+    monkeypatch.setattr(cli, "_do_foreshadow", lambda args, settings: got.append(list(args)))
+    replies = iter(["伏笔 加 一条新线", "quit"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(replies))
+    cli.main()
+    assert got == [["加", "一条新线"]]
+
+
+# ---------- 角色弧光抽取回路（3.2 character-arc，C2/C3/C4/C12/C13/C15）----------
+class ArcAgent(_RecordingAgent):
+    """替身 agent：extract_character_arc 按 result 返回或抛错，并记录调用入参。
+
+    继承 _RecordingAgent：run() 收 plan 关键字（批量路径会传）。
+    """
+
+    def __init__(self, rag, result=None):
+        super().__init__(rag)
+        self.result = result if result is not None else {"characters": []}
+        self.extract_calls = []
+
+    def extract_character_arc(self, chapter_text, character_states, chapter_no=None):
+        self.extract_calls.append({
+            "chapter_no": chapter_no,
+            "names": list((character_states or {}).keys()),
+        })
+        if isinstance(self.result, Exception):
+            raise self.result
+        return dict(self.result)
+
+
+def _run_arc(monkeypatch, tmp_settings, agent, wm, task="写第5章：异乡风起"):
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write(task, tmp_settings)
+
+
+def test_write_arc_extracts_and_records(tmp_settings, fake_rag, monkeypatch, capsys):
+    """C2/C4：抽取成功 -> 状态入 wm / record 留痕且落盘可查 / 🎭 行。"""
+    wm = WorkingMemory()
+    agent = ArcAgent(fake_rag, {"characters": [
+        {"name": "林晚", "stage": "复仇决心初动摇", "goal": "查清真相",
+         "conflict": "复仇与良知", "belief": "真相值得代价", "changed": True},
+    ]})
+    _run_arc(monkeypatch, tmp_settings, agent, wm)
+
+    assert agent.extract_calls[0]["chapter_no"] == 5
+    assert agent.extract_calls[0]["names"] == []                  # 首章清单空
+    lin = wm.character_states["林晚"]
+    assert lin["stage"] == "复仇决心初动摇" and lin["chapter"] == 5
+    assert lin["history"] == [{"chapter": 5, "stage": "复仇决心初动摇"}]
+
+    saved = load_run("run_20260828_000001", tmp_settings)          # C4：补写后真读得到
+    assert saved["arc"]["updated"] == ["林晚"]
+    assert saved["arc"]["changed"] == ["林晚"]
+    assert saved["arc"]["total"] == 1
+    assert "🎭 弧光：更新 1 角色（跟踪 1）" in capsys.readouterr().out
+
+
+def test_write_arc_failure_keeps_everything(tmp_settings, fake_rag, monkeypatch, capsys):
+    """C3/Z8：弧光抛异常 -> 状态不变、进度照常落盘、record 留 error 键、主流程走完。"""
+    wm = WorkingMemory()
+    wm.update_character_states(
+        [{"name": "林晚", "stage": "蒙冤受屈", "changed": False}], chapter_no=3)
+    agent = ArcAgent(fake_rag, RuntimeError("网关 502"))
+    _run_arc(monkeypatch, tmp_settings, agent, wm)
+
+    assert wm.character_states["林晚"]["stage"] == "蒙冤受屈"      # 状态未被吞
+    assert wm.current_chapter == 5 and wm.last_plot_point == "摘要：风起。"
+    assert load_working_memory(tmp_settings).current_chapter == 5  # 且已落盘
+
+    saved = load_run("run_20260828_000001", tmp_settings)
+    assert saved["arc"] == {"error": "网关 502"}                   # Z8：分得清「没动」与「挂了」
+    out = capsys.readouterr().out
+    assert "弧光抽取跳过：网关 502" in out
+    assert "章节已存" in out                                       # 写作主流程不受影响
+
+
+def test_write_arc_failure_does_not_break_foreshadow(tmp_settings, fake_rag, monkeypatch, capsys):
+    """C3：两回路独立 try/except--弧光挂了，伏笔照常抽取且落盘。"""
+    wm = WorkingMemory()
+
+    class BothAgent(ArcAgent):
+        def __init__(self, rag):
+            super().__init__(rag, RuntimeError("弧光挂了"))
+            self.fo_calls = []
+
+        def extract_foreshadowing(self, chapter_text, unresolved, chapter_no=None):
+            self.fo_calls.append(chapter_no)
+            return {"new": [{"desc": "怀表"}], "resolved": []}
+
+    agent = BothAgent(fake_rag)
+    _run_arc(monkeypatch, tmp_settings, agent, wm)
+
+    assert agent.fo_calls == [5]                                  # 伏笔照常
+    assert [e["desc"] for e in wm.unresolved_foreshadowing] == ["怀表"]
+    saved = load_run("run_20260828_000001", tmp_settings)
+    assert "foreshadow" in saved and saved["arc"] == {"error": "弧光挂了"}
+
+
+def test_write_arc_disabled_zero_calls(tmp_settings, fake_rag, monkeypatch):
+    """C12：NOVEL_ARC=0 -> 零抽取调用，record 不留 arc 键。"""
+    settings = dataclasses.replace(tmp_settings, arc_enabled=False)
+    agent = ArcAgent(fake_rag)
+    _run_arc(monkeypatch, settings, agent, WorkingMemory())
+
+    assert agent.extract_calls == []
+    assert "arc" not in load_run("run_20260828_000001", settings)
+    assert load_working_memory(settings).current_chapter == 5      # 写作主流程不受影响
+
+
+def test_write_arc_same_chapter_rerun_overwrites(tmp_settings, fake_rag, monkeypatch):
+    """C15：同章重写覆盖该章旧 history 条目，不产生「同一章两个阶段」。"""
+    wm = WorkingMemory()
+    agent = ArcAgent(fake_rag, {"characters": [
+        {"name": "林晚", "stage": "阶段A", "changed": True}]})
+    _run_arc(monkeypatch, tmp_settings, agent, wm)
+    agent.result = {"characters": [
+        {"name": "林晚", "stage": "阶段A2", "changed": True}]}     # 重跑第 5 章
+    _run_arc(monkeypatch, tmp_settings, agent, wm)
+
+    lin = wm.character_states["林晚"]
+    assert [h["chapter"] for h in lin["history"]] == [5]           # 无重复条目
+    assert lin["history"][0]["stage"] == "阶段A2"
+    assert lin["stage"] == "阶段A2"
+
+
+def test_write_arc_num_none_keeps_untagged_history(tmp_settings, fake_rag, monkeypatch):
+    """C15 守卫：任务串解析不出章号（num=None）时不清洗，无章号 history 不被抹掉。"""
+    wm = WorkingMemory()
+    wm.update_character_states(
+        [{"name": "林晚", "stage": "番外态", "changed": True}], chapter_no=None)
+    agent = ArcAgent(fake_rag, {"characters": [
+        {"name": "林晚", "stage": "番外态2", "changed": True}]})
+    _run_arc(monkeypatch, tmp_settings, agent, wm, task="写一段番外")
+
+    history = wm.character_states["林晚"]["history"]
+    assert [h["stage"] for h in history] == ["番外态", "番外态2"]  # 追加，不清洗
+    assert agent.extract_calls[0]["chapter_no"] is None
+
+
+def test_batch_arc_continuity(tmp_settings, fake_rag, monkeypatch):
+    """C2：批量两章走「落盘 -> 再读回」链，第二章抽取输入含第一章的角色状态。"""
+    _mk_plan_file(tmp_settings)
+    agent = ArcAgent(fake_rag, {"characters": [
+        {"name": "林晚", "stage": "蒙冤受屈", "changed": True}]})
+    monkeypatch.setattr(
+        cli, "_build_agent",
+        lambda settings, task="", need_style=True: (agent, load_working_memory(settings), None),
+    )
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
+    cli._do_write_batch("写第5-6章", tmp_settings, auto=False)
+
+    assert len(agent.extract_calls) == 2
+    assert agent.extract_calls[0]["names"] == []                   # 首章清单空
+    assert agent.extract_calls[1]["names"] == ["林晚"]             # 章间连续性
+    wm = load_working_memory(tmp_settings)
+    assert wm.character_states["林晚"]["chapter"] == 6             # 状态推进到第二章
+
+
+# ---------- 角色 REPL 命令（3.2 C9/C10/D9/Z4）----------
+def test_character_command_lists(tmp_settings, capsys):
+    """C9：列表形态（空提示 / 非空全量含目标冲突信念与历史）。"""
+    cli._do_character([], tmp_settings)
+    assert "跟踪角色：无" in capsys.readouterr().out
+
+    wm = WorkingMemory()
+    wm.update_character_states(
+        [{"name": "林晚", "stage": "蒙冤受屈", "goal": "活下去",
+          "conflict": "复仇与良知", "belief": "天理昭昭", "changed": True}], chapter_no=3)
+    save_working_memory(wm, tmp_settings)
+    cli._do_character([], tmp_settings)
+    out = capsys.readouterr().out
+    assert "跟踪角色（共 1 个）：" in out
+    assert "林晚（第3章）：蒙冤受屈" in out
+    assert "目标：活下去｜冲突：复仇与良知｜信念：天理昭昭" in out
+    assert "历史变化 1 次：蒙冤受屈" in out
+
+
+def test_character_delete_removes(tmp_settings, capsys):
+    """C9/Z4：删 = 直接移除（不归档）；未命中提示不改数据。"""
+    wm = WorkingMemory()
+    wm.update_character_states(
+        [{"name": "林晚", "stage": "蒙冤受屈", "changed": False}], chapter_no=3)
+    save_working_memory(wm, tmp_settings)
+
+    cli._do_character(["删", "林晚"], tmp_settings)
+    assert "已停止跟踪：林晚" in capsys.readouterr().out
+    assert load_working_memory(tmp_settings).character_states == {}
+
+    cli._do_character(["删", "查无此人"], tmp_settings)
+    assert "没有这个角色" in capsys.readouterr().out
+
+
+def test_character_revise_persists(tmp_settings, capsys):
+    """C10：改 = 修正 stage 且落盘 roundtrip；未命中提示。"""
+    wm = WorkingMemory()
+    wm.current_chapter = 5
+    wm.update_character_states(
+        [{"name": "林晚", "stage": "蒙冤受屈", "goal": "活下去",
+          "conflict": "", "belief": "天理昭昭", "changed": True}], chapter_no=3)
+    save_working_memory(wm, tmp_settings)
+
+    cli._do_character(["改", "林晚", "复仇决心已崩溃"], tmp_settings)
+    assert "已修正 林晚 的当前阶段" in capsys.readouterr().out
+    wm2 = load_working_memory(tmp_settings)
+    assert wm2.character_states["林晚"]["stage"] == "复仇决心已崩溃"
+    assert wm2.character_states["林晚"]["chapter"] == 5           # 更新章取当前章
+    assert wm2.character_states["林晚"]["goal"] == "活下去"        # 其余字段保留
+
+    cli._do_character(["改", "查无此人", "新阶段"], tmp_settings)
+    assert "没有这个角色" in capsys.readouterr().out
+    cli._do_character(["改"], tmp_settings)
+    assert "用法" in capsys.readouterr().out
+
+
+def test_character_command_requires_novel_dir(capsys):
+    """C9：NOVEL_DIR 未配置 -> 报错不崩。"""
+    cli._do_character([], Settings(ark_api_key="k", repo_root=Path(".")))
+    assert "NOVEL_DIR" in capsys.readouterr().out
+
+
+def test_character_unknown_subcommand(tmp_settings, capsys):
+    """C9：未知子命令给用法提示，不改数据。"""
+    cli._do_character(["乱敲"], tmp_settings)
+    assert "未知子命令" in capsys.readouterr().out
+
+
+def test_help_lists_character_commands(capsys):
+    """C9：help 增行（列表/删/改）。"""
+    cli._print_help()
+    out = capsys.readouterr().out
+    assert "角色             查看跟踪角色" in out
+    assert "角色 删 <名字>" in out and "角色 改 <名字> <新阶段>" in out
+
+
+def test_main_loop_dispatches_character(tmp_settings, monkeypatch, capsys):
+    """C9：主循环把「角色 ...」分发到 _do_character（args 原样透传）。"""
+    got = []
+    monkeypatch.setattr(cli, "_do_character", lambda args, settings: got.append(list(args)))
+    replies = iter(["角色 改 林晚 复仇决心已崩溃", "quit"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(replies))
+    cli.main()
+    assert got == [["改", "林晚", "复仇决心已崩溃"]]
+
+
+# ---------- 卷对齐落盘集成（volume-align，V1/V3/V8）----------
+def _vol_align_settings(tmp_settings):
+    """卷对齐集成配置：subdir 指到第一卷目录。"""
+    return dataclasses.replace(tmp_settings, volume_align=True, chapter_subdir="正文/第一卷")
+
+
+def test_write_volume_align_lands_in_volume(tmp_settings, fake_rag, monkeypatch):
+    """V1：对齐模式下章节落卷路径、头行 ## 第{中文}章、RAG 入库收卷路径。"""
+    settings = _vol_align_settings(tmp_settings)
+    agent = WriteAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第38章：空", settings)
+
+    vol_file = settings.novel_path / "正文" / "第一卷" / "第一卷-38.md"
+    assert vol_file.exists()
+    assert vol_file.read_text(encoding="utf-8").startswith("## 第三十八章 空\n\n")
+    assert fake_rag.add_calls == [str(vol_file)]        # V8：入库路径随落盘走
+
+
+def test_write_volume_align_overwrites_original(tmp_settings, fake_rag, monkeypatch):
+    """V3：预置人工原稿被同文件覆盖（git diff 即比对），目录内仅 1 个 md。"""
+    settings = _vol_align_settings(tmp_settings)
+    vol_dir = settings.novel_path / "正文" / "第一卷"
+    vol_dir.mkdir(parents=True, exist_ok=True)
+    original = vol_dir / "第一卷-38.md"
+    original.write_text("## 第三十八章 空\n\n人工原稿正文。", encoding="utf-8")
+
+    agent = WriteAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第38章：空", settings)
+
+    text = original.read_text(encoding="utf-8")
+    assert text.startswith("## 第三十八章 空\n\n")     # 头行格式保持
+    assert "人工原稿正文。" not in text                  # 原稿被覆盖
+    assert "风起了。" in text                            # AI 定稿已写入
+    assert len(list(vol_dir.glob("*.md"))) == 1          # 无 run_id 后缀副本
+
+
+# ---------- planner 集成（3.3 P1/P4/P11/P12）----------
+class PlannerAgent(WriteAgent):
+    """替身 agent：run() 模拟 planner 开启时的行为（steps[0]=planner、outline=节拍）。"""
+
+    BEATS = "【场景序列】\n1. 山道/黄昏/相遇/克制/600字\n【结尾钩子】灯亮了"
+
+    def run(self, task, run_id=None, temperature=0.9, plan=""):
+        state, record = super().run(task, run_id, temperature)
+        state.outline = self.BEATS
+        record["steps"] = [{"step_id": 1, "agent": "planner", "round": 1,
+                            "input_state": {}, "output_state": {"outline": self.BEATS},
+                            "decision": "writer"}]
+        record["final_state"] = {"outline": self.BEATS}
+        return state, record
+
+
+def test_write_planner_on_full_chain(tmp_settings, fake_rag, monkeypatch, capsys):
+    """P1/P6 集成：planner 开启时 run record 首步是 planner、节拍进 final_state。"""
+    settings = dataclasses.replace(tmp_settings, planner_enabled=True)
+    agent = PlannerAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", settings)
+
+    from novel_agent.storage import load_run
+    record = load_run("run_20260828_000001", settings)
+    assert record["steps"][0]["agent"] == "planner"
+    assert record["final_state"]["outline"] == PlannerAgent.BEATS
+    out = capsys.readouterr().out
+    assert "章节已存" in out                                # 写作流程照常走完
+
+
+def test_write_planner_off_no_planner_step(tmp_settings, fake_rag, monkeypatch):
+    """P4 集成：默认关时 run record 无 planner 步骤（现状零变化）。"""
+    agent = WriteAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", tmp_settings)
+
+    from novel_agent.storage import load_run
+    record = load_run("run_20260828_000001", tmp_settings)
+    assert all(s.get("agent") != "planner" for s in record["steps"])
+
+
+def test_batch_budget_text_planner_on_off(tmp_settings, fake_rag, monkeypatch, capsys):
+    """P11/Z2：批量预算文案按开关二态（off 8-11 / on 9-12）。"""
+    _mk_plan_file(tmp_settings)
+    agent = _RecordingAgent(fake_rag)
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
+
+    cli._do_write_batch("写第5-6章", tmp_settings, auto=False)
+    assert "8-11 次" in capsys.readouterr().out            # 默认关：既有口径
+
+    settings_on = dataclasses.replace(tmp_settings, planner_enabled=True)
+    cli._do_write_batch("写第5-6章", settings_on, auto=False)
+    assert "9-12 次" in capsys.readouterr().out            # 开：口径诚实
+
+
+def test_status_shows_planner_switch(tmp_settings, capsys):
+    """P12：状态命令显示 planner 开关行（两态）。"""
+    cli._do_status(tmp_settings)
+    assert "planner：关" in capsys.readouterr().out
+
+    settings_on = dataclasses.replace(tmp_settings, planner_enabled=True)
+    cli._do_status(settings_on)
+    assert "planner：开" in capsys.readouterr().out

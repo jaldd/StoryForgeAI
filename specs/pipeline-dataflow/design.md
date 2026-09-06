@@ -64,8 +64,8 @@
 
 以下两点在 grep 复核后与任务描述原文有出入，按代码现状为准：
 
-1. **「状态机从不路由到 director」不成立**。`state.py:30` 默认 `next_agent="director"` 且 `run()` 不覆写，`_run_loop`（`agent.py:380-387`）按 `agents_map.get(state.next_agent)` 取到 `_director`——即 **run() 每次必经 director**（ROADMAP:96 的「refine/rewrite 早已绕开它」才是准确表述：refine 在 `agent.py:459` 显式置 `"polisher"`，rewrite 在 `agent.py:494` 显式置 `"writer"`）。影响：删除后 run 的 steps 数 4→3，`test_agent.py:59`（`== 4`）与 `test_agent.py:94`（`== 7`）的断言、`test_state.py:10`（`== "director"`）必须同步修改。
-2. **「前情摘要只给 writer/polisher」不成立**。`_working_context()` 唯一调用点是 `_writer`（`agent.py:220`）——polisher 拿到的只是 `_retrieve(with_prior=True)` 的 RAG 前文片段（`agent.py:191-196`），**没有**工作记忆快照。故本 feature 除给 reviewer 注入外，顺带把 polisher 也补上（ROADMAP:104 只点名 reviewer，polisher 属设计外延，见 D8 的注入范围决策）。
+1. **「状态机从不路由到 director」不成立**。`state.py:30` 默认 `next_agent="director"` 且 `run()` 不覆写，`_run_loop`（`agent.py:380-387`）按 `agents_map.get(state.next_agent)` 取到 `_director`——即 **run() 每次必经 director**（早期规划的「refine/rewrite 早已绕开它」才是准确表述：refine 在 `agent.py:459` 显式置 `"polisher"`，rewrite 在 `agent.py:494` 显式置 `"writer"`）。影响：删除后 run 的 steps 数 4→3，`test_agent.py:59`（`== 4`）与 `test_agent.py:94`（`== 7`）的断言、`test_state.py:10`（`== "director"`）必须同步修改。
+2. **「前情摘要只给 writer/polisher」不成立**。`_working_context()` 唯一调用点是 `_writer`（`agent.py:220`）——polisher 拿到的只是 `_retrieve(with_prior=True)` 的 RAG 前文片段（`agent.py:191-196`），**没有**工作记忆快照。故本 feature 除给 reviewer 注入外，顺带把 polisher 也补上（早期规划只点名 reviewer，polisher 属设计外延，见 D8 的注入范围决策）。
 
 ## 2. 改法设计
 
@@ -127,9 +127,9 @@ if state.outline:
     outline_hint = f"\n\n【writer 构思（验收基准：请审查正文是否实现了该构思）】\n{state.outline}"
 ```
 
-**进 run record**：零额外代码。`_record` 的 steps 快照用 `asdict(after)`（`agent.py:393-403`），新字段自动进入每步 `output_state` 与 `final_state`。ROADMAP 验收「run 日志含 writer 构思」由此满足；`harness.replay` 展示构思为 P1 可选增强（追加行，见非目标 9）。
+**进 run record**：零额外代码。`_record` 的 steps 快照用 `asdict(after)`（`agent.py:393-403`），新字段自动进入每步 `output_state` 与 `final_state`。早期规划验收「run 日志含 writer 构思」由此满足；`harness.replay` 展示构思为 P1 可选增强（追加行，见非目标 9）。
 
-**字段命名依据**：ROADMAP:198「构思（0.8 已保留传递）从 writer 前移到 planner」——`outline` 与 3.3 planner 的「节拍/大纲」语义直接衔接，未来前移即把 writer 的产出挂到 planner 角色上，字段无需改名。备选名对比见 D1。
+**字段命名依据**：早期规划「构思（0.8 已保留传递）从 writer 前移到 planner」——`outline` 与 3.3 planner 的「节拍/大纲」语义直接衔接，未来前移即把 writer 的产出挂到 planner 角色上，字段无需改名。备选名对比见 D1。
 
 ### 2.3 断点三：reviewer 前情注入
 
@@ -143,14 +143,14 @@ system = reviewer_system(...) + self._working_context()
 
 **注入范围论证（为什么是快照而不是 RAG 前文，D3）**：
 
-1. **ROADMAP 明示**（ROADMAP:104）：「reviewer 注入 `_working_context()`（伏笔/时间线维度有数据可查）」。
+1. **早期规划明示**（早期规划）：「reviewer 注入 `_working_context()`（伏笔/时间线维度有数据可查）」。
 2. **对位性**：reviewer 的痛点维度是「伏笔一致性/时间线一致性」（`prompts.py:139/141`），`WorkingMemory.snapshot()`（`memory.py:61-68`）恰好是结构化四元组（当前进度/最近剧情/角色状态/**未回收伏笔**）——直接对位。
 3. **噪声与成本**：`_retrieve(with_prior=True)` 的前文是 top_k=3 的散文片段（`agent.py:191-196`），且与「必须遵守的设定」混在同一段检索结果里；给「挑错者」喂参考性散文反而稀释审查注意力，还把 reviewer 单次调用 token 翻倍。
 4. **职责边界**：reviewer 的本职是审稿不是复读前文；连续性判断需要的是状态事实（快照），不是原文重读。
 
 故 `with_prior` 保持 `False`（`agent.py:338` 不动，A11），reviewer 的前情来源 = 工作记忆快照 + 构思（A8）。
 
-**polisher 同样注入快照**（D8 已拍板；ROADMAP:104 只点名 reviewer，属设计外延）：改法同 reviewer，system 构造处 `+ self._working_context()`。理由：polisher 的铁律「严禁改动剧情/伏笔」（`prompts.py:125`）同样需要伏笔清单支撑；成本为零——同一段快照字符串拼接。
+**polisher 同样注入快照**（D8 已拍板；早期规划只点名 reviewer，属设计外延）：改法同 reviewer，system 构造处 `+ self._working_context()`。理由：polisher 的铁律「严禁改动剧情/伏笔」（`prompts.py:125`）同样需要伏笔清单支撑；成本为零——同一段快照字符串拼接。
 
 ### 2.4 断点四：长度控制归一
 
@@ -312,7 +312,7 @@ if num is not None and summary and (wm.current_chapter is None or num >= wm.curr
 
 ## 6. 最大风险：长度目标 vs 推理模型 token 预算（D5 关联）
 
-`target_words=1500`（默认）进 prompt 后，若模型顺从，writer 单次需产出 1500 中文字 ≈ 1500-2200 输出 token（glm 分词器中文约 1-1.5 token/字）；glm-5.2 是推理模型（宪法 §4），`max_tokens=4096` **含内部推理预算**——推理消耗数百至千余 token 后，正文预算贴边。ROADMAP:108 的端到端验收「可配出 2000+ 字章节」更紧（2000+ 字 ≈ 2500-3000 token 正文 + 推理）。
+`target_words=1500`（默认）进 prompt 后，若模型顺从，writer 单次需产出 1500 中文字 ≈ 1500-2200 输出 token（glm 分词器中文约 1-1.5 token/字）；glm-5.2 是推理模型（宪法 §4），`max_tokens=4096` **含内部推理预算**——推理消耗数百至千余 token 后，正文预算贴边。早期规划的端到端验收「可配出 2000+ 字章节」更紧（2000+ 字 ≈ 2500-3000 token 正文 + 推理）。
 
 **缓解与边界**：
 1. 本 feature **不动 4096**（宪法 §4 规定值，且调大属运行时调参、不涉换栈，留给实测后按需调整——记录在案但不预置）。
@@ -324,14 +324,14 @@ if num is not None and summary and (wm.current_chapter is None or num >= wm.curr
 
 | # | 决策 | 选项 | 推荐 | 理由 |
 |---|---|---|---|---|
-| D1 | 构思字段命名 | a) `outline` b) `concept` c) `premise` | **a** | 与 ROADMAP 3.3「构思前移到 planner 产节拍」语义衔接，未来前移零改名；`concept` 过泛、`premise` 偏前提设定 |
+| D1 | 构思字段命名 | a) `outline` b) `concept` c) `premise` | **a** | 与阶段 3.3 规划「构思前移到 planner 产节拍」语义衔接，未来前移零改名；`concept` 过泛、`premise` 偏前提设定 |
 | D2 | 构思解析实现位置 | a) `agent.py` 模块级纯函数 `_split_writer_output` b) 内联在 `_writer` c) 挂 `state.py` 作 dataclass 方法 | **a** | 同 `_strip_polisher_meta` 先例（`agent.py:101`）；纯函数直测，不引入状态依赖 |
-| D3 | reviewer 前情注入量 | a) 仅 `_working_context()` 快照 b) 快照 + RAG 前文（`with_prior=True`） c) 全量正文 | **a** | ROADMAP:104 明示；快照与伏笔/时间线维度直接对位；b 的散文片段稀释审查注意力且 token 翻倍（§2.3 论证） |
+| D3 | reviewer 前情注入量 | a) 仅 `_working_context()` 快照 b) 快照 + RAG 前文（`with_prior=True`） c) 全量正文 | **a** | 早期规划明示；快照与伏笔/时间线维度直接对位；b 的散文片段稀释审查注意力且 token 翻倍（§2.3 论证） |
 | D4 | 长度配置项名与默认值 | a) `Settings.target_words=1500` + env `NOVEL_TARGET_WORDS` b) `chapter_words` + `NOVEL_CHAPTER_WORDS` | **a** | 接活 `polisher_system` 既有死参数名（`prompts.py:119`），一词贯通配置/参数/prompt；1500 承接死参数默认，行为零跳变 |
 | D5 | `NOVEL_TARGET_WORDS` 非法值处理 | a) `int()` 直转，启动 fail-fast b) 容错回落 1500 并告警 | **a** | 配置错误显式暴露优于静默降级；现有 `get_settings` 无容错先例，保持一致（备注：本项风险见 §6） |
 | D6 | 摘要方法命名与异常策略 | a) `summarize_chapter(text, max_tokens=1024)`，不吞异常，兜底留 cli b) 方法内吞异常返回空串 | **a** | agent 方法薄、可测（FakeLLM 断言 system/参数）；UI 兜底策略属 cli 职责（现状 `cli.py:140-142` 行为保持，A17） |
 | D7 | 构思注入 prompt 的位置（polisher/reviewer 侧） | a) user 消息尾部（feedback_hint 同款） b) system prompt 拼接 | **a** | 构思是每次运行的动态数据，user 侧语义自然；且 FakeLLM 的 `calls` 只记录 user（`conftest.py:28`），测试断言最直接 |
-| D8 | polisher 是否也注入工作记忆快照 | a) 注入（同 reviewer） b) 不注入（严格按 ROADMAP 字面，只改 reviewer） | **a**（已拍板） | polisher 铁律「严禁改动剧情/伏笔」（`prompts.py:125`）同样需要伏笔清单支撑；成本为零（同一段快照字符串）。但 ROADMAP:104 未点名 polisher，属设计外延，2026-08-28 拍板：注入 |
+| D8 | polisher 是否也注入工作记忆快照 | a) 注入（同 reviewer） b) 不注入（严格按早期规划字面，只改 reviewer） | **a**（已拍板） | polisher 铁律「严禁改动剧情/伏笔」（`prompts.py:125`）同样需要伏笔清单支撑；成本为零（同一段快照字符串）。但早期规划未点名 polisher，属设计外延，2026-08-28 拍板：注入 |
 | D9 | P1 精修旧章的进度指针语义 | a) `update_after_write` 直接覆盖（精修第 3 章会把 `current_chapter` 从 5 回退到 3） b) 仅 `current_chapter is None or num >= current_chapter` 时更新 c) 只刷 `last_plot_point` 不动 `current_chapter` | **b**（已拍板） | a 会误导 writer 的「当前进度」显示；c 需要绕过 `update_after_write` 的封装，破坏 memory 接口；b 一行判断即可，语义为「精修不回退进度，但刷新最新章摘要」 |
 
 > 以上推荐为实现缺省取向。**2026-08-28 复核拍板：D1-D9 全部按推荐项执行**（D8=polisher 注入快照；D9=b，且边界条件须按 §2.6 代码块写全 `current_chapter is None or num >= current_chapter`，因 `current_chapter` 初始为 `None`（`memory.py:44`），裸 `>=` 在首章会 TypeError，属复核发现的硬伤）。实现时如与拍板结果不一致，回改本表。

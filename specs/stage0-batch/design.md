@@ -129,7 +129,7 @@ def exemplar_info(path) -> Tuple[int, int]   # (文件数, 总字数)，供状�
 ```
 
 - 不依赖 config（宪法 §5：prompts 模块保持独立可单测）。
-- 截断按**文件序**（不抽样）：排序靠前的基准文件优先保住，与 ROADMAP「按顺序截断」一致。
+- 截断按**文件序**（不抽样）：排序靠前的基准文件优先保住，与早期规划「按顺序截断」一致。
 
 ### 5.3 cli.py
 
@@ -164,11 +164,11 @@ def exemplar_info(path) -> Tuple[int, int]   # (文件数, 总字数)，供状�
 | D3 | 铁律空时不输出占位块 | 与 `_instruction_block` 一致；避免空铁律文件产生噪音 prompt |
 | D4 | exemplar 上限用字符数近似 token | 不引入 tokenizer 依赖（§2 无新依赖）；30000 字对 glm-5.2 上下文安全 |
 | D5 | manifest 放 chroma_path 下 | 与向量库同生命周期、同备份单元；NOVEL_CHROMA_DIR 可整体迁移 |
-| D6 | 「约200字」不收编 | 任务边界明确：长度控制归 ROADMAP 0.8 |
+| D6 | 「约200字」不收编 | 任务边界明确：长度控制归阶段 0.8 规划 |
 
 ## 8. 开放问题（记录上报，不在本批处理）
 
-1. `harness.py` `run_tests` 硬编码人物名规则断言（产品代码含具体小说男主名），同类宪法 §1 问题，归 ROADMAP 1.2 词表外置。
+1. `harness.py` `run_tests` 硬编码人物名规则断言（产品代码含具体小说男主名），同类宪法 §1 问题，归阶段 1.2 规划词表外置。
 2. SKILL.md 称文风基准有 14 个文件，当前工作副本无 `.env`/真实 NOVEL_DIR 无法核实；0.5 按「多文件可能存在」的目录级设计（天然兼容 1 或 N 个）。
 3. 存量失败 3 个（`test_strip_polisher_meta` 的 `---` 分隔语义、`test_runtime_dir_override` 的 Windows 绝对路径解析、`test_defaults` 的 `max_reviews` 期望值 2 vs 6）与本批无关，不修。
 4. `parse_review` 返回类型变更（`Optional[bool]`）是**有意的行为变更**：`test_parse_review_fallback_true` 期望值需同步更新（旧期望「默认通过」正是本项要消灭的行为）。

@@ -20,6 +20,8 @@ __all__ = [
     "load_recent_human",
     "EXEMPLAR_ROUTER_SYSTEM",
     "exemplar_router_user",
+    "planner_system",
+    "planner_user",
     "writer_system",
     "polisher_system",
     "reviewer_system",
@@ -32,6 +34,10 @@ __all__ = [
     "PLOT_SUMMARY_SYSTEM",
     "COMPARE_SYSTEM",
     "SUMMARIZER_SYSTEM",
+    "FORESHADOW_SYSTEM",
+    "foreshadow_user",
+    "ARC_SYSTEM",
+    "arc_user",
     "PARTIAL_REFINE_SUFFIX",
     "partial_refine_user",
 ]
@@ -275,6 +281,60 @@ def _recent_human_block(recent_human: str) -> str:
 
 
 # ---------- 各 Agent 的 system prompt ----------
+def planner_system(
+    novel_name: str,
+    retrieved: str,
+    instruction: str = "",
+    rules: str = "",
+) -> str:
+    """规划师 system（3.3 planner，D5 走 writer_llm；节拍不学文风，不含 exemplar/recent_human）。"""
+    return f"""你是小说《{novel_name}》的章节规划师。
+职责：写作前把章纲要点、未回收伏笔、角色当前弧光阶段、目标字数汇合成一份本章节拍表——
+writer 按它写正文，reviewer 拿它当验收基准。
+{_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
+【节拍表要求】
+1. 具体可执行，不写空话（「情绪升温」不算节拍，「云依第一次主动打断他说话」才算）
+2. 场景与事件不得违背设定、铁律与既有伏笔
+3. 伏笔操作要指名道姓：收哪条旧伏笔（引用工作记忆中的描述）、埋什么新伏笔
+4. 角色弧光推进要写清「谁从什么阶段到什么阶段」
+只输出节拍表本身，不要写正文，不要解释规划过程。"""
+
+
+def planner_user(
+    task: str,
+    plan: str,
+    target_words: int,
+    source_content: str = "",
+) -> str:
+    """规划 user 消息：任务 + 章纲（如有）+ 四要素清单（纯函数）。
+
+    source_content 非空 = rewrite 路径（T8，D9）：节拍基于原文结构
+    （场景提取 -> 重排/增强），不从零规划；为空时输出与 T8 前逐字节一致。
+    """
+    plan_block = f"\n【本章章纲要点】（节拍必须覆盖这些要点）\n{plan}\n" if plan.strip() else ""
+    if source_content.strip():
+        source_block = f"\n【原文（重写参考，节拍的结构基础）】\n{source_content}\n"
+        mode_block = (
+            "\n这是重写任务：节拍必须基于原文结构，不要从零规划——"
+            "\n先提取原文的场景序列，再逐场景标注处理方式（保留/重排/合并/增强/删除），"
+            "\n保留原文核心意图与既有伏笔的埋设状态。"
+        )
+    else:
+        source_block = ""
+        mode_block = ""
+    return (
+        f"【本章写作任务】\n{task}\n"
+        f"{plan_block}{source_block}"
+        f"\n【目标字数】约{target_words}字\n"
+        f"{mode_block}"
+        "\n请产出本章节拍表，必含四要素："
+        "\n1. 场景序列：每场景一行（地点/时间/事件/情绪/字数分配，合计贴近目标字数）"
+        "\n2. 伏笔操作：收哪些旧伏笔 + 埋什么新伏笔（无则写「本章无伏笔操作」）"
+        "\n3. 角色弧光推进：谁从什么阶段到什么阶段（无则写「本章弧光无推进」）"
+        "\n4. 结尾钩子：本章结尾留什么悬念/余韵"
+    )
+
+
 def writer_system(
     novel_name: str,
     retrieved: str,
@@ -445,6 +505,70 @@ SUMMARIZER_SYSTEM = "把下面的对话压成 3 句话摘要，只留对小说�
 PLOT_SUMMARY_SYSTEM = (
     "把下面的小说章节压成 1-2 句话剧情摘要，只记关键情节与情绪落点，不要评价、不要复述全文。"
 )
+
+
+# ---------- 伏笔抽取 prompt（3.1 foreshadow，D1 单次调用双职 / D2 编号协议） ----------
+# 不硬编码书名（宪法 §1）：只描述任务，小说名由写作侧 prompt 负责。
+FORESHADOW_SYSTEM = """你是小说的伏笔审计员。读完一章正文，找出本章新埋下的伏笔，并判断既有清单里哪些伏笔已被本章回收。
+
+规则：
+1. 新伏笔必须自包含：一句话说清「什么线索 + 为什么悬而未决」，脱离本章也能看懂
+2. 清单里已有的不要重复报（换个说法也算重复）
+3. 单章新增不超过 5 条；宁缺毋滥--普通环境描写、人物日常不是伏笔
+4. 只有明确「埋下、尚未兑现」的才算伏笔；本章当场解释清楚的不要记
+5. 回收判定从严：本章正文明确揭晓/兑现了才算回收，仅仅提到不算
+6. 既有清单为空时照常返回本章新埋的伏笔，不要因为清单空就返回空
+
+只返回纯 JSON，不要 markdown 包裹、不要加任何其他文字：
+{"new": [{"desc": "一句话自包含描述"}, ...], "resolved": [2, 5]}
+resolved 只填清单编号（整数），不要填描述文字；没有新伏笔或没有回收时给空数组。
+"""
+
+
+def foreshadow_user(chapter_text: str, unresolved_lines: List[str]) -> str:
+    """抽取 user 消息：带编号的既有伏笔清单 + 本章正文（纯函数）。
+
+    unresolved_lines 由调用方按列表序生成（编号 1 起，与 resolved 回报协议同源）。
+    """
+    lines = "\n".join(unresolved_lines) if unresolved_lines else "（无）"
+    return (
+        f"【既有未回收伏笔清单】\n{lines}\n\n"
+        f"【本章正文】\n{chapter_text}\n\n"
+        "请返回本章新埋的伏笔，以及清单里已被本章回收的伏笔编号。"
+    )
+
+
+# ---------- 角色弧光抽取 prompt（3.2 character-arc，D1 单次调用三职 / D2 名字协议） ----------
+# 不硬编码书名（宪法 §1）：只描述任务，小说名由写作侧 prompt 负责。
+ARC_SYSTEM = """你是小说的角色弧光审计员。读完一章正文，更新出场主要角色的弧光状态。
+
+规则：
+1. 以本章正文结束时角色的状态为准（不是本章开始时）
+2. 清单里已有的角色必须用清单原名回报，不要用别名/昵称（防同一角色分裂成两条）
+3. 清单外的新角色用正文中的正式全名
+4. stage 必须自包含：一句话说清角色当前的心理/立场状态，脱离上下文也能看懂
+5. 单章回报不超过 6 个主要角色；只报对剧情有作用的角色，纯龙套不报
+6. changed 只在阶段发生实质变化时为 true（目标转移、信念动摇、立场反转等）；措辞微调、信息量增加但立场未变都算 false
+7. 既有清单为空时照常返回本章出场的主要角色，不要因为清单空就返回空
+
+只返回纯 JSON，不要 markdown 包裹、不要加任何其他文字：
+{"characters": [{"name": "角色名", "stage": "一句话自包含阶段", "goal": "当前目标", "conflict": "当前核心冲突", "belief": "当前信念", "changed": true}, ...]}
+本章没有可报角色时给空数组。
+"""
+
+
+def arc_user(chapter_text: str, character_lines: List[str]) -> str:
+    """弧光抽取 user 消息：既有角色状态清单 + 本章正文（纯函数）。
+
+    character_lines 由调用方从 wm.character_states 生成（名字与 dict 键逐字一致，
+    D2 名字口径三处同源：清单渲染/覆盖判定/`角色` 命令显示）。
+    """
+    lines = "\n".join(character_lines) if character_lines else "（无）"
+    return (
+        f"【既有角色弧光清单】\n{lines}\n\n"
+        f"【本章正文】\n{chapter_text}\n\n"
+        "请返回出场主要角色本章结束时的弧光状态。"
+    )
 
 
 # ---------- 版本对比 prompt（0.8 从 cli._is_better 收编） ----------

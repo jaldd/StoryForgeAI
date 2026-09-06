@@ -3,6 +3,12 @@
 > 对应需求：`requirements.md`（B1-B20）；详细设计：`design.md`（D1-D8/Z1-Z6）。
 > 开工前状态：`quality-gate` T1-T11 已完成（本 feature 消费其 checker/ai_flavor_score/回填管线）。
 > 回归基线：`cli/` 下 `python -m pytest tests/ -q` = 362 passed / 0 failed / 1 deselected，零新增。
+> 真车验收（2026-09-06）：**1.6 去AI 全链路通过**——`去AI 第一卷-58.md`：
+> 定位 1 项可定位问题（黑名单「淡淡的」）→ 只传 1 个问题段重写 →
+> AI 味分 28→15（下降）→ diff 仅 1 句其余逐字节不变 → y 确认存回+索引更新；
+> 跳过路径同验（第一卷-43.md 无命中，B17 不空烧正常退出）。
+> 1.5 滚动注入真车同轮覆盖（批量连写 42/43 章 writer prompt 含近期人工正文，
+> 见 throughput 真车记录）。T10/T11 留 P1。
 > 行号锚点基于 2026-08-30 代码（quality-gate 完成态），实现时以函数名为准。
 
 ## P0
@@ -82,10 +88,10 @@
   验证：test_harness.py 新增--含合法 deai 键的 record 断言通过、伪造 after >= before 的 record 断言
   FAIL、无键 record 不受影响。B16/B20。
 
-- [x] **T9 `.env copy.example` + ROADMAP：配置注释与状态**
+- [x] **T9 `.env copy.example` + 早期规划：配置注释与状态**
   改动：追加「文风闭环（1.5/1.6）」注释段--`NOVEL_STYLE_RECENT_N`（默认 3，0=禁用）、
   `NOVEL_STYLE_SLICE_CHARS`（默认 1000）、`质量规则.json` 的 `deai` 键（enabled/threshold，无键=
-  不启用）；ROADMAP 阶段 1 状态行更新。
+  不启用）；早期规划阶段 1 状态行更新。
   验证：人工核对注释与 design §2 配置表逐行一致。B1/B9（可发现性）。
 
 ## P1（依赖真实运行数据，非阻塞）

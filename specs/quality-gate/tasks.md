@@ -177,7 +177,7 @@
 | A36 run_tests 规则化 | T9 |
 | A37 旧记录兼容 | T4、T7、T9 |
 
-## 人工验收（对齐 ROADMAP 1.1-1.4 验收口径）
+## 人工验收（对齐阶段 1.1-1.4 规划验收口径）
 
 1. NOVEL_DIR 放 `质量规则.json`（抄 design §2 模板改词表），跑「写一章」：run record 的
    steps 出现 checker 步；若产出命中黑名单词，日志可见 checker 打回 -> fixer 修复调用 ->

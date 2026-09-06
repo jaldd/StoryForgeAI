@@ -443,3 +443,31 @@ def test_deai_user_renders_spans_and_issues():
     # 第 7 段 before/after 均空 -> 其渲染区不含上下文占位块
     seg7 = user_prompt.split("第7段 ━━")[1]
     assert "【上文" not in seg7 and "【下文" not in seg7
+
+
+# ---------- 3.2 角色弧光抽取 prompt（character-arc T3）----------
+def test_arc_system_contract():
+    """C5/D2/D7：审计员角色 + 原名回报 + ≤6 软上限 + changed 语义 + 自包含要求。"""
+    from novel_agent.prompts import ARC_SYSTEM
+
+    assert "角色弧光审计员" in ARC_SYSTEM
+    assert "清单原名" in ARC_SYSTEM                    # D2：防命名分裂
+    assert "不超过 6 个" in ARC_SYSTEM                 # C5：软上限
+    assert "changed" in ARC_SYSTEM and "实质变化" in ARC_SYSTEM  # D7：语义判定
+    assert "自包含" in ARC_SYSTEM                      # C5：脱离上下文能看懂
+    assert "结束时" in ARC_SYSTEM                      # 快照语义：以本章末状态为准
+    assert '"characters"' in ARC_SYSTEM                # 输出协议
+    assert "测试小说" not in ARC_SYSTEM                # 宪法 §1：不硬编码书名
+
+
+def test_arc_user_renders_list_and_chapter():
+    """C1：既有清单 + 本章正文两段式；空清单回落「（无）」。"""
+    from novel_agent.prompts import arc_user
+
+    user_prompt = arc_user("本章正文内容。", ["林晚（第3章）：蒙冤受屈", "沈砚：暗中观察"])
+    assert "【既有角色弧光清单】" in user_prompt
+    assert "林晚（第3章）：蒙冤受屈" in user_prompt
+    assert "【本章正文】" in user_prompt and "本章正文内容。" in user_prompt
+
+    empty = arc_user("正文。", [])
+    assert "（无）" in empty

@@ -21,7 +21,7 @@ class PipelineState:
     polished: str = ""        # Polisher 润色稿
     feedback: str = ""        # Reviewer 审稿意见
     final_chapter: str = ""   # 最终定稿
-    outline: str = ""         # Writer 的构思说明（=== 分隔前的部分；无分隔符时为空）
+    outline: str = ""         # 本章构思/节拍（3.3 构思前移：planner 节拍（planner 开且成功）或 writer 构思（其余情况）；=== 分隔前的部分，无分隔符时为空）
     plan: str = ""            # 本章规划（2.2 章纲要点；空 = 无规划自由写，T12）
 
     # -- 重写输入 --

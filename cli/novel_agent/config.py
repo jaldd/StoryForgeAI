@@ -132,6 +132,34 @@ class Settings:
     batch_max: int = 10            # NOVEL_BATCH_MAX：批量连写单命令最大章数（token 护栏）
     chapter_plan_subpath: str = "每章.md"  # NOVEL_CHAPTER_PLAN：每章规划文件（章纲）；留空 = 禁用
 
+    # --- 伏笔追踪（3.1 foreshadow）---
+    # 写后抽取回路开关：0 = 关（只关抽取，快照新格式与「伏笔」命令保留，F12）
+    foreshadow_enabled: bool = True
+    # 抽取调用温度（判定类，走主 llm；None = 调用点默认 0.2，不吃 NOVEL_TEMPERATURE 兜底）
+    foreshadow_temperature: Optional[float] = None
+    # 注入 prompt 的未回收伏笔条数上限（只影响注入，不影响回收判定池）；0 = 不截断
+    foreshadow_cap: int = 30
+
+    # --- 角色弧光（3.2 character-arc）---
+    # 写后抽取回路开关：0 = 关（只关抽取，快照新格式与「角色」命令保留，C12）
+    arc_enabled: bool = True
+    # 抽取调用温度（判定类，走主 llm；None = 调用点默认 0.2，不吃 NOVEL_TEMPERATURE 兜底）
+    arc_temperature: Optional[float] = None
+    # 注入 prompt 的跟踪角色数上限（只影响注入，不影响抽取输入清单）；0 = 不截断
+    arc_cap: int = 8
+
+    # --- 卷对齐落盘（volume-align）---
+    # 开关：1 = 章节按卷结构落盘（{卷名}-{NN}.md 直接覆盖原稿，git diff 即比对）；
+    # 前提 NOVEL_CHAPTER_SUBDIR 指到当前卷目录（如 正文/第一卷）。默认 0 = 现状平铺。
+    volume_align: bool = False
+
+    # --- 章节规划师（3.3 planner）---
+    # 开关：1 = run 路径先规划再写（planner 汇合章纲/伏笔/弧光/字数产节拍，
+    # writer 按节拍写，reviewer 拿节拍当验收基准）。默认 0 = 现状（writer 自行构思）。
+    planner_enabled: bool = False
+    # 规划调用温度（创作类，走 writer_llm；None = NOVEL_TEMPERATURE 兜底，再回落调用点默认 0.5）
+    planner_temperature: Optional[float] = None
+
     # ---------- 路径解析 ----------
     def path(self, rel: str) -> Path:
         """相对路径 -> 绝对路径（相对 repo_root）。已是绝对路径则原样返回。"""
@@ -278,6 +306,15 @@ def get_settings() -> Settings:
         stream=int(os.environ.get("NOVEL_STREAM", "1")) != 0,
         batch_max=int(os.environ.get("NOVEL_BATCH_MAX", "10")),
         chapter_plan_subpath=os.environ.get("NOVEL_CHAPTER_PLAN", "每章.md"),
+        foreshadow_enabled=int(os.environ.get("NOVEL_FORESHADOW", "1")) != 0,
+        foreshadow_temperature=_env_float("NOVEL_FORESHADOW_TEMPERATURE"),
+        foreshadow_cap=int(os.environ.get("NOVEL_FORESHADOW_CAP", "30")),
+        arc_enabled=int(os.environ.get("NOVEL_ARC", "1")) != 0,
+        arc_temperature=_env_float("NOVEL_ARC_TEMPERATURE"),
+        arc_cap=int(os.environ.get("NOVEL_ARC_CAP", "8")),
+        volume_align=int(os.environ.get("NOVEL_VOLUME_ALIGN", "0")) != 0,
+        planner_enabled=int(os.environ.get("NOVEL_PLANNER", "0")) != 0,
+        planner_temperature=_env_float("NOVEL_PLANNER_TEMPERATURE"),
         embed_model=os.environ.get("EMBED_MODEL", "") or "doubao-embedding-vision",
         embed_url=os.environ.get("EMBED_BASE_URL", "")
         or "https://ark.cn-beijing.volces.com/api/coding/v3/embeddings/multimodal",
