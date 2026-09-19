@@ -1,0 +1,132 @@
+# 事件锚门禁（event-anchor）- 需求
+
+> 需求来源：一部 300 章实测长篇的二三四卷复盘（2026-09-19，语料 anonymized）——AI 生成漂移出两类"状态章"病灶，既有门禁全部不可见。
+> 最高约束：`.specify/memory/constitution.md`。
+> 现状证据与详细设计见同目录 `design.md`；任务分解见 `tasks.md`。
+> 前置依赖：`specs/quality-gate/`（checker 结构化 issue / fixer 打回闭环）、`specs/style-loop/`、
+> `specs/style-repeat/`（跨章检查 / 风格体检命令）均已实现；本 feature 消费三者资产，不重复建设。
+> 条目编号用 E 系列（A1-A37 归 quality-gate、B1-B20 归 style-loop、C1-C18 归 style-repeat，避免跨 feature 撞号）。
+
+## 1. 背景与问题
+
+quality-gate 管单章表达（黑名单/句长/独白/比喻），style-loop 管 AI 味，style-repeat 管跨章复读。
+但实测复盘发现：**三类门禁都假设"章里有一件事在发生"，而漂移的产物是"章里没事发生"**——
+AI 写不出事件时，就拿天气、身体感受、内心状态填充，产出两种形态：
+
+1. **碎片章**：一章只有 4-9 行、一两百字，是一段状态速写，不是正文。实测一卷尾部连续 10 章（47-54、58-59）
+   全部如此，且伴随最重级别的文风违规（把隐喻写成公式"风=人心"、叙述者替读者解码）。
+2. **零对话独白章**：1400-2700 字、零行对话。实测一卷 4 章，其中一章是该卷最高潮戏——压力越大，
+   AI 越写不出场景与对话，越往独白里灌。
+3. **状态堆叠**：状态词（胸口/太阳穴/睡不着/麻木一类）密度畸高，对话行趋零。
+
+既有检查为何不可见：monologue 上限 80 行太松（独白章靠换行切碎就绕过）；
+blacklist 管词不管章的结构；reviewer 八个维度里没有"这章有没有事发生"这一维；
+字数分布只进体检报告、无拦截；**"删掉天气和身体描写后本章还剩不剩一件完整的事"这个判断，机器与 LLM 都没有人在做。**
+
+根因总结：**写作侧缺"事件锚"这个契约**——规划（每章.md）只给状态不给事件时，writer 只能产出状态；
+审稿侧没有对应维度，状态章一路绿灯进正文。
+
+本 feature 补三件事，与 style-repeat 同构：**检测**（checker 结构检查）、**预防**（reviewer 第 9 维）、
+**诊断**（体检报告增状态章嫌疑榜）。
+
+## 2. 术语
+
+- **事件锚**：一章中删掉所有天气描写、身体感受、心理描写后，仍然完整成立的那件事
+  （来客、出行、置办、节日、配角的一步）。状态章 = 没有事件锚的章。
+- **碎片章**：正文字数低于 `chapter_structure.min_chars` 的章——不是写歪了，是没写成。
+- **零对话独白章**：字数达到 `dialogue_check_min_chars` 但对话行数低于 `min_dialogue_lines` 的章。
+- **状态词**：`chapter_structure.state_words` 配置的词表（静态配置进 NOVEL_DIR 的质量规则.json，
+  代码仓库零小说词，宪法 §1）。词法代理，非语义判断（style-repeat 同款边界）。
+- **对话行**：行内出现任意引号字符的行（复用 checker `_is_dialogue_line`，Z9 词法代理同款）。
+- **嫌疑分**：体检榜排序指标 = 状态词命中数/非空行数 − 对话行数/非空行数×2。越高越像状态章。
+- **EARS**：`当 <条件> 时，系统应 <行为>` 的验收条目格式。
+
+## 3. 验收标准（EARS）
+
+### 3.1 结构检查（检测，checker 纯代码零 LLM）
+
+- **E1** 当 checker 执行且规则含 `chapter_structure.min_chars`、正文有效字符数
+  （剔除 `#` 标题行与 `---`/`***` 分隔行后的非空白字符数）低于该值时，系统应输出结构化 issue
+  （problem 前缀「碎片章：」，quote 置空——全文属性，无法定位到段落；
+  report-only 通道下 quote 仅供留痕展示，不参与任何修复定位（E5）；
+  fix 文案引导"按事件锚扩写为完整章节，请使用重写命令"）。
+- **E2** 当规则含 `dialogue_check_min_chars` 与 `min_dialogue_lines`、正文有效字符数达到前者
+  且对话行数低于后者时，系统应输出结构化 issue（problem 前缀「零对话独白章：」，
+  quote=首个非标题非分隔行截前 50 字，可定位；fix 引导"补回场景与对话，独白压缩为状态登记"）。
+- **E3** 当规则含 `state_words`（非空）与 `state_density_max_per_100_lines`、状态词总命中数
+  占非空行数的比例（每百行命中数）超过上限时，系统应输出结构化 issue
+  （problem 前缀「状态堆叠：」，quote=首个状态词所在句截前 50 字，可定位；
+  fix 引导"状态登记删至每章 3 笔以内，篇幅让给事件"）。
+- **E4** 当 `chapter_structure` 键缺失、或其子键缺失、或 `state_words` 为空表时，
+  系统应跳过对应检查项（零误伤；键全缺 = 行为与现状逐字节一致）。
+- **E5** 当结构检查命中时，issue 应与既有 checker/reviewer issue 同构（quote/problem/fix），
+  但**不进 fixer 打回循环、不消耗 `review_count`**：走 report-only 通道——控制台显著警告
+  （逐条 problem）+ `state.log` 留痕（随 run record 落盘）+ 直通 reviewer。
+  （依据：fixer 铁律禁止增删情节与段落，prompts.py:440-491；结构问题闭环内修不好，
+  打回只会白烧修复调用后由逃生门放行。2026-09-19 评审拍板，design D9。）
+- **E6** 当碎片章/零对话独白章需要修复时，修复路径应为人工 `重写` 命令
+  （rewrite 携带原文，writer 上下文完整，可按规划补事件锚）；结构类 issue 的可见性与留痕
+  是本 feature 的核心价值，闭环内修复明确不做（非目标 9）。
+
+### 3.2 reviewer 第 9 维（预防，LLM）
+
+- **E7** 当构造 reviewer system prompt 时，审查维度应含第 9 维「事件锚」
+  （现状 8 维：1-6 一致性维度 + 7 比喻密度 + 8 视角越界，prompts.py:417-425）：
+  删掉天气描写、身体感受、心理描写后，本章是否还剩一件完整成立的事
+  （纯氛围/纯心情章 = 不通过）；scores 输出应含 `"事件锚"` 键。
+- **E8** 当 reviewer 判定事件锚不达标时，issue 的 problem 应以「事件锚：」为前缀；
+  其处置同为 report-only 类（design D10）：仅事件锚不达标时放行留痕
+  （feedback 标注「事件锚不达标，建议人工重写」，不进入 fixer 循环）；
+  与其他维度问题混合不达标时，其余 issue 走正常 fixer 闭环，事件锚 issue 仅留痕、
+  不进 fixer 修复批次。
+
+### 3.3 状态章嫌疑榜（诊断，体检纯代码零 LLM）
+
+- **E9** 当用户执行 `风格体检 [目录]` 且规则含 `chapter_structure.state_words`（非空）时，
+  报告应增第四节「状态章嫌疑榜」：逐章计算嫌疑分
+  （状态词命中数/非空行数 − 对话行数/非空行数×2），按分降序输出 Top 20，
+  附各章行数/对话行数/状态词命中数；键缺失或词表为空时该节输出一行未配置提示。
+- **E10** 当体检执行时，新增节全程零 LLM 调用（style-repeat C14 同款）。
+- **E11** 当目录不存在或无可扫描文件时，行为与现状一致（提示后正常退出，不崩 REPL，C15 同款）。
+
+### 3.4 兼容
+
+- **E12** 当规则文件不含 `chapter_structure` 键时，**结构检查与体检新节的行为**
+  应与 style-repeat 完成态逐字节一致（reviewer 第 9 维按 D4 无条件生效，
+  reviewer prompt 文本变化不属本条范围）。
+- **E13** 当 replay/compare/run_tests 消费旧 run 记录时，系统应正常工作
+  （结构 issue 的留痕走 `state.log`——report-only 通道不进 `state.issues`（E5），
+  随 run record steps 快照落盘，无新字段，C17 同款）。
+- **E14** reviewer prompt 变更应保持返回 JSON schema 不变（pass/reason/scores/issues 四键同构），
+  harness 评测与门禁消费面零改动。
+
+## 4. 非目标（明确不做）
+
+1. **不做语义级"事件完整性"判断进 checker**：「这件事完不完整」只有 LLM 能判，
+   归 reviewer 第 9 维（quality-gate 非目标 3、style-repeat 非目标 3 同边界）。
+   checker 只做词法代理（字数/对话行/状态词密度）。
+2. **不做自动批量返修命令**：`重写` 路径（rewrite + source_content）现成，人触发；
+   批量模式归 `specs/stage0-batch/`。
+3. **planner 注入事件锚声明归 P1**：节拍层改动回归成本高，先观察 reviewer 维度拦截效果再定
+   （见 tasks P1 T4）。
+4. **不做状态词语义扩展/词向量**：静态词表，确定性优先（style-repeat 非目标 2 同哲学）。
+5. **不动 ai_flavor_score 三组件、不动滚动注入/exemplar/样文路由**（style-repeat 非目标 4/6 同款边界）。
+6. **不建持久账本**：章节文件即唯一真源，嫌疑分现算（style-repeat 非目标 5 同款）。
+7. **回归基线全绿**：`cli/` 下 `python -m pytest tests/ -q` = 628 passed / 0 failed / 1 deselected
+   （2026-09-19，真车修复后实测）；本 feature 验收口径为**保持全绿**。
+8. **不改 `改` 命令交互、不动伏笔/角色弧光抽取**。
+9. **不开扩写许可的 fixer 变体**：按 issue 类型条件放宽 fixer 铁律 +
+   `fixer_whole_user` 注入章节规划——评估为新修复机制，与「零新机制」卖点矛盾且工作量
+   不匹配；report-only + 人工重写已覆盖处置需求（2026-09-19 评审拍板，design D9）。
+
+## 5. 宪法对齐表
+
+| 宪法条款 | 约束要点 | 本 feature 的对齐方式 |
+|---|---|---|
+| §1 项目身份 | 代码仓库零具体小说名 | state_words 词表与全部阈值进 `NOVEL_DIR` 的 `质量规则.json`；prompt 模板与报告文案零小说词；复盘数据 anonymized |
+| §2 技术栈 | 零新依赖 | 结构检查/嫌疑榜是纯代码（re 标准库）；体检零 LLM；不碰 RAG/embedding |
+| §3 存储与路径 | 小说数据在仓库外 | 词表从既有质量规则加载器读；体检默认 `human_text_full`；无新落盘文件（非目标 6） |
+| §4 推理预算 | token 预算意识 | 检测零 LLM；reviewer 仅 prompt 增一维（max_tokens 不变）；report-only 通道零修复调用，人工重写复用既有 rewrite 管线 |
+| §5 模块边界 | 依赖注入、纯函数优先 | 结构检查/嫌疑分为 checker.py 纯函数；reviewer 变更限 prompts.py 模板；命令复用 `_do_style_scan` |
+| §6 开发流程 | spec-kit 三件套 | 本目录即三件套 |
+| §7 验收纪律 | 单测绿、不破基线、离线可测 | 全部测试离线（tmp 目录构造章节文件 + FakeLLM）；真实语料体检属人工验收（零 LLM、零联网） |
