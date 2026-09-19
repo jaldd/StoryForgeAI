@@ -174,6 +174,26 @@ def test_add_document_missing_file(tmp_path):
         pass
 
 
+def test_remove_chapters_clears_only_chapter_blocks(tmp_path):
+    """clear-chapters 只清 type=chapter 块，设定/文风基准块不动。"""
+    novel, store = _store(tmp_path)
+    zh = novel / "正文"
+    zh.mkdir()
+    (zh / "001.md").write_text("正文章节内容。" * 50, encoding="utf-8")
+    (novel / "人物.md").write_text("林晚是女主。" * 50, encoding="utf-8")
+    n_chap = store.add_document("正文/001.md", progress=None)
+    n_char = store.add_document("人物.md", progress=None)
+    assert n_chap >= 1 and n_char >= 1
+
+    n = store.remove_chapters()
+    assert n == n_chap
+    coll = store._collection_obj()
+    assert coll.count() == n_char                       # 只剩设定块
+    assert all(v["metadata"]["type"] == "character" for v in coll.data.values())
+    # 再跑一次：无正文块返回 0（幂等）
+    assert store.remove_chapters() == 0
+
+
 # ---------- build_index manifest（0.6 rebuild 陈块精确清理）----------
 def test_rebuild_first_time_writes_manifest(tmp_path):
     """首建（无 manifest）：不清理直接写块，结束时落 manifest 供下次精确清理。"""

@@ -18,6 +18,7 @@ __all__ = [
     "load_exemplar",
     "exemplar_info",
     "load_recent_human",
+    "build_style_taboos",
     "EXEMPLAR_ROUTER_SYSTEM",
     "exemplar_router_user",
     "planner_system",
@@ -280,6 +281,51 @@ def _recent_human_block(recent_human: str) -> str:
     )
 
 
+def _style_taboos_block(style_taboos: str) -> str:
+    """近期文风禁则块（1.7 负面清单）；空则返回空串不占位（对齐 _recent_human_block 先例）。"""
+    if not style_taboos.strip():
+        return ""
+    return f"\n{style_taboos}\n"
+
+
+def build_style_taboos(recent_endings, rules) -> str:
+    """近期文风禁则分节（1.8 预防，纯函数 C11：同输入同输出）。
+
+    - 收束句：参照窗内 count+1 > max_repeat 的归一化结尾（本章再用即超配额），
+      按次数降序最多 5 条（护栏防分节膨胀）；min_chars 以下豁免（与检查口径一致）；
+    - 句式：syntax_patterns.patterns 全量列出配额说明（预防优先，不等打回）；
+    - 无内容 -> ""（整块不占位，C9）。
+    """
+    if not rules:
+        return ""
+    lines: list[str] = []
+    end_cfg = rules.get("ending") or {}
+    if end_cfg and recent_endings:
+        max_repeat = end_cfg.get("max_repeat", 2)
+        min_chars = end_cfg.get("min_chars", 3)
+        counts: dict[str, int] = {}
+        for e in recent_endings:
+            if len(e) >= min_chars:
+                counts[e] = counts.get(e, 0) + 1
+        over = [(e, n) for e, n in counts.items() if n + 1 > max_repeat]
+        over.sort(key=lambda x: (-x[1], x[0]))  # 次数降序，同次数字典序（确定性）
+        for e, n in over[:5]:
+            lines.append(
+                f"- 收束句「{e}」：最近{len(recent_endings)}章已用{n}次，本章结尾禁止再用"
+            )
+    pats = (rules.get("syntax_patterns") or {}).get("patterns") or []
+    if pats:
+        max_per = (rules.get("syntax_patterns") or {}).get("max_per_chapter", 1)
+        for p in pats:
+            lines.append(f"- 句式模板「{p}」：每章最多{max_per}次，超出会被打回修改")
+    if not lines:
+        return ""
+    return (
+        "【近期文风禁则】（以下收束句/句式近期已重复使用，本章禁止再用或按配额限量）\n"
+        + "\n".join(lines)
+    )
+
+
 # ---------- 各 Agent 的 system prompt ----------
 def planner_system(
     novel_name: str,
@@ -342,12 +388,13 @@ def writer_system(
     instruction: str = "",
     rules: str = "",
     recent_human: str = "",
+    style_taboos: str = "",
 ) -> str:
     return f"""你是小说《{novel_name}》的创作助手，必须严格模仿以下文风写作。
 {_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
 【风格范例】
 {exemplar}
-{_recent_human_block(recent_human)}"""
+{_recent_human_block(recent_human)}{_style_taboos_block(style_taboos)}"""
 
 
 def polisher_system(novel_name: str, retrieved: str, instruction: str = "", target_words: int = 1500, rules: str = "") -> str:

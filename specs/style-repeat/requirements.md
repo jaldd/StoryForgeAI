@@ -1,6 +1,6 @@
 # 阶段 1 续：文风复读防治（style-repeat）- 需求
 
-> 需求来源：`specs/ROADMAP.md` 阶段 1 续条目 1.7-1.9（随本 spec 一并补录）；动机为一部 300 章实测长篇的复盘数据（见 design §1，语料 anonymized）。
+> 需求来源：阶段 1 续规划条目 1.7-1.9（随本 spec 一并补录）；动机为一部 300 章实测长篇的复盘数据（见 design §1，语料 anonymized）。
 > 最高约束：`.specify/memory/constitution.md`。
 > 现状证据与详细设计见同目录 `design.md`；任务分解见 `tasks.md`。
 > 前置依赖：`specs/quality-gate/`（checker 结构化 issue / fixer 打回闭环 / 质量规则.json 加载）与 `specs/style-loop/`（滚动注入 / de-AI pass）均已实现；本 feature 消费两者资产，不重复建设。
@@ -67,12 +67,13 @@ quality-gate（1.1-1.4）与 style-loop（1.5-1.6）让**单章**质量被度量
 1. **不做字数方差的 checker 拦截**：字数均一是生成期问题，单章稿件无法归因（fixer 修不了「字数太均匀」）；体检只报告。生成期抖动（target_words 随机化）归 P1 任务，校准后再定去留。
 2. **不做模糊结尾匹配**：编辑距离/子串/语义相似不做——归一化完全相等，确定性优先（子串会把「嗯。」这类超短结尾全灭，靠 min_chars 豁免足够）。
 3. **语义级句式判断不进 checker**：这句话是不是「解释性比喻」只有 LLM 能判，归 reviewer 维度（quality-gate 非目标 3 同边界）。
-4. **不动 ai_flavor_score 三组件**：freq 组件改「自相似」方向（与自己最近 N 章比，而非与基准比）是研究性变更，需回测数据支撑，另立 feature（见 ROADMAP 备注）；本 feature 不碰。
+4. **不动 ai_flavor_score 三组件**：freq 组件改「自相似」方向（与自己最近 N 章比，而非与基准比）是研究性变更，需回测数据支撑，另立 feature（见 tasks P1 T9）；本 feature 不碰。
 5. **不做持久风格账本**：不建 `.agent/style_ledger.json` 之类状态文件；章节文件即唯一真源，指纹现算（见 design D1）。
 6. **不动滚动注入 / exemplar / 样文路由**：负面清单是追加的独立分节（style-loop 非目标 3 同款边界）。
 7. **不做伏笔回收接口**（阶段 3.1）；**不动批量/API 模式**（阶段 2）；**不改 `改` 命令交互**。
-8. **不修存量 3 个失败测试**（`test_strip_polisher_meta`、`test_runtime_dir_override`、`test_defaults`）：纪律是零新增。
+8. **回归基线全绿**：`cli/` 下 `python -m pytest tests/ -q` = 566 passed / 0 failed / 1 deselected（2026-09-06，planner 完成态）；本 feature 验收口径为**保持全绿**。
 9. **不做卷序修正**：中文数字卷名（第一/二/三卷）的字典序 ≠ 章序，体检按目录分组规避（design Z3），全局排序类统计不做。
+10. **planner 不注入禁则**：节拍是结构层（场景/冲突/钩子），收束句与句式是散文层；定调归 writer（D5 同哲学），planner prompt 零改动。
 
 ## 5. 宪法对齐表
 

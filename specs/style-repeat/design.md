@@ -1,8 +1,8 @@
 # 阶段 1 续：文风复读防治（style-repeat）- 设计
 
-> 对应需求：同目录 `requirements.md`（C1-C17）。
+> 对应需求：同目录 `requirements.md`（C1-C18）。
 > 前置：`specs/quality-gate/design.md`（D1-D12/Z1-Z10）与 `specs/style-loop/design.md`（D1-D8/Z1-Z6）均已实现；本文引用其决策编号与模块。
-> 行号引用基于 2026-09-03 代码（style-loop 完成态）。
+> 行号引用基于 2026-09-06 代码（planner 完成态；`_checker` 在 agent.py:623，`save_chapter` 在 storage.py:223）。
 
 ## 0. 需求映射
 
@@ -136,7 +136,7 @@ recent_endings: Optional[list[str]] = None,   # cross 检查参照（None = 跳�
 style_taboos: str = "",                       # writer 禁则分节（空 = 不占位）
 ```
 
-**`_checker`**（`agent.py:532-559`）两行改动：
+**`_checker`**（`agent.py:623`）两行改动：
 
 ```python
 issues = run_checks(state.polished, self.quality_rules)
@@ -146,7 +146,7 @@ if self.quality_rules and self.recent_endings is not None:
 
 打回目标、review_count 共享、fixer 复检全部既有机制（C6/C8 零新状态）。
 
-**`cli._build_agent`**（4 个调用点同改，均在 try 外的 RuntimeError 捕获已覆盖 C4 落点）：
+**`cli._build_agent`**（5 个调用点：写/精修/重写/去AI/改，均在 try 外的 RuntimeError 捕获已覆盖 C4 落点）：
 
 ```python
 ending_cfg = (rules or {}).get("ending") or {}
@@ -161,7 +161,8 @@ taboos = build_style_taboos(recent_endings, rules)     # §3.4
 
 - 参照章取 `human_text_full`（D6：实测工作流是 AI 初稿直接写进 `正文/第X卷/` 原位精修，初稿与定稿同目录演化；`chapter_path` 在该工作流为空）。参照集与滚动注入/体检同源，改 `NOVEL_HUMAN_TEXT` 一处全生效；写第 N 章时窗口 = 已存的 N-1 章，卷尾→卷首过渡被跨卷排序（Z7）正确覆盖。
 - `精修`/`重写`/`去AI` 把被处理文件路径经 `_build_agent` 新增可选参 `active_file` 传入 exclude（C18；既有调用点默认 None 零改动）。
-- refine/rewrite/去AI 四命令复用 `_build_agent` 天然生效。
+- 写/精修/重写/改 四命令复用 `_build_agent` 天然生效（agent 内 `_checker` 走 cross checks）。
+- **去AI 是直调例外**：`_do_deai` 不经 agent 流水线，直接 `run_checks(content, rules)`（cli.py:793）——需在同处追加 `run_cross_checks(content, recent_endings, rules)` 直调（参照集已在 `_build_agent` 构造，exclude=被处理文件，C18 语义落地）；只取可定位 issue（quote in content）同 B10 口径。
 
 ### 3.4 负面清单注入（prompts.py + 复用 §3.1）
 
@@ -238,12 +239,14 @@ def scan_style_report(
 
 - **零宽正则**：`compile_syntax_patterns` 必须拒收（`pat.search("")` 真即拒），否则 findall 计数爆炸且难定位（用户配 `(像|仿佛)?` 这类模式会踩）。
 - **捕获组**：pattern 含组时用 `match.group(0)` 定位句；纯字符串 pattern（如「像一个人」）无组，`re.findall` 返回字符串列表——统一 `re.finditer` 取 `group(0)` 计数，规避两种返回形态分叉。
-- **章号重复文件**：`save_chapter` 同名追加 `-run_id` 后缀保留历史（`storage.py:130-131`），参照章不去重（D8：旧版结尾也算「用过」，防复读优先于防误伤）。
+- **跨句命中的 quote 定位**（真车 refine_20260919_201749 踩坑）：pattern 如「不是X，是Y」允许 `[。，]` 后接 `[^。]{0,4}`，会命中跨句串「不是拨。\\n\\n是」——group(0) 含句号换行，不落在任何单句内，`_first_sentence_with` 兜底返回命中串本身 -> fixer 段落定位失败 -> 整文降级 -> 4 轮不收敛烧到 review_count 上限。修复：quote 改按**命中起点所在句**定位（`_sentence_at`），单句必为原文子串且不含段落边界，段落级修复每轮可达（命中 4->3->…收敛）。
+- **章号重复文件**：`save_chapter` 平铺模式同名追加 `-run_id` 后缀保留历史（`storage.py:262-263`），参照章不去重（D8：旧版结尾也算「用过」，防复读优先于防误伤）；volume-align 模式直接覆盖（`storage.py:244-255`），无重复文件问题。
 - **`_build_agent` 读文件耗时**：lookback ≤ 10 个小文件，秒级；`去AI` 命令复用 `_build_agent` 时也读（可接受，读文件无副作用）。
 - **fixer 修结尾行**：quote=结尾行是末段子串，`split_paragraphs` 命中末段；fixer prompt「只改问题处」已覆盖；字数保护已有。改后新结尾复检 vs 同一 `recent_endings` 快照（agent 构造时捕获）——语义正确：参照系就是写入时的近期历史。
+- **句式超配额的收敛节奏**：C3 每 pattern 发 1 条 issue（quote=首个命中句），fixer 段落级修复一轮只改一个命中点——命中 n 次超配额 k 时最多烧 n-k 轮 review_count 才收敛（C8 共享预算）。行为可接受（配额默认 1、命中通常 2-3 次），若真车数据出现多轮打回，再议「按超配额数发多条 issue」的增强。
 - **测试缝**：cross 检查测试用 tmp 目录写假章节文件驱动 `load_recent_endings`；`_checker` 级测试直接注入 `recent_endings` 列表，不碰文件系统。
 - **体检递归**：`rglob` 会扫到 `.agent/`（在 novel_dir 下但体检默认目录是 human_text，不含 .agent）；若用户把目录指到 novel_dir 根，忽略 `.agent`/隐藏目录（`p.parts` 含 `.agent` 或 `.` 前缀目录即跳过）。
-- **跨卷章序解析**（Z7）：`第X卷/部/册` 中文数字转换（一~百、组合如「二十三」）与纯数字目录名三态都要测；章号取文件名尾部 `-0*(\d+)`——规范命名已拍板为 `{卷}-{NN}.md`（ROADMAP 1.10，2026-09-04），新章与存量同构，此解析为主路径。注意 `parse_chapter_file`（`storage.py:60-71`）的 `第N章-` 前缀约定不匹配该命名——1.10 会在 `storage.py` 侧兼容两格式（服务工作记忆更新），本 feature 的 Z7 解析器独立实现（服务跨卷排序），职责不混。
+- **跨卷章序解析**（Z7）：`第X卷/部/册` 中文数字转换（一~百、组合如「二十三」）与纯数字目录名三态都要测；章号取文件名尾部 `-0*(\d+)`——规范命名已拍板为 `{卷}-{NN}.md`（阶段 1.10 规划，2026-09-04），新章与存量同构，此解析为主路径。注意 `parse_chapter_file`（`storage.py:168`）的 `第N章-` 前缀约定不匹配该命名——1.10 会在 `storage.py` 侧兼容两格式（服务工作记忆更新），本 feature 的 Z7 解析器独立实现（服务跨卷排序），职责不混。
 
 ## 7. 测试策略（全程不联网）
 
@@ -251,7 +254,7 @@ def scan_style_report(
 - **test_agent.py 追加**：`_checker` 合并 cross issues 并打回 fixer（FakeLLM 脚本含修复输出）；cross 打回共享 review_count（连续打回达上限放行）；`recent_endings=None` 时零行为变更；fixer 修复结尾行后复检通过（新结尾不在参照集）。
 - **test_prompts.py 追加**：`build_style_taboos` 确定性、空输入空串、5 条上限护栏、分节文案含「禁」语义；`writer_system` 第 7 参空串时输出与既有用例逐字节一致。
 - **test_cli_write.py 追加**：`风格体检` 命令冒烟（tmp 目录 + monkeypatch 打印缝）；`状态` 命令含禁则行。
-- **回归**：`cli/` 下 `python -m pytest tests/ -q`；基线 3 存量失败，零新增。
+- **回归**：`cli/` 下 `python -m pytest tests/ -q`；基线 566 passed / 0 failed / 1 deselected（2026-09-06），验收口径为保持全绿。测试分工按宪法 §8 两步走：AI 只跑纯逻辑最小验证脚本（checker/prompts 层直接 import + assert，跑一次即收），全量回归由用户在 IDE 终端执行。
 
 ## 8. 决策表
 

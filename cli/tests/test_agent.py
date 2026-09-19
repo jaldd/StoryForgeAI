@@ -1845,3 +1845,140 @@ def test_planner_beats_reach_polisher_reviewer(fake_rag, tmp_settings):
     assert "本章构思/节拍" in rec.users[2]                    # polisher（Z3 中性文案）
     assert "本章构思/节拍" in rec.users[3]                    # reviewer（Z3 中性文案）
     assert BEATS in rec.users[3]                              # 节拍全文进验收基准
+
+
+# ---------------- 1.7 style-repeat：_checker 跨章接线（T3） ----------------
+CROSS_RULES = {
+    "ending": {"lookback": 10, "max_repeat": 2, "min_chars": 3},
+    "syntax_patterns": {"patterns": ["像一个人"], "max_per_chapter": 1},
+}
+
+
+def test_checker_cross_issue_rejects_to_fixer(fake_llm, tmp_settings):
+    """C6/C1：cross issue 并入既有 issues 流 -> 打回 fixer，review_count+1。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules=CROSS_RULES,
+        recent_endings=["风很轻", "风很轻"],
+    )
+    state = _gate_state("开头。\n\n风很轻。")
+    agent._checker(state)
+    assert state.next_agent == "fixer"
+    assert state.review_count == 1
+    assert len(state.issues) == 1
+    assert "收束句复读" in state.feedback
+    assert fake_llm.calls == []                                # 纯代码零 LLM
+
+
+def test_checker_cross_syntax_alone_works(fake_llm, tmp_settings):
+    """C5：只配 syntax_patterns（ending 键缺、recent_endings=None）-> 句式项照跑。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules={"syntax_patterns": {"patterns": ["像一个人"], "max_per_chapter": 1}},
+        recent_endings=None,
+    )
+    state = _gate_state("他像一个人立在风里。\n\n她像一个人坐着。")
+    agent._checker(state)
+    assert state.next_agent == "fixer"
+    assert "句式模板超配额" in state.feedback
+
+
+def test_checker_cross_none_endings_zero_change(fake_llm, tmp_settings):
+    """C16：recent_endings=None 且规则无新键 -> 行为与现状一致（回归护栏）。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules={"blacklist": ["眼眸"]},
+        recent_endings=None,
+    )
+    state = _gate_state("她的眼眸里闪过一丝哀伤。")
+    agent._checker(state)
+    assert state.next_agent == "fixer"
+    assert len(state.issues) == 1                              # 只有 blacklist 项
+    assert "收束句复读" not in state.feedback
+
+
+def test_checker_cross_shares_review_count(fake_llm, tmp_settings):
+    """C8：cross 打回共享 review_count，达上限放行（不另开循环通道）。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings, max_reviews=1,
+        quality_rules=CROSS_RULES,
+        recent_endings=["风很轻", "风很轻"],
+    )
+    state = _gate_state("开头。\n\n风很轻。", review_count=1)
+    agent._checker(state)
+    assert state.next_agent == "reviewer"                      # 达上限放行
+    assert state.review_count == 1                             # 不再递增
+    assert any("放行" in line for line in state.log)
+
+
+def test_checker_cross_fixer_repairs_ending(fake_llm, tmp_settings):
+    """fixer 修结尾行后复检通过：新结尾不在参照集（design §6 收敛闭环）。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules=CROSS_RULES,
+        recent_endings=["风很轻", "风很轻"],
+    )
+    state = _gate_state("开头。\n\n风很轻。")
+    agent._checker(state)
+    assert state.next_agent == "fixer"
+    # fixer 按标记协议改写末段（新结尾「灯灭了」不在参照集）
+    fake_llm.script = ["【第2段·修复后】\n灯灭了。"]
+    agent._fixer(state)
+    assert state.next_agent == "checker"
+    agent._checker(state)                                      # 复检
+    assert state.next_agent == "reviewer"                      # 新结尾通过
+    assert state.issues == []
+
+
+def test_checker_cross_refine_path(fake_llm, tmp_settings):
+    """refine 路径 cross 同样生效（refine_agents 含 checker，T3 验证项）。"""
+    agent = NovelAgent(
+        llm=fake_llm, settings=tmp_settings,
+        quality_rules=CROSS_RULES,
+        recent_endings=["风很轻", "风很轻"],
+    )
+    # 脚本：润色稿结尾复读「风很轻。」-> checker 打回 -> fixer 改写末段 -> 复检过 -> 审稿过
+    fake_llm.script = [
+        "【润色稿】开头。\n\n风很轻。",
+        "【第2段·修复后】\n灯灭了。",
+        '{"pass": true, "reason": "通过"}',
+    ]
+    state, record = agent.refine("要精修的稿。", "精修：x.md")
+    assert state.review_count == 1                          # cross 打回过一次
+    assert any("收束句复读" in str(s.get("output_state", {}).get("feedback", ""))
+               for s in record["steps"])                    # steps 留痕
+    assert "审稿通过" in state.feedback                     # 修复后走完
+
+
+def test_writer_system_gets_style_taboos(fake_rag, tmp_settings):
+    """C9/C10：禁则分节只进 writer system（polisher/reviewer 不受影响）。"""
+    taboos = "【近期文风禁则】（以下收束句/句式近期已重复使用）\n- 收束句「风很轻」：禁止再用"
+    rec = _SysRecorder(["【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = NovelAgent(
+        llm=rec, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(), style_taboos=taboos,
+    )
+    agent.run("写第5章：异乡风起")
+    assert "【近期文风禁则】" in rec.systems[0]                # writer system 含禁则
+    assert "【近期文风禁则】" not in rec.systems[1]            # polisher 不含
+    assert "【近期文风禁则】" not in rec.systems[2]            # reviewer 不含
+
+
+def test_writer_system_empty_taboos_byte_identical(fake_rag, tmp_settings):
+    """C16：style_taboos 空串时 writer system 与既有输出逐字节一致。"""
+    rec = _SysRecorder(["【初稿】风起了。", "【润色】风起了。",
+                        '{"pass": true, "reason": "通过"}'])
+    agent = NovelAgent(
+        llm=rec, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(),
+    )
+    agent.run("写第5章：异乡风起")
+    rec2 = _SysRecorder(["【初稿】风起了。", "【润色】风起了。",
+                         '{"pass": true, "reason": "通过"}'])
+    agent2 = NovelAgent(
+        llm=rec2, rag=fake_rag, settings=tmp_settings,
+        working_memory=WorkingMemory(), style_taboos="",
+    )
+    agent2.run("写第5章：异乡风起")
+    assert rec.systems[0] == rec2.systems[0]                   # 逐字节一致

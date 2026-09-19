@@ -22,13 +22,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from .agent import NovelAgent
-from .checker import ai_flavor_score, load_baseline, load_quality_rules, run_checks
+from .checker import (
+    ai_flavor_score,
+    load_baseline,
+    load_quality_rules,
+    load_recent_endings,
+    run_checks,
+    run_cross_checks,
+    scan_style_report,
+)
 from .config import Settings, get_settings
 from .harness import backtest_gate, compare, evaluate, replay, run_tests
 from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, parse_selection, preview_line, split_paragraphs
-from .prompts import exemplar_info, load_exemplar, load_recent_human
+from .prompts import build_style_taboos, exemplar_info, load_exemplar, load_recent_human
 from .rag import RAGStore
 from .routing import parse_tag_lines, route_exemplars
 from .state import PipelineState
@@ -40,6 +48,7 @@ from .storage import (
     parse_chapter_plan,
     parse_chapter_range,
     parse_chapter_task,
+    preserve_leading_title,
     save_chapter,
     save_run,
     save_working_memory,
@@ -131,7 +140,7 @@ def _route_exemplar_files(settings: Settings, task: str):
     return route.files, route
 
 
-def _build_agent(settings: Settings, task: str = "", need_style: bool = True):
+def _build_agent(settings: Settings, task: str = "", need_style: bool = True, active_file: str = ""):
     """构造 NovelAgent：加载文风金标准 + 写作指令 + 写作铁律 + 工作记忆，RAG 惰性。
 
     0.7：load_profiles 一次解析，双 LLMClient 注入（llm=default profile，
@@ -142,6 +151,10 @@ def _build_agent(settings: Settings, task: str = "", need_style: bool = True):
     样文加载；路由任何失败回落现状（清单/全量）加载，永不阻塞写作。
     1.5 滚动注入：exemplar 之后加载人工正文尾部 N 章（仅当 human_text_subpath
     已配置；目录不存在/空返回空串，B2 零误伤），只传 writer（B5）。
+    1.7 跨章禁则：质量规则含 ending/syntax_patterns 时现算参照章结尾
+    （load_recent_endings，D1 章节文件即真源）+ 构造 writer 禁则分节；
+    active_file = 精修/重写/去AI 被处理文件（C18 防自比，从参照集排除）；
+    两键全缺时 recent_endings=None、taboos=""，行为与现状逐字节一致（C16）。
     need_style=False：exemplar/滚动语料/样文路由只被 writer 消费，精修/改/去AI
     不走 writer，跳过加载省一次路由调用与文件 IO（行为零变化，纯省）。
     """
@@ -164,6 +177,27 @@ def _build_agent(settings: Settings, task: str = "", need_style: bool = True):
     instruction = _load_instruction(settings)
     rules = _load_rules(settings)
     quality_rules = load_quality_rules(settings)
+    # 1.7：参照章现算 + 禁则构造（Z4：compile_syntax_patterns 的 RuntimeError
+    # 在此抛出，命令层既有 RuntimeError 捕获兜住不崩 REPL）
+    recent_endings = None
+    style_taboos = ""
+    if quality_rules and (quality_rules.get("ending") or quality_rules.get("syntax_patterns")):
+        ending_cfg = quality_rules.get("ending") or {}
+        if ending_cfg:
+            # C18：active_file 按 rag._resolve_source 同口径解析（相对 NOVEL_DIR），
+            # 用户敲相对路径时 exclude 才能命中（否则自比双计、阈值实际 -1）
+            exclude = None
+            if active_file:
+                p = Path(active_file).expanduser()
+                if not p.is_absolute():
+                    p = settings.novel_path / p
+                exclude = p
+            recent_endings = load_recent_endings(
+                settings.human_text_full,
+                ending_cfg.get("lookback", 10),
+                exclude=exclude,
+            )
+        style_taboos = build_style_taboos(recent_endings, quality_rules)
     wm = load_working_memory(settings)
     profiles = load_profiles(settings)
     agent = NovelAgent(
@@ -178,6 +212,8 @@ def _build_agent(settings: Settings, task: str = "", need_style: bool = True):
         quality_rules=quality_rules,
         recent_human=recent_human,
         stream=settings.stream,  # 2.1（T26）：NOVEL_STREAM 驱动 writer/polisher 流式
+        recent_endings=recent_endings,
+        style_taboos=style_taboos,
     )
     return agent, wm, route
 
@@ -577,6 +613,11 @@ def _refine_postprocess(
     action: str = "精修",
 ) -> None:
     """精修/重写后的公共处理：落盘、评测、门禁、存回、差异。"""
+    # 章标题保真（存回/评测/diff 三处一致）：polisher/writer 常不回显标题行
+    # （真车 2026-09-19 精修第一卷-04 丢「## 第四章 余温」），落盘前以原文标题补回
+    if state.final_chapter:
+        state.final_chapter = preserve_leading_title(content, state.final_chapter)
+        record["final_state"]["final_chapter"] = state.final_chapter
     print("💾 落盘运行记录...")
     run_file = save_run(record, settings)
 
@@ -670,8 +711,10 @@ def _do_refine(args: List[str], settings: Settings) -> None:
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
     # 精修从 polisher 起，不走 writer -> 跳过 exemplar/滚动语料/路由（纯省，行为零变化）
+    # active_file：C18 防自比（被精修章从参照集排除）
     try:
-        agent, wm, _route = _build_agent(settings, task=f"精修：{file_path}", need_style=False)
+        agent, wm, _route = _build_agent(
+            settings, task=f"精修：{file_path}", need_style=False, active_file=file_path)
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -711,8 +754,10 @@ def _do_rewrite(args: List[str], settings: Settings) -> None:
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
     # exemplar-routing：重写按文件名路由样文（task=重写：文件名；路由失败回落）
+    # active_file：C18 防自比（被重写章从参照集排除）
     try:
-        agent, wm, _route = _build_agent(settings, task=f"重写：{file_path}")
+        agent, wm, _route = _build_agent(
+            settings, task=f"重写：{file_path}", active_file=file_path)
     except RuntimeError as e:  # 1.1 A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -772,8 +817,9 @@ def _do_deai(args: List[str], settings: Settings) -> None:
     file_path = " ".join(args)
     print("🔧 构建 Agent...")
     # 不路由不传 task（去AI 用不到 exemplar/滚动语料，构造副作用只是读文件，design §6）
+    # active_file：C18 防自比（被去AI 章从参照集排除）
     try:
-        agent, _wm, _route = _build_agent(settings, need_style=False)
+        agent, _wm, _route = _build_agent(settings, need_style=False, active_file=file_path)
     except RuntimeError as e:  # A23：装配错误命令层兜住，不崩 REPL
         print(f"❌ {e}")
         return
@@ -789,8 +835,10 @@ def _do_deai(args: List[str], settings: Settings) -> None:
         return
 
     rules = load_quality_rules(settings)
+    # 1.7：去AI 不经 agent 流水线，cross checks 在此直调（design §3.3 直调例外；
+    # 参照集已在 _build_agent 构造，exclude=本文件，C18 语义落地）
     issues = [
-        i for i in run_checks(content, rules)
+        i for i in run_checks(content, rules) + run_cross_checks(content, agent.recent_endings, rules)
         if i.get("quote") and i["quote"] in content  # 只取可定位（B10）
     ]
     if not issues:
@@ -1040,6 +1088,13 @@ def _do_index(args: List[str], settings: Settings) -> None:
             print(f"✅ 已删除 {n} 块" if n else f"⚠️ 向量库中没有该文件的块：{path}")
         except Exception as e:
             print(f"❌ 删除失败：{e}")
+    elif sub == "clear-chapters":
+        # 手改大量正文后一键清陈块（设定/文风基准块不动；前文连贯靠工作记忆+滚动注入）
+        try:
+            n = rag.remove_chapters()
+            print(f"✅ 已清空全部正文块（{n} 块）" if n else "⚠️ 向量库中没有正文块")
+        except Exception as e:
+            print(f"❌ 清空失败：{e}")
     else:
         # 无参或未知子命令：显示状态 + 帮助
         try:
@@ -1051,6 +1106,7 @@ def _do_index(args: List[str], settings: Settings) -> None:
         print("  index rebuild         全量重建（遵守 NOVEL_INDEX_EXCLUDE，不索引正文）")
         print("  index add <路径>      手动加单文件（相对 NOVEL_DIR 或绝对路径；不受排除限制）")
         print("  index remove <路径>   手动删某文件的所有块")
+        print("  index clear-chapters  清空全部正文块（手改大量正文后一键清陈块）")
 
 
 def _print_unresolved(wm: WorkingMemory) -> None:
@@ -1278,6 +1334,87 @@ def _do_status(settings: Settings) -> None:
         print("planner：开（先规划节拍再写，reviewer 拿节拍当验收基准）")
     else:
         print("planner：关（writer 自行构思；NOVEL_PLANNER=1 开启）")
+    # 1.7 跨章禁则状态行（C12：配置静默失效必须可发现）
+    try:
+        rules = load_quality_rules(settings)
+    except RuntimeError as e:
+        print(f"跨章禁则：❌ {e}")
+    else:
+        end_cfg = (rules or {}).get("ending") or {}
+        syn_cfg = (rules or {}).get("syntax_patterns") or {}
+        if not (end_cfg or syn_cfg):
+            print("跨章禁则：未配置（质量规则.json 缺 ending / syntax_patterns 键）")
+        else:
+            parts = []
+            if end_cfg:
+                endings = load_recent_endings(
+                    settings.human_text_full, end_cfg.get("lookback", 10))
+                taboos = build_style_taboos(endings, rules)
+                n_ban = len([ln for ln in taboos.splitlines() if ln.startswith("- 收束句")])
+                parts.append(f"参照最近 {end_cfg.get('lookback', 10)} 章（实得 {len(endings)} 章）"
+                             f" · 禁用收束句 {n_ban} 条")
+            if syn_cfg:
+                parts.append(f"句式配额 {len(syn_cfg.get('patterns') or [])} 条")
+            print("跨章禁则：" + " · ".join(parts))
+
+
+def _do_style_scan(args: List[str], settings: Settings) -> None:
+    """风格体检 [目录]（1.9 诊断，C13-C15）：纯代码扫描，零 LLM 调用。
+
+    - 目录参数可选（相对 NOVEL_DIR 解析或绝对），默认人工正文目录；
+    - 三节报告：收束句复读榜 / 句式命中榜 / 分卷字数分布（服务人工改稿决策）；
+    - 不落 run record（D9：诊断工具，人是标尺，同去AI 命令先例）；
+    - 目录不存在 / 无可扫描文件 -> 提示后正常退出（C15，不崩 REPL）。
+    """
+    try:
+        settings.require_novel_dir()
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+    target = " ".join(args) if args else ""
+    if target:
+        p = Path(target).expanduser()
+        dir_path = p if p.is_absolute() else settings.novel_path / p
+    else:
+        dir_path = settings.human_text_full
+    if not dir_path.is_dir():
+        print(f"❌ 目录不存在：{dir_path}")
+        return
+    try:
+        rules = load_quality_rules(settings)
+    except RuntimeError as e:  # A23：非法 pattern 等，命令层兜住
+        print(f"❌ {e}")
+        return
+    report = scan_style_report(dir_path, rules)
+    if not report["files_scanned"]:
+        print(f"无可扫描的 .md/.txt 文件 @ {dir_path}")
+        return
+
+    print(f"=== 风格体检 @ {dir_path}（{report['files_scanned']} 个文件，零 LLM）===\n")
+
+    print("--- 收束句复读榜（归一化结尾按出现次数降序）---")
+    if report["endings"]:
+        for row in report["endings"]:
+            print(f"\n「{row['ending']}」× {row['count']} 次")
+            for f in row["files"]:
+                print(f"    {f}")
+    else:
+        print("（无达到阈值的复读结尾）")
+
+    print("\n--- 句式命中榜（各模板总次数 + 超配额章清单）---")
+    if report["patterns"]:
+        for row in report["patterns"]:
+            print(f"\n「{row['pattern']}」共 {row['total']} 次")
+            for over in row["over"]:
+                print(f"    超配额：{over['file']}（{over['count']} 次）")
+    else:
+        print("（未配置 syntax_patterns 或无命中）")
+
+    print("\n--- 字数分布（按顶层子目录分组）---")
+    print(f"{'分组':<10}{'章数':>5}{'最小':>8}{'最大':>8}{'均值':>9}{'变异系数':>9}")
+    for row in report["sizes"]:
+        print(f"{row['group']:<10}{row['n']:>5}{row['min']:>8}{row['max']:>8}"
+              f"{row['mean']:>9}{row['cv']:>9}")
 
 
 def _do_replay(args: List[str], settings: Settings) -> None:
@@ -1288,7 +1425,6 @@ def _do_replay(args: List[str], settings: Settings) -> None:
         replay(args[0], settings)
     except FileNotFoundError:
         print(f"❌ 找不到运行记录：{args[0]}")
-
 
 def _do_eval(args: List[str], settings: Settings) -> None:
     if not args:
@@ -1359,6 +1495,7 @@ def _print_help() -> None:
     print("  test <run_id>    规则断言测试")
     print("  回测门禁 [条数]  历史runs跑评委回测门禁阈值（分数有缓存，命中不重烧）")
     print("  状态             查看当前写到第几章、角色状态、未回收伏笔")
+    print("  风格体检 [目录]  文风复读诊断（收束句复读榜/句式命中榜/字数分布，零 LLM）")
     print("  伏笔             查看未回收伏笔（编号+埋设章+描述）")
     print("  伏笔 删 <编号>    标记已回收（出列入归档，`伏笔 已回收` 可查可找回；多个编号空格分隔）")
     print("  伏笔 加 <描述>    手动补录一条（埋设章号取当前章，不被同章重写覆盖）")
@@ -1426,6 +1563,8 @@ def main() -> None:
                 _do_index(args, settings)
             elif cmd in ("状态", "status"):
                 _do_status(settings)
+            elif cmd == "风格体检":
+                _do_style_scan(args, settings)
             elif cmd == "伏笔":
                 _do_foreshadow(args, settings)
             elif cmd == "角色":

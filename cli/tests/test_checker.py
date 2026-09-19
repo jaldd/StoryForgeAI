@@ -2,6 +2,7 @@
 import dataclasses
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -339,3 +340,302 @@ def test_load_baseline_human_text_empty_reads_exemplar_only(tmp_settings, tmp_pa
     assert base is not None
     full = "他走了很久。风停了。"
     assert base.total_chars == len(full)
+
+
+# ---------- 1.7 跨章指纹（style-repeat T1：extract/normalize/load/compile）----------
+from novel_agent.checker import (
+    compile_syntax_patterns,
+    extract_ending,
+    load_recent_endings,
+    normalize_ending,
+    run_cross_checks,
+    scan_style_report,
+)
+
+
+def test_extract_ending_basic():
+    assert extract_ending("第一段。\n\n第二段。\n") == "第二段。"
+
+
+def test_extract_ending_skips_separator_and_heading():
+    """末行是分隔线/标题行时向上找正文（C2）。"""
+    assert extract_ending("正文。\n\n---\n") == "正文。"
+    assert extract_ending("正文。\n\n***\n\n## 尾注\n") == "正文。"
+    assert extract_ending("正文。\n\n# 后记\n") == "正文。"
+
+
+def test_extract_ending_quote_line():
+    """引号行也是正文（对话收尾常见）。"""
+    assert extract_ending("他走了。\n\n「风很轻。」") == "「风很轻。」"
+
+
+def test_extract_ending_empty():
+    assert extract_ending("") == ""
+    assert extract_ending("\n\n---\n\n# 标题\n") == ""
+
+
+def test_normalize_ending_strips_punct():
+    assert normalize_ending("风很轻。") == "风很轻"
+    assert normalize_ending("风很轻。。。") == "风很轻"
+    assert normalize_ending("风很轻？！") == "风很轻"
+    # 右引号剥掉、左引号保留（对话收尾与叙述收尾是不同形态）
+    assert normalize_ending("「风很轻。」") == "「风很轻"
+    assert normalize_ending("  风很轻  ") == "风很轻"
+    assert normalize_ending("嗯。") == "嗯"
+
+
+def test_normalize_ending_equality():
+    """归一化后相等 = 同一收束句（C2 口径）。"""
+    assert normalize_ending("风很轻。") == normalize_ending("风很轻")
+
+
+def _mk_chapter(root, rel, ending):
+    f = root / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(f"开头。\n\n中间。\n\n{ending}\n", encoding="utf-8")
+    return f
+
+
+def test_load_recent_endings_tail_lookback(tmp_path):
+    """按章序取尾部 lookback 个（C7）。"""
+    root = tmp_path / "正文"
+    for i in range(1, 6):
+        _mk_chapter(root, f"第一卷-{i:02d}.md", f"结尾{i}")
+    endings = load_recent_endings(root, lookback=3)
+    assert endings == ["结尾3", "结尾4", "结尾5"]
+
+
+def test_load_recent_endings_cross_volume_order(tmp_path):
+    """跨卷章序（Z7）：中文数字卷名字典序陷阱（一<三<二）必须被解析纠正。"""
+    root = tmp_path / "正文"
+    _mk_chapter(root, "第三卷/卷三-01.md", "三卷一章")
+    _mk_chapter(root, "第一卷/卷一-01.md", "一卷一章")
+    _mk_chapter(root, "第一卷/卷一-02.md", "一卷二章")
+    _mk_chapter(root, "第二卷/卷二-01.md", "二卷一章")
+    endings = load_recent_endings(root, lookback=10)
+    assert endings == ["一卷一章", "一卷二章", "二卷一章", "三卷一章"]
+
+
+def test_load_recent_endings_cn_volume_combination(tmp_path):
+    """中文数字组合（「二十三」）与阿拉伯数字卷名（Z7 三态）。"""
+    root = tmp_path / "正文"
+    _mk_chapter(root, "第23卷/a-01.md", "二十三卷")
+    _mk_chapter(root, "第二十三卷/b-01.md", "二十三卷中文")
+    _mk_chapter(root, "第9卷/c-01.md", "九卷")
+    endings = load_recent_endings(root, lookback=10)
+    assert endings == ["九卷", "二十三卷", "二十三卷中文"]
+
+
+def test_load_recent_endings_unparseable_falls_back(tmp_path):
+    """不可解析卷名回退字典序且排在可解析之后（Z7）。"""
+    root = tmp_path / "正文"
+    _mk_chapter(root, "杂记/x-01.md", "杂记结尾")
+    _mk_chapter(root, "第一卷/卷一-01.md", "一卷结尾")
+    endings = load_recent_endings(root, lookback=10)
+    assert endings == ["一卷结尾", "杂记结尾"]
+
+
+def test_load_recent_endings_exclude(tmp_path):
+    """exclude 排除被处理文件自身（C18 防自比）。"""
+    root = tmp_path / "正文"
+    f1 = _mk_chapter(root, "第一卷-01.md", "结尾一")
+    f2 = _mk_chapter(root, "第一卷-02.md", "结尾二")
+    endings = load_recent_endings(root, lookback=10, exclude=f2)
+    assert endings == ["结尾一"]
+    # exclude 相对路径同样生效
+    endings2 = load_recent_endings(root, lookback=10, exclude=Path("第一卷-02.md"))
+    assert endings2 == ["结尾一"]
+
+
+def test_load_recent_endings_empty_and_missing(tmp_path):
+    assert load_recent_endings(tmp_path / "不存在", lookback=10) == []
+    root = tmp_path / "正文"
+    root.mkdir()
+    assert load_recent_endings(root, lookback=10) == []
+    assert load_recent_endings(root, lookback=0) == []
+
+
+def test_load_recent_endings_ignores_hidden(tmp_path):
+    """点前缀目录与 .agent 不进参照集（Z6 同款）。"""
+    root = tmp_path / "正文"
+    _mk_chapter(root, ".agent/run-01.md", "隐藏结尾")
+    _mk_chapter(root, ".drafts/x-01.md", "草稿结尾")
+    _mk_chapter(root, "第一卷-01.md", "正常结尾")
+    assert load_recent_endings(root, lookback=10) == ["正常结尾"]
+
+
+def test_compile_syntax_patterns_ok():
+    rules = {"syntax_patterns": {"patterns": ["像一个人", "不是[^，。]{1,12}"], "max_per_chapter": 1}}
+    pats = compile_syntax_patterns(rules)
+    assert len(pats) == 2
+
+
+def test_compile_syntax_patterns_missing_key():
+    assert compile_syntax_patterns({}) == []
+    assert compile_syntax_patterns({"syntax_patterns": {}}) == []
+
+
+def test_compile_syntax_patterns_invalid_regex():
+    with pytest.raises(RuntimeError, match="合法正则"):
+        compile_syntax_patterns({"syntax_patterns": {"patterns": ["(["]}})
+
+
+def test_compile_syntax_patterns_zero_width_rejected():
+    """可零宽匹配（pat.search("") 命中）加载期拒收（C4/Z2）。"""
+    with pytest.raises(RuntimeError, match="零宽"):
+        compile_syntax_patterns({"syntax_patterns": {"patterns": ["(像|仿佛)?"]}})
+
+
+# ---------- 1.7 run_cross_checks（style-repeat T2）----------
+END_RULES = {"ending": {"lookback": 10, "max_repeat": 2, "min_chars": 3}}
+SYN_RULES = {"syntax_patterns": {"patterns": ["像一个人"], "max_per_chapter": 1}}
+
+
+def test_cross_ending_hit():
+    """参照窗内同结尾已 2 次 + 本章 = 3 > max_repeat 2 -> issue（C1）。"""
+    text = "开头。\n\n风很轻。"
+    issues = run_cross_checks(text, ["别的", "风很轻", "风很轻"], END_RULES)
+    assert len(issues) == 1
+    assert issues[0]["quote"] == "风很轻。"  # 原文子串（可定位）
+    assert issues[0]["quote"] in text
+    assert "收束句复读" in issues[0]["problem"]
+
+
+def test_cross_ending_at_threshold_no_hit():
+    """次数恰等于 max_repeat（含本章）不报（不误伤）。"""
+    text = "开头。\n\n风很轻。"
+    assert run_cross_checks(text, ["别的", "风很轻"], END_RULES) == []
+
+
+def test_cross_ending_min_chars_exempt():
+    """归一化后 < min_chars 的超短结尾豁免（「嗯。」）。"""
+    text = "开头。\n\n嗯。"
+    assert run_cross_checks(text, ["嗯", "嗯"], END_RULES) == []
+
+
+def test_cross_ending_none_endings_skip():
+    """recent_endings 为 None/[] -> ending 项跳过（C5）。"""
+    text = "开头。\n\n风很轻。"
+    assert run_cross_checks(text, None, END_RULES) == []
+    assert run_cross_checks(text, [], END_RULES) == []
+
+
+def test_cross_syntax_hit():
+    """pattern 命中 2 次 > 配额 1 -> issue，quote 为原文子串（C3）。"""
+    text = "他像一个人立在风里。\n\n她像一个人坐在门口。"
+    issues = run_cross_checks(text, None, SYN_RULES)
+    assert len(issues) == 1
+    assert "句式模板超配额" in issues[0]["problem"]
+    assert issues[0]["quote"] in text
+
+
+def test_cross_syntax_at_quota_no_hit():
+    text = "他像一个人立在风里。"
+    assert run_cross_checks(text, None, SYN_RULES) == []
+
+
+def test_cross_syntax_with_capture_group():
+    """含捕获组的 pattern 用 group(0) 定位（Z5 finditer 统一口径）。"""
+    rules = {"syntax_patterns": {"patterns": ["不是[^，。]{1,12}[。，][^。]{0,4}是"], "max_per_chapter": 1}}
+    text = "这不是愤怒，是疲惫。\n\n那不是拒绝，是恐惧。"
+    issues = run_cross_checks(text, None, rules)
+    assert len(issues) == 1
+    assert issues[0]["quote"] in text
+
+
+def test_cross_syntax_cross_sentence_quote_locatable():
+    """跨句命中（含句号+换行）quote 仍须落在单句内（真车 refine_20260919_201749
+    4 轮不收敛的根因回归：group(0)='不是拨。\\n\\n是' 不落在任何单句，
+    旧定位兜底返回命中串本身 -> fixer 段落定位失败 -> 整文降级死循环）。"""
+    rules = {"syntax_patterns": {"patterns": ["不是[^，。]{1,12}[。，][^。]{0,4}是"], "max_per_chapter": 1}}
+    text = (
+        "开头一句。\n\n"
+        "那年那天，不是拨。\n\n"
+        "是他太想让它好。\n\n"
+        "他不是不敢去。\n\n"
+        "是那股劲先按住了他。\n\n"
+        "结尾句。"
+    )
+    issues = run_cross_checks(text, None, rules)
+    assert len(issues) == 1
+    q = issues[0]["quote"]
+    assert q in text                       # 原文子串（fixer 可定位）
+    assert "\n" not in q                   # 单句（不含段落边界 -> 段落级修复可达）
+    assert "不是" in q                     # 指向首个命中所在句
+
+
+def test_cross_both_keys_missing():
+    """两键全缺 -> []（C16 双降级）。"""
+    text = "开头。\n\n风很轻。"
+    assert run_cross_checks(text, ["风很轻"], {}) == []
+    assert run_cross_checks(text, ["风很轻"], {"blacklist": ["x"]}) == []
+
+
+def test_cross_issue_shape_same_as_run_checks():
+    """issue 与 run_checks 同构 {quote, problem, fix}（C6）。"""
+    issues = run_cross_checks("开头。\n\n风很轻。", ["风很轻", "风很轻"], END_RULES)
+    assert set(issues[0].keys()) == {"quote", "problem", "fix"}
+
+
+# ---------- 1.9 scan_style_report（style-repeat T5）----------
+def test_scan_style_report_full(tmp_path):
+    """三节报告形状与数值（C13）：复读榜/句式榜/字数分布。"""
+    root = tmp_path / "正文"
+    for i in range(1, 4):
+        _mk_chapter(root, f"第一卷/卷一-{i:02d}.md", "风很轻。")
+    _mk_chapter(root, "第二卷/卷二-01.md", "别的结尾。")
+    (root / "第一卷/卷一-01.md").write_text(
+        "他像一个人立在风里。\n\n像一个人坐着。\n\n风很轻。\n", encoding="utf-8")
+    rules = {**END_RULES, **SYN_RULES}
+    r = scan_style_report(root, rules)
+    assert r["files_scanned"] == 4
+    # 复读榜：风很轻 3 次（>= max_repeat+1=3）上榜，附文件清单
+    assert len(r["endings"]) == 1
+    assert r["endings"][0]["ending"] == "风很轻"
+    assert r["endings"][0]["count"] == 3
+    assert len(r["endings"][0]["files"]) == 3
+    # 句式榜：像一个人 只在卷一-01 命中 2 次（其余章无该模板）
+    assert len(r["patterns"]) == 1
+    assert r["patterns"][0]["total"] == 2
+    assert r["patterns"][0]["over"] == [{"file": "第一卷/卷一-01.md", "count": 2}]
+    # 字数分布：两卷分组 + 全局行
+    groups = [row["group"] for row in r["sizes"]]
+    assert groups == ["第一卷", "第二卷", "全局"]
+    vol1 = r["sizes"][0]
+    assert vol1["n"] == 3 and vol1["min"] <= vol1["max"] and vol1["mean"] > 0
+
+
+def test_scan_style_report_cv(tmp_path):
+    """字数完全一致 -> cv=0（实测「45 章全落 5.8-6.0KB」的量化口径）。"""
+    root = tmp_path / "正文"
+    root.mkdir(parents=True)
+    for i in range(1, 4):
+        (root / f"第一卷-{i:02d}.md").write_text("x" * 100, encoding="utf-8")
+    r = scan_style_report(root, {})
+    assert r["sizes"][0]["cv"] == 0.0
+    assert r["sizes"][0]["n"] == 3
+
+
+def test_scan_style_report_empty_and_missing(tmp_path):
+    """目录不存在/无文件 -> files_scanned=0（C15）。"""
+    assert scan_style_report(tmp_path / "不存在", {})["files_scanned"] == 0
+    empty = tmp_path / "空"
+    empty.mkdir()
+    assert scan_style_report(empty, {})["files_scanned"] == 0
+
+
+def test_scan_style_report_ignores_hidden(tmp_path):
+    """忽略 .agent 与点前缀目录（Z6）。"""
+    root = tmp_path / "正文"
+    _mk_chapter(root, ".agent/x.md", "隐藏")
+    _mk_chapter(root, "第一卷-01.md", "正常。")
+    r = scan_style_report(root, {})
+    assert r["files_scanned"] == 1
+
+
+def test_scan_style_report_rules_missing_sections_empty(tmp_path):
+    """规则键缺失 -> 对应节为空列表（不误伤）。"""
+    root = tmp_path / "正文"
+    _mk_chapter(root, "第一卷-01.md", "风很轻。")
+    r = scan_style_report(root, {})
+    assert r["endings"] == [] and r["patterns"] == []

@@ -9,6 +9,7 @@ from pathlib import Path
 from novel_agent import cli
 from novel_agent.prompts import (
     EXEMPLAR_MAX_CHARS,
+    build_style_taboos,
     deai_system,
     deai_user,
     exemplar_info,
@@ -471,3 +472,66 @@ def test_arc_user_renders_list_and_chapter():
 
     empty = arc_user("正文。", [])
     assert "（无）" in empty
+
+
+# ---------- 1.7/1.8 文风禁则注入（style-repeat T4）----------
+TABOO_RULES = {
+    "ending": {"lookback": 10, "max_repeat": 2, "min_chars": 3},
+    "syntax_patterns": {"patterns": ["像一个人"], "max_per_chapter": 1},
+}
+
+
+def test_build_style_taboos_deterministic():
+    """C11：同输入两次构造结果相同（纯函数）。"""
+    endings = ["风很轻", "风很轻", "别的"]
+    assert build_style_taboos(endings, TABOO_RULES) == build_style_taboos(endings, TABOO_RULES)
+
+
+def test_build_style_taboos_content():
+    """C9：超配额收束句 + 句式配额都进分节，含「禁」语义。"""
+    taboos = build_style_taboos(["风很轻", "风很轻", "别的"], TABOO_RULES)
+    assert "【近期文风禁则】" in taboos
+    assert "收束句「风很轻」" in taboos
+    assert "已用2次" in taboos
+    assert "禁止再用" in taboos
+    assert "句式模板「像一个人」" in taboos
+    assert "每章最多1次" in taboos
+
+
+def test_build_style_taboos_empty_inputs():
+    """无内容 -> ""（整块不占位）。"""
+    assert build_style_taboos(None, {}) == ""
+    assert build_style_taboos([], {}) == ""
+    # 无参照章：句式配额仍注入（预防优先），但无收束句列表项
+    taboos = build_style_taboos(None, TABOO_RULES)
+    assert "句式模板" in taboos and "- 收束句" not in taboos
+    # 参照窗内无超配额结尾且无句式键 -> ""
+    assert build_style_taboos(["别的"], {"ending": {"max_repeat": 2}}) == ""
+
+
+def test_build_style_taboos_cap_five():
+    """护栏：收束句最多列 5 条（防分节膨胀）。"""
+    endings = [f"结尾{i}" for i in range(8)] * 2  # 8 种各 2 次，全超配额
+    taboos = build_style_taboos(endings, TABOO_RULES)
+    n_endings = len([ln for ln in taboos.splitlines() if ln.startswith("- 收束句")])
+    assert n_endings == 5
+
+
+def test_build_style_taboos_min_chars_exempt():
+    """min_chars 以下超短结尾不进禁则（与检查口径一致）。"""
+    taboos = build_style_taboos(["嗯", "嗯"], TABOO_RULES)
+    assert "「嗯」" not in taboos
+
+
+def test_writer_system_style_taboos_block():
+    """C9/C16：禁则分节落在近期人工正文之后；空串不占位。"""
+    base = writer_system("测试小说", "", "范例", recent_human="人工正文片段")
+    assert "近期文风禁则" not in base
+    with_block = writer_system(
+        "测试小说", "", "范例", recent_human="人工正文片段",
+        style_taboos="【近期文风禁则】（测试）\n- 收束句「风很轻」：禁止再用")
+    assert "【近期文风禁则】" in with_block
+    assert with_block.startswith(base)  # 既有分节零改动，追加在最后
+    # 空串与不传参逐字节一致（既有调用零改动）
+    assert writer_system("测试小说", "", "范例") == writer_system(
+        "测试小说", "", "范例", style_taboos="")

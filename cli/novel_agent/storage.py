@@ -31,6 +31,8 @@ __all__ = [
     "save_chapter",
     "save_working_memory",
     "load_working_memory",
+    "extract_leading_title",
+    "preserve_leading_title",
 ]
 
 WORKING_MEMORY_FILE = "working_memory.json"
@@ -50,6 +52,29 @@ def _strip_leading_title(text: str) -> str:
             break
         text = text[m.end():].lstrip()
     return text
+
+
+def extract_leading_title(text: str) -> str:
+    """开头的章节标题行（strip 后，不含尾随空行）；无标题返回 ""。"""
+    m = _LEADING_TITLE_RE.match(text.lstrip())
+    return m.group(0).strip() if m else ""
+
+
+def preserve_leading_title(original: str, refined: str) -> str:
+    """精修/重写存回时保住章标题行（polisher/writer 常不回显标题）。
+
+    - 原文无标题 -> refined 原样返回（不凭空添）；
+    - 原文有标题 -> 结果以原文标题行开头（真车 2026-09-19 精修第一卷-04 丢
+      「## 第四章 余温」的修复）：refined 未带标题则补回；自带变体（如少了
+      ## 前缀）则统一替换回原文标题，与落盘约定格式一致；
+    - 标题后正文原样保留，仅规范化标题与正文间为一个空行。
+    """
+    title = extract_leading_title(original)
+    if not title:
+        return refined
+    m = _LEADING_TITLE_RE.match(refined.lstrip())
+    body = refined.lstrip()[m.end():].lstrip() if m else refined.lstrip()
+    return f"{title}\n\n{body}" if body else title
 
 
 # ---------- 任务解析 ----------

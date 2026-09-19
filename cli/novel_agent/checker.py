@@ -16,12 +16,21 @@ from typing import Optional
 
 from .prompts import _exemplar_files
 
-__all__ = ["load_quality_rules", "split_sentences", "run_checks", "load_baseline", "ai_flavor_score"]
+__all__ = [
+    "load_quality_rules", "split_sentences", "run_checks", "load_baseline", "ai_flavor_score",
+    "extract_ending", "normalize_ending", "load_recent_endings", "compile_syntax_patterns",
+    "run_cross_checks", "scan_style_report",
+]
 
 _SENTENCE_DELIM = r"。！？!?；;\n"
 # 直引号 " ' 也算对话标记：正文章节常用直引号（弯/CJK 引号之外的真实分布）
 _QUOTE_CHARS = "「」『』“”‘’\"'"
 _QUOTE_TRUNC = 50
+
+# 1.7 收束句归一化：循环剥掉的句末标点尾缀（design §3.1）。
+# 注意含「」』右引号（剥「风很轻。」的句号后连右引号一起剥，归一到「风很轻」）
+# 但不含左引号「『（开头引号是内容的一部分，剥掉会破坏比对形态）。
+_SENT_STRIP = "。！？…—，、；：“”‘’」』?!."
 
 # AI 味三组件默认权重与锚点（design §3.1.3；ai_score 可配覆盖）
 _DEFAULT_WEIGHTS = {"blacklist": 0.4, "sentence": 0.3, "freq": 0.3}
@@ -84,6 +93,27 @@ def _first_sentence_with(sentences: list[str], word: str) -> str:
         if word in sent:
             return sent[:_QUOTE_TRUNC]
     return word  # 理论不可达（词在文中必有归属句），兜底保 quote 可定位
+
+
+def _sentence_at(text: str, sentences: list[str], pos: int) -> str:
+    """命中起点（pos）所在的句子（截前 50 字，原文子串）。
+
+    跨句命中（如「不是拨。\\n\\n是」含句号换行）时 group(0) 不落在任何单句内，
+    _first_sentence_with 会兜底返回命中串本身 -> fixer 段落定位失败 -> 整文降级。
+    改按命中起点定位：起点所在句必存在且是原文子串（真车 refine_20260919_201749
+    4 轮不收敛的根因修复）。
+    """
+    consumed = 0
+    for sent in sentences:
+        idx = text.find(sent, consumed)
+        if idx < 0:
+            continue
+        end = idx + len(sent)
+        if idx <= pos < end:
+            return sent[:_QUOTE_TRUNC]
+        consumed = max(consumed, end)
+    # 兜底：命中起点附近的原文窗口（必为原文子串，可定位）
+    return text[max(0, pos - 20):pos + 30]
 
 
 def run_checks(text: str, rules: Optional[dict]) -> list[dict]:
@@ -163,6 +193,196 @@ def run_checks(text: str, rules: Optional[dict]) -> list[dict]:
                 "fix": "删减比喻，保留最有效的少数",
             })
 
+    return issues
+
+
+# ---------- 1.7 跨章文风指纹（style-repeat，design §3.1/§3.2，零 LLM）----------
+_CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNIT = {"十": 10, "百": 100}
+_VOLUME_RE = re.compile(r"第\s*([0-9零一二三四五六七八九十百]+)\s*[卷部册]")
+_CHAPTER_NUM_RE = re.compile(r"-(\d+)$")
+
+
+def _cn_to_int(s: str) -> Optional[int]:
+    """中文数字（一~百，含「二十三」组合）-> int；解析失败返回 None。"""
+    if not s:
+        return None
+    total, num = 0, 0
+    for ch in s:
+        if ch in _CN_DIGIT:
+            num = _CN_DIGIT[ch]
+        elif ch in _CN_UNIT:
+            if num == 0:
+                num = 1  # 「十」开头 = 一十
+            total += num * _CN_UNIT[ch]
+            num = 0
+        else:
+            return None
+    return total + num
+
+
+def _volume_key(name: str) -> tuple[int, int, str]:
+    """目录名 -> 排序键（Z7）：可解析「第X卷/部/册」（中文或阿拉伯数字）或纯数字名
+    -> (0, 卷序, 名字)；不可解析 -> (1, 0, 名字) 字典序排在可解析之后。"""
+    m = _VOLUME_RE.search(name)
+    if m:
+        token = m.group(1)
+        n = int(token) if token.isdigit() else _cn_to_int(token)
+        if n is not None:
+            return (0, n, name)
+    if name.isdigit():
+        return (0, int(name), name)
+    return (1, 0, name)
+
+
+def _chapter_key(path: Path) -> tuple[int, int, str]:
+    """文件名 -> 组内排序键（Z7）：尾部 `-数字`（如「-01」）-> (0, 章号, 名字)；
+    无数字回退 (1, 0, 名字) 字典序排后。"""
+    m = _CHAPTER_NUM_RE.search(path.stem)
+    if m:
+        return (0, int(m.group(1)), path.name)
+    return (1, 0, path.name)
+
+
+def extract_ending(text: str) -> str:
+    """最后一个非空行（C2）：跳过 `---`/`***` 分隔行与 `#` 标题行；无正文返回 ""。"""
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if len(s) >= 3 and set(s) <= {"-", "*"}:
+            continue  # 分隔线
+        return s
+    return ""
+
+
+def normalize_ending(line: str) -> str:
+    """归一化（C2）：strip + 循环剥句末标点尾缀 + 再 strip（「风很轻。」=「风很轻」）。"""
+    s = line.strip()
+    while s and s[-1] in _SENT_STRIP:
+        s = s[:-1].rstrip()
+    return s.strip()
+
+
+def _collect_chapter_files(root: Path) -> list[Path]:
+    """递归收集章节文件（.md，忽略点前缀目录/文件与 .agent，Z6 同款）。"""
+    files: list[Path] = []
+    if not root.is_dir():
+        return files
+    for q in root.rglob("*"):
+        if not q.is_file() or q.suffix.lower() != ".md":
+            continue
+        rel = q.relative_to(root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        files.append(q)
+    return files
+
+
+def _cross_volume_sort(files: list[Path], root: Path) -> list[Path]:
+    """跨卷章序排序（Z7）：卷序（目录名解析）优先，组内章序（文件名尾部数字）次之。"""
+    def key(f: Path):
+        rel = f.relative_to(root)
+        vol = rel.parts[0] if len(rel.parts) > 1 else ""
+        return (_volume_key(vol), _chapter_key(f))
+    return sorted(files, key=key)
+
+
+def load_recent_endings(
+    dir_path: Path,
+    lookback: int,
+    exclude: Optional[Path] = None,
+) -> list[str]:
+    """参照章归一化结尾列表（C7）：人工正文目录按跨卷章序取尾部 lookback 个 .md。
+
+    - exclude = 被精修/重写/去AI 处理中的文件（C18 防自比双计）；
+    - 目录不存在 / lookback<=0 / 无文件 -> []；不可读文件跳过不阻断；
+    - 纯函数、现算、无缓存（D1：章节文件是唯一真源）。
+    """
+    root = Path(dir_path)
+    if lookback <= 0 or not root.is_dir():
+        return []
+    files = _collect_chapter_files(root)
+    if exclude is not None:
+        ex = Path(exclude).expanduser()
+        if not ex.is_absolute():
+            ex = root / ex
+        ex = ex.resolve()
+        files = [f for f in files if f.resolve() != ex]
+    if not files:
+        return []
+    endings: list[str] = []
+    for f in _cross_volume_sort(files, root)[-lookback:]:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue  # 不可读跳过，不阻断
+        endings.append(normalize_ending(extract_ending(text)))
+    return endings
+
+
+def compile_syntax_patterns(rules: dict) -> list[re.Pattern]:
+    """syntax_patterns.patterns 预编译（C4）：非法正则或可零宽匹配（pat.search("")
+    命中）-> RuntimeError 含 pattern 原文（A23 口径，不静默放行）；键缺失 -> []。"""
+    pats = ((rules or {}).get("syntax_patterns") or {}).get("patterns") or []
+    compiled: list[re.Pattern] = []
+    for src in pats:
+        try:
+            pat = re.compile(src)
+        except re.error as e:
+            raise RuntimeError(f"句式模板不是合法正则（{src!r}）: {e}")
+        if pat.search(""):
+            raise RuntimeError(f"句式模板可零宽匹配，计数会爆炸（{src!r}）")
+        compiled.append(pat)
+    return compiled
+
+
+def run_cross_checks(
+    text: str,
+    recent_endings: Optional[list[str]],
+    rules: dict,
+) -> list[dict]:
+    """两项跨章检查 -> issues（与 run_checks 同构，C1/C3/C5）。
+
+    1. ending：本章归一化结尾在参照窗内（含本章）出现次数 > max_repeat -> issue；
+    2. syntax_patterns：某 pattern 本章命中次数 > max_per_chapter -> issue；
+    键缺失 / 参照章为空 -> 对应项跳过（零误伤）；两键全缺 -> []（C16）。
+    """
+    if not rules or not text:
+        return []
+    issues: list[dict] = []
+
+    end_cfg = rules.get("ending") or {}
+    if end_cfg and recent_endings:
+        min_chars = end_cfg.get("min_chars", 3)
+        max_repeat = end_cfg.get("max_repeat", 2)
+        mine = normalize_ending(extract_ending(text))
+        if len(mine) >= min_chars:
+            n = recent_endings.count(mine) + 1  # 含本章
+            if n > max_repeat:
+                issues.append({
+                    "quote": extract_ending(text)[:_QUOTE_TRUNC],
+                    "problem": (f"收束句复读：最近{len(recent_endings)}章该结尾已出现"
+                                f"{n - 1}次，含本章共{n}次（上限{max_repeat}）"),
+                    "fix": "重写结尾段：换一个动作或画面收束，不要复用近期用过的句子",
+                })
+
+    syn_cfg = rules.get("syntax_patterns") or {}
+    if syn_cfg:
+        max_per = syn_cfg.get("max_per_chapter", 1)
+        sentences: Optional[list[str]] = None
+        for pat in compile_syntax_patterns(rules):
+            matches = list(pat.finditer(text))
+            if len(matches) > max_per:
+                if sentences is None:
+                    sentences = split_sentences(text)
+                # 按命中起点定位句（跨句命中时 group(0) 不落在单句内，
+                # _first_sentence_with 会返回命中串本身导致 fixer 不可定位）
+                issues.append({
+                    "quote": _sentence_at(text, sentences, matches[0].start()),
+                    "problem": f"句式模板超配额：命中{len(matches)}次（上限{max_per}）",
+                    "fix": "删或改写多余命中，保留最有效的一处",
+                })
     return issues
 
 
@@ -273,3 +493,85 @@ def ai_flavor_score(text: str, rules: Optional[dict], baseline: Optional[Baselin
         "components": {k: int(round(v)) for k, v in components.items()},
         "degraded": degraded,
     }
+
+
+# ---------- 1.9 风格体检（style-repeat，design §3.5，纯代码零 LLM）----------
+def scan_style_report(dir_path: Path, rules: dict) -> dict:
+    """递归扫描 .md/.txt -> 三节报告数据（C13/C14）：收束句复读榜 / 句式命中榜 /
+    分卷字数分布。纯函数、同输入同输出。
+
+    - endings：归一化结尾全局频次，count >= max_repeat+1 才上榜（降序，附文件清单）；
+    - patterns：全部 pattern 的总命中数 + 超配额章清单（诊断要全貌，不是拦截）；
+    - sizes：按顶层子目录分组（Z3 规避中文数字卷名字典序陷阱）+ 全局行；
+    - 规则键缺失 -> 对应节为空列表；目录不存在/无文件 -> files_scanned=0。
+    """
+    root = Path(dir_path)
+    report: dict = {"endings": [], "patterns": [], "sizes": [], "files_scanned": 0}
+    if not root.is_dir():
+        return report
+    files = sorted(
+        q for q in root.rglob("*")
+        if q.is_file() and q.suffix.lower() in (".md", ".txt")
+        and not any(part.startswith(".") for part in q.relative_to(root).parts)
+    )
+    if not files:
+        return report
+    files = _cross_volume_sort(files, root)
+
+    end_cfg = (rules or {}).get("ending") or {}
+    syn_cfg = (rules or {}).get("syntax_patterns") or {}
+    min_chars = end_cfg.get("min_chars", 3) if end_cfg else 3
+    ending_threshold = (end_cfg.get("max_repeat", 2) + 1) if end_cfg else 3
+    compiled = compile_syntax_patterns(rules or {})
+
+    ending_files: dict[str, list[str]] = {}
+    pattern_hits: dict[str, list[tuple[str, int]]] = {p.pattern: [] for p in compiled}
+    pattern_total: dict[str, int] = {p.pattern: 0 for p in compiled}
+    sizes: dict[str, list[int]] = {}
+
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue  # 不可读跳过，不阻断
+        report["files_scanned"] += 1
+        rel = f.relative_to(root).as_posix()
+        group = rel.split("/", 1)[0] if "/" in rel else "(根目录)"
+        sizes.setdefault(group, []).append(len(text))
+
+        if end_cfg:
+            e = normalize_ending(extract_ending(text))
+            if len(e) >= min_chars:
+                ending_files.setdefault(e, []).append(rel)
+        for pat in compiled:
+            n = len(pat.findall(text))
+            pattern_total[pat.pattern] += n
+            if syn_cfg and n > syn_cfg.get("max_per_chapter", 1):
+                pattern_hits[pat.pattern].append((rel, n))
+
+    report["endings"] = [
+        {"ending": e, "count": len(fs), "files": fs}
+        for e, fs in sorted(
+            ending_files.items(), key=lambda kv: (-len(kv[1]), kv[0])
+        ) if len(fs) >= ending_threshold
+    ]
+    report["patterns"] = [
+        {"pattern": p, "total": pattern_total[p],
+         "over": [{"file": rel, "count": n} for rel, n in pattern_hits[p]]}
+        for p in pattern_total
+    ]
+    rows = []
+    for group in sorted(sizes):
+        ns = sizes[group]
+        mean = sum(ns) / len(ns)
+        std = math.sqrt(sum((x - mean) ** 2 for x in ns) / len(ns))
+        rows.append({"group": group, "n": len(ns), "min": min(ns), "max": max(ns),
+                     "mean": round(mean, 1), "cv": round(std / mean, 3) if mean else 0.0})
+    if rows:
+        all_ns = [x for ns in sizes.values() for x in ns]
+        mean = sum(all_ns) / len(all_ns)
+        std = math.sqrt(sum((x - mean) ** 2 for x in all_ns) / len(all_ns))
+        rows.append({"group": "全局", "n": len(all_ns), "min": min(all_ns), "max": max(all_ns),
+                     "mean": round(mean, 1), "cv": round(std / mean, 3) if mean else 0.0})
+    report["sizes"] = rows
+    return report

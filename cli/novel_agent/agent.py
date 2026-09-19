@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Settings, get_settings
-from .checker import run_checks
+from .checker import run_checks, run_cross_checks
 from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, build_context_pair, split_paragraphs
@@ -270,6 +270,8 @@ class NovelAgent:
         writer_llm: Optional[LLMClient] = None,
         recent_human: str = "",
         stream: bool = False,
+        recent_endings: Optional[list[str]] = None,
+        style_taboos: str = "",
     ):
         self.llm = llm
         self.rag = rag
@@ -280,6 +282,10 @@ class NovelAgent:
         self.instruction = instruction
         # 1.5 滚动注入：人工正文尾部 N 章片段，只进 writer prompt（B5）。
         self.recent_human = recent_human
+        # 1.7 跨章禁则：参照章归一化结尾（checker 跨章比对用；None = ending 键未配置）
+        # 与 writer 禁则分节（空串不占位，C9/C10）。
+        self.recent_endings = recent_endings
+        self.style_taboos = style_taboos
         # 0.2：写作铁律全文（NOVEL_DIR 下「写作铁律.md」），注入 writer/polisher/reviewer。
         self.rules = rules
         # 1.1：质量规则 dict（checker 五项机械检查）；None = 无规则 = checker 直通。
@@ -415,9 +421,10 @@ class NovelAgent:
         print("  ✍️  写作中（流式）...\n" if self.stream else "  ✍️  写作中（约30秒）...")
         retrieved = self._retrieve(state.task)
         # 1.5：滚动人工正文只注入 writer（polisher/reviewer 零改动，B5）
+        # 1.7：文风禁则分节同款只进 writer（C10，定调归 writer，D5）
         system = writer_system(
             self.novel_name, retrieved, self.exemplar, self.instruction,
-            self.rules, self.recent_human,
+            self.rules, self.recent_human, self.style_taboos,
         ) + self._working_context()
 
         # 2.2 规划注入（D12）：章纲要点进 writer prompt（空串整块不占位）；
@@ -628,6 +635,12 @@ class NovelAgent:
         - 打回 feedback 附命中摘要（规则名+次数，Z2），明细在 state.issues。
         """
         issues = run_checks(state.polished, self.quality_rules)
+        # 1.7 跨章检查（C6）：并入同一 issues 流（打回 fixer / review_count 共享 /
+        # 复检全部既有机制，零新状态）。两键全缺时 run_cross_checks 返回 []，
+        # 行为与现状逐字节一致（C16）；ending 键缺失时 recent_endings=None，
+        # ending 项跳过、syntax 项照跑（C5 各键独立降级）。
+        if self.quality_rules:
+            issues += run_cross_checks(state.polished, self.recent_endings, self.quality_rules)
         if not issues or state.review_count >= self.max_reviews:
             if issues:
                 print(f"  ⚠️ 规则检查命中 {len(issues)} 项，但打回已达上限 {self.max_reviews} 次，放行审稿")

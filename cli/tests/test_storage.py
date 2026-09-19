@@ -8,11 +8,13 @@ from pathlib import Path
 from novel_agent.memory import WorkingMemory
 from novel_agent.storage import (
     _strip_leading_title,
+    extract_leading_title,
     list_runs,
     load_run,
     load_working_memory,
     parse_chapter_file,
     parse_chapter_task,
+    preserve_leading_title,
     save_chapter,
     save_run,
     save_working_memory,
@@ -138,6 +140,49 @@ def test_strip_arabic_numeral():
 
 def test_strip_no_title_unchanged():
     assert _strip_leading_title("正文无标题") == "正文无标题"
+
+
+# ---------- preserve_leading_title（精修/重写存回标题保真）----------
+def test_extract_leading_title_variants():
+    """volume-align「## 第四章 余温」/平铺「第4章 标题」/中文数字均可提取。"""
+    assert extract_leading_title("## 第四章 余温\n\n正文") == "## 第四章 余温"
+    assert extract_leading_title("第4章 标题\n\n正文") == "第4章 标题"
+    assert extract_leading_title("第十二章 风裂\n正文") == "第十二章 风裂"
+    assert extract_leading_title("正文无标题") == ""
+    assert extract_leading_title("") == ""
+
+
+def test_preserve_title_polisher_dropped_title():
+    """polisher 洗掉标题（真车第一卷-04 场景）-> 以原文标题补回。"""
+    original = "## 第四章 余温\n\n灯关了。\n\n正文。"
+    refined = "灯关了。\n\n正文改后。"
+    assert preserve_leading_title(original, refined) == "## 第四章 余温\n\n灯关了。\n\n正文改后。"
+
+
+def test_preserve_title_kept_unchanged():
+    """polisher 回显了标题 -> 原样（不重复补）。"""
+    original = "## 第四章 余温\n\n正文。"
+    refined = "## 第四章 余温\n\n正文改后。"
+    assert preserve_leading_title(original, refined) == refined
+
+
+def test_preserve_title_variant_normalized_to_original():
+    """polisher 回显变体（少 ## 前缀）-> 统一替换回原文标题格式。"""
+    original = "## 第四章 余温\n\n正文。"
+    refined = "第四章 余温\n\n正文改后。"
+    assert preserve_leading_title(original, refined) == "## 第四章 余温\n\n正文改后。"
+
+
+def test_preserve_title_no_title_in_original_untouched():
+    """原文无标题 -> 不凭空添（改稿原样返回）。"""
+    refined = "正文改后。"
+    assert preserve_leading_title("正文。", refined) == refined
+
+
+def test_preserve_title_flat_format():
+    """平铺格式「第4章 标题」同款生效。"""
+    original = "第4章 标题\n\n正文。"
+    assert preserve_leading_title(original, "正文改后。") == "第4章 标题\n\n正文改后。"
 
 
 # ---------- save_chapter ----------

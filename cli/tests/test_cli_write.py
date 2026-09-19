@@ -27,6 +27,7 @@ class WriteAgent:
         self.feedback = feedback
         self.instruction = ""
         self.llm = self  # 摘要用（agent.llm.chat）
+        self.recent_endings = None  # 1.7：对齐真实 NovelAgent 接口（去AI 直调 cross checks 用）
 
     def run(self, task, run_id=None, temperature=0.9):
         state = PipelineState(task=task)
@@ -54,7 +55,7 @@ class WriteAgent:
 
 def _run_write(monkeypatch, tmp_settings, agent):
     """把 _build_agent / evaluate 替换掉后跑一次 _do_write。"""
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
 
@@ -152,7 +153,7 @@ def test_do_write_records_route(tmp_settings, fake_rag, monkeypatch, capsys):
     agent = WriteAgent(fake_rag)
     wm = WorkingMemory()
     route = RouteResult(files=["1.txt", "2.txt"], reason="日常章")
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, route))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, wm, route))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
 
@@ -165,7 +166,7 @@ def test_do_write_no_route_no_key(tmp_settings, fake_rag, monkeypatch, capsys):
     from novel_agent.storage import load_run
 
     agent = WriteAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
 
@@ -335,7 +336,7 @@ def test_refine_pass_refreshes_working_memory(tmp_settings, fake_rag, monkeypatc
 
     agent = RefineAgent(fake_rag)
     wm = WorkingMemory()
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, wm, None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_refine([str(chap)], tmp_settings)
 
@@ -346,6 +347,48 @@ def test_refine_pass_refreshes_working_memory(tmp_settings, fake_rag, monkeypatc
     assert wm2.last_plot_point == "第5章精修后的摘要。"
     out = capsys.readouterr().out
     assert "已覆盖存回" in out
+
+
+def test_refine_preserves_chapter_title(tmp_settings, fake_rag, monkeypatch, capsys):
+    """精修存回保住章标题（真车 2026-09-19 精修第一卷-04 丢「## 第四章 余温」的修复）：
+    polisher 不回显标题 -> 以原文标题行补回；run record 同步。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    chap = novel / "第04章-余温.md"
+    chap.write_text("## 第四章 余温\n\n旧正文。", encoding="utf-8")
+
+    class RefineAgent:
+        def __init__(self, rag):
+            self.rag = rag
+            self.instruction = ""
+
+        def refine(self, content, task, run_id=None, temperature=0.7):
+            state = PipelineState(task=task)
+            state.draft = content
+            state.polished = "新正文。"          # polisher 洗掉了标题
+            state.final_chapter = "新正文。"
+            state.feedback = "审稿通过：ok"
+            state.round = 2
+            state.log = []
+            record = {"run_id": "refine_t", "task": task, "timestamp": "",
+                      "config": {}, "initial_state": {}, "steps": [],
+                      "final_state": {"final_chapter": "新正文。"}}
+            return state, record
+
+        def summarize_chapter(self, chapter_text, max_tokens=1024):
+            return "摘要。"
+
+    agent = RefineAgent(fake_rag)
+    wm = WorkingMemory()
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, wm, None))
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_refine([str(chap)], tmp_settings)
+
+    # 存回文件以原文标题开头
+    assert chap.read_text(encoding="utf-8") == "## 第四章 余温\n\n新正文。"
+    # run record 的 final_state 同步带标题
+    rec = load_run("refine_t", tmp_settings)
+    assert rec["final_state"]["final_chapter"] == "## 第四章 余温\n\n新正文。"
 
 
 # ---------- 0.7 双 client 装配（T7）----------
@@ -387,7 +430,7 @@ def _write_gate_rules(tmp_settings, threshold=4.0):
 
 def _patch_write(monkeypatch, tmp_settings, agent, score):
     """门禁测试公共注入：假 agent + 假评委返回固定分。"""
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: score)
 
 
@@ -539,7 +582,7 @@ def _run_refine_gated(monkeypatch, tmp_settings, fake_rag, agent, score, confirm
     novel.mkdir(parents=True, exist_ok=True)
     chap = novel / "第05章-异乡风起.md"
     chap.write_text("旧正文。", encoding="utf-8")
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: score)
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: confirm)
     cli._do_refine([str(chap)], tmp_settings)
@@ -698,7 +741,7 @@ def _patch_deai(monkeypatch, final, new_text, before, after, issues):
 
 def _run_deai_write(monkeypatch, tmp_settings, agent):
     """_do_write 的 de-AI 测试公共注入：替身 agent + 跳过评测（同 _patch_write 模式）。"""
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
 
@@ -801,7 +844,7 @@ def _run_deai_cmd(monkeypatch, tmp_settings, agent, confirm, before=80, after=50
     issues = [{"quote": "AI味重的稿子", "problem": "黑名单词「一丝」", "fix": "换成具体描写"}]
     _patch_deai(monkeypatch, "AI味重的稿子，一丝哀伤。\n\n他走了。\n",
                 agent.new_text, before, after, issues)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "_deai_confirm", lambda prompt: confirm)
     cli._do_deai([str(chap)], tmp_settings)
     return chap
@@ -850,7 +893,7 @@ def test_deai_cmd_no_locatable_issues_exits(tmp_settings, fake_rag, monkeypatch,
     chap = _mk_deai_chapter(tmp_settings)
     agent = DeaiAgent(fake_rag)
     _patch_deai(monkeypatch, "x", "y", 80, 50, [{"quote": "", "problem": "p", "fix": "f"}])
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     cli._do_deai([str(chap)], tmp_settings)
 
     assert agent.deai_calls == []
@@ -861,7 +904,7 @@ def test_deai_cmd_no_locatable_issues_exits(tmp_settings, fake_rag, monkeypatch,
 def test_deai_cmd_file_not_found(tmp_settings, fake_rag, monkeypatch, capsys):
     """文件不存在 -> 报错退出。"""
     agent = DeaiAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     cli._do_deai([str(tmp_settings.novel_path / "不存在.md")], tmp_settings)
     assert "找不到文件" in capsys.readouterr().out
 
@@ -869,7 +912,7 @@ def test_deai_cmd_file_not_found(tmp_settings, fake_rag, monkeypatch, capsys):
 # ---------- 2.2 _write_one 拆层（throughput W5，D9/T7/T17/T27）----------
 def _write_one_with(monkeypatch, tmp_settings, agent, task="写第5章：异乡风起", plan=""):
     """替换 _build_agent / evaluate 后跑一次 _write_one，返回结局。"""
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     return cli._write_one(task, tmp_settings, plan=plan)
 
@@ -905,7 +948,7 @@ def test_write_one_interrupted_no_save_no_wm(tmp_settings, fake_rag, monkeypatch
             raise KeyboardInterrupt
 
     wm = WorkingMemory()
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (InterruptAgent(fake_rag), wm, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (InterruptAgent(fake_rag), wm, None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     assert cli._write_one("写第5章：异乡风起", tmp_settings) == "interrupted"
     assert list(tmp_settings.chapter_path.glob("*.md")) == []  # 未存盘
@@ -921,7 +964,7 @@ def test_write_one_interrupted_in_post_run_stages(tmp_settings, fake_rag, monkey
     def boom(*a, **kw):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", boom)
     assert cli._write_one("写第5章：异乡风起", tmp_settings) == "interrupted"
     assert list(tmp_settings.chapter_path.glob("*.md")) == []  # 未走到存盘
@@ -933,7 +976,7 @@ def test_write_one_gate_reject_by_answer_n(tmp_settings, fake_rag, monkeypatch, 
     monkeypatch.setattr(cli, "load_quality_rules", lambda settings: {"eval_gate": {"enabled": True, "threshold": 3.5, "weights": {"剧情": 1}}})
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: {"剧情": 1})  # 低于阈值
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "n")
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     assert cli._write_one("写第5章：异乡风起", tmp_settings) == "rejected"
     assert list(tmp_settings.chapter_path.glob("*.md")) == []
 
@@ -954,7 +997,7 @@ def test_write_one_passes_plan_to_run(tmp_settings, fake_rag, monkeypatch):
 def test_do_write_thin_shell_unchanged(tmp_settings, fake_rag, monkeypatch, capsys):
     """T27：_do_write 薄壳 -- 行为与拆层前一致（存盘 + 尾部展示照常打印）。"""
     agent = WriteAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
     out = capsys.readouterr().out
@@ -995,7 +1038,7 @@ def test_batch_plan_driven_titles_plans_continuity(tmp_settings, fake_rag, monke
     _mk_plan_file(tmp_settings)
     wm = WorkingMemory()
     agent = _RecordingAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, wm, None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
     cli._do_write_batch("写第5-6章", tmp_settings, auto=False)
@@ -1026,7 +1069,7 @@ def test_batch_template_fallback_ordinal_suffix(tmp_settings, fake_rag, monkeypa
     """T13：带模板回落 = 模板+中文序数后缀；章纲存在该章则规划照注入。"""
     _mk_plan_file(tmp_settings)
     agent = _RecordingAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write_batch("写第5-6章：夜行", tmp_settings, auto=True)
 
@@ -1189,7 +1232,7 @@ class ForeshadowAgent(_RecordingAgent):
 
 
 def _run_extract(monkeypatch, tmp_settings, agent, wm, task="写第5章：异乡风起"):
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, wm, None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write(task, tmp_settings)
 
@@ -1278,7 +1321,7 @@ def test_batch_foreshadow_continuity(tmp_settings, fake_rag, monkeypatch):
     # 同真实 _build_agent：每章重建 agent、wm 重新读盘（非同实例传递）
     monkeypatch.setattr(
         cli, "_build_agent",
-        lambda settings, task="", need_style=True: (agent, load_working_memory(settings), None),
+        lambda settings, task="", need_style=True, active_file="": (agent, load_working_memory(settings), None),
     )
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
@@ -1410,7 +1453,7 @@ class ArcAgent(_RecordingAgent):
 
 
 def _run_arc(monkeypatch, tmp_settings, agent, wm, task="写第5章：异乡风起"):
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, wm, None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, wm, None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write(task, tmp_settings)
 
@@ -1526,7 +1569,7 @@ def test_batch_arc_continuity(tmp_settings, fake_rag, monkeypatch):
         {"name": "林晚", "stage": "蒙冤受屈", "changed": True}]})
     monkeypatch.setattr(
         cli, "_build_agent",
-        lambda settings, task="", need_style=True: (agent, load_working_memory(settings), None),
+        lambda settings, task="", need_style=True, active_file="": (agent, load_working_memory(settings), None),
     )
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
@@ -1635,7 +1678,7 @@ def test_write_volume_align_lands_in_volume(tmp_settings, fake_rag, monkeypatch)
     """V1：对齐模式下章节落卷路径、头行 ## 第{中文}章、RAG 入库收卷路径。"""
     settings = _vol_align_settings(tmp_settings)
     agent = WriteAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第38章：空", settings)
 
@@ -1654,7 +1697,7 @@ def test_write_volume_align_overwrites_original(tmp_settings, fake_rag, monkeypa
     original.write_text("## 第三十八章 空\n\n人工原稿正文。", encoding="utf-8")
 
     agent = WriteAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第38章：空", settings)
 
@@ -1685,7 +1728,7 @@ def test_write_planner_on_full_chain(tmp_settings, fake_rag, monkeypatch, capsys
     """P1/P6 集成：planner 开启时 run record 首步是 planner、节拍进 final_state。"""
     settings = dataclasses.replace(tmp_settings, planner_enabled=True)
     agent = PlannerAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", settings)
 
@@ -1700,7 +1743,7 @@ def test_write_planner_on_full_chain(tmp_settings, fake_rag, monkeypatch, capsys
 def test_write_planner_off_no_planner_step(tmp_settings, fake_rag, monkeypatch):
     """P4 集成：默认关时 run record 无 planner 步骤（现状零变化）。"""
     agent = WriteAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     cli._do_write("写第5章：异乡风起", tmp_settings)
 
@@ -1713,7 +1756,7 @@ def test_batch_budget_text_planner_on_off(tmp_settings, fake_rag, monkeypatch, c
     """P11/Z2：批量预算文案按开关二态（off 8-11 / on 9-12）。"""
     _mk_plan_file(tmp_settings)
     agent = _RecordingAgent(fake_rag)
-    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True: (agent, WorkingMemory(), None))
+    monkeypatch.setattr(cli, "_build_agent", lambda settings, task="", need_style=True, active_file="": (agent, WorkingMemory(), None))
     monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_gate_confirm", lambda prompt: "y")
 
@@ -1723,6 +1766,143 @@ def test_batch_budget_text_planner_on_off(tmp_settings, fake_rag, monkeypatch, c
     settings_on = dataclasses.replace(tmp_settings, planner_enabled=True)
     cli._do_write_batch("写第5-6章", settings_on, auto=False)
     assert "9-12 次" in capsys.readouterr().out            # 开：口径诚实
+
+
+# ---------- 1.7/1.8 跨章禁则装配（style-repeat T4）----------
+def _write_cross_rules(tmp_settings):
+    """往临时小说目录写含 ending/syntax_patterns 两键的质量规则 JSON。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    (novel / "质量规则.json").write_text(json.dumps({
+        "ending": {"lookback": 3, "max_repeat": 2, "min_chars": 3},
+        "syntax_patterns": {"patterns": ["像一个人"], "max_per_chapter": 1},
+    }), encoding="utf-8")
+
+
+def test_build_agent_injects_cross_taboos(tmp_settings, monkeypatch):
+    """C7/C9：_build_agent 现算参照章结尾 + 构造禁则分节注入 agent。"""
+    _write_cross_rules(tmp_settings)
+    d = tmp_settings.human_text_full
+    d.mkdir(parents=True)
+    (d / "第01章-风起.md").write_text("开头。\n\n风很轻。\n", encoding="utf-8")
+    (d / "第02章-夜行.md").write_text("开头。\n\n风很轻。\n", encoding="utf-8")
+    (d / "第03章-旧约.md").write_text("开头。\n\n别的。\n", encoding="utf-8")
+
+    captured: dict = {}
+
+    class _Agent:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "LLMClient", lambda settings=None, profile=None: None)
+    monkeypatch.setattr(cli, "RAGStore", lambda settings=None: None)
+    monkeypatch.setattr(cli, "NovelAgent", _Agent)
+    cli._build_agent(tmp_settings)
+    assert captured["recent_endings"] == ["风很轻", "风很轻", "别的"]
+    assert "收束句「风很轻」" in captured["style_taboos"]      # 超配额进禁则
+    assert "句式模板「像一个人」" in captured["style_taboos"]
+
+    # C18：active_file 排除被处理文件（参照集少一章）
+    cli._build_agent(tmp_settings, active_file=str(d / "第03章-旧约.md"))
+    assert captured["recent_endings"] == ["风很轻", "风很轻"]
+
+    # C18：相对路径（相对 NOVEL_DIR，同 rag._resolve_source 口径）同样排除
+    cli._build_agent(tmp_settings, active_file="正文/第03章-旧约.md")
+    assert captured["recent_endings"] == ["风很轻", "风很轻"]
+
+
+def test_build_agent_cross_keys_missing_zero_change(tmp_settings, monkeypatch):
+    """C16：规则无两新键 -> recent_endings=None、taboos=""（双降级）。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    (novel / "质量规则.json").write_text(json.dumps({"blacklist": ["一丝"]}), encoding="utf-8")
+
+    captured: dict = {}
+
+    class _Agent:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(cli, "LLMClient", lambda settings=None, profile=None: None)
+    monkeypatch.setattr(cli, "RAGStore", lambda settings=None: None)
+    monkeypatch.setattr(cli, "NovelAgent", _Agent)
+    cli._build_agent(tmp_settings)
+    assert captured["recent_endings"] is None
+    assert captured["style_taboos"] == ""
+
+
+def test_build_agent_invalid_pattern_caught(tmp_settings, monkeypatch, capsys):
+    """C4/Z4：非法 pattern 在装配点 RuntimeError，命令层捕获不崩 REPL。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    (novel / "质量规则.json").write_text(json.dumps(
+        {"syntax_patterns": {"patterns": ["(["]}}), encoding="utf-8")
+
+    monkeypatch.setattr(cli, "evaluate", lambda *a, **kw: None)
+    cli._do_write("写第5章：异乡风起", tmp_settings)          # 不应抛异常
+    assert "合法正则" in capsys.readouterr().out
+
+
+def test_status_shows_cross_taboo_lines(tmp_settings, capsys):
+    """C12：状态命令展示跨章禁则行（未配置/已配置两态）。"""
+    cli._do_status(tmp_settings)
+    out = capsys.readouterr().out
+    assert "跨章禁则：未配置" in out
+
+    _write_cross_rules(tmp_settings)
+    d = tmp_settings.human_text_full
+    d.mkdir(parents=True)
+    (d / "第01章-风起.md").write_text("开头。\n\n风很轻。\n", encoding="utf-8")
+    (d / "第02章-夜行.md").write_text("开头。\n\n风很轻。\n", encoding="utf-8")
+    cli._do_status(tmp_settings)
+    out = capsys.readouterr().out
+    assert "跨章禁则：参照最近 3 章（实得 2 章）" in out
+    assert "禁用收束句 1 条" in out
+    assert "句式配额 1 条" in out
+
+
+# ---------- 1.9 风格体检命令（style-repeat T5）----------
+def test_style_scan_cmd_smoke(tmp_settings, capsys):
+    """C13/C14：命令冒烟——三节报告打印、零 LLM（不触 FakeLLM 调用计数）。"""
+    _write_cross_rules(tmp_settings)
+    d = tmp_settings.human_text_full
+    d.mkdir(parents=True)
+    for i in range(1, 4):
+        (d / f"第一卷-{i:02d}.md").write_text(
+            f"他像一个人立在风里。\n\n开头{i}。\n\n风很轻。\n", encoding="utf-8")
+
+    cli._do_style_scan([], tmp_settings)
+    out = capsys.readouterr().out
+    assert "风格体检" in out and "3 个文件" in out
+    assert "收束句复读榜" in out
+    assert "「风很轻」× 3 次" in out
+    assert "句式命中榜" in out
+    assert "字数分布" in out
+    assert "全局" in out
+
+
+def test_style_scan_cmd_missing_dir_exits(tmp_settings, capsys):
+    """C15：目录不存在 -> 提示退出不崩 REPL。"""
+    cli._do_style_scan(["不存在的目录"], tmp_settings)
+    assert "目录不存在" in capsys.readouterr().out
+
+
+def test_style_scan_cmd_empty_dir_exits(tmp_settings, capsys):
+    """C15：目录存在但无 .md/.txt -> 提示退出。"""
+    d = tmp_settings.human_text_full
+    d.mkdir(parents=True)
+    cli._do_style_scan([], tmp_settings)
+    assert "无可扫描" in capsys.readouterr().out
+
+
+def test_style_scan_cmd_explicit_dir(tmp_settings, capsys):
+    """目录参数（相对 NOVEL_DIR 解析）生效。"""
+    sub = tmp_settings.novel_path / "某卷"
+    sub.mkdir(parents=True)
+    (sub / "a-01.md").write_text("开头。\n\n风很轻。\n", encoding="utf-8")
+    cli._do_style_scan(["某卷"], tmp_settings)
+    out = capsys.readouterr().out
+    assert "风格体检" in out and "1 个文件" in out
 
 
 def test_status_shows_planner_switch(tmp_settings, capsys):

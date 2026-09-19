@@ -453,6 +453,21 @@ class RAGStore:
         collection.delete(where={"source": src})
         return n
 
+    def remove_chapters(self) -> int:
+        """清空全部正文块（type=chapter，含 index add 手动加的章节块）。
+
+        场景：用户手改了大量正文文件，向量库里的章节块是陈的——与其逐章
+        index add 同步，不如一键清空（前文连贯靠工作记忆+滚动注入兜底，
+        章节块只是 writer 的辅助参考）。rebuild 块（设定/文风基准）不动。
+        返回删除的块数。
+        """
+        collection = self._collection_obj()
+        before = collection.get(where={"type": "chapter"}) or {}
+        n = len(before.get("ids", []) or [])
+        if n:
+            collection.delete(where={"type": "chapter"})
+        return n
+
     # -- 检索 --
     def retrieve(
         self, query: str, top_k: int = 5, doc_type: Optional[str] = None
