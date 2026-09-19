@@ -222,6 +222,22 @@ def test_pipeline_max_reviews_forced_finalize_warns(fake_llm, fake_rag, tmp_sett
     assert any("强制定稿" in line for line in state.log)
 
 
+def test_run_loop_max_rounds_abort_not_forced(fake_llm, tmp_settings):
+    """超轮兜底只中止不落盘（D7：强制定稿由 reviewer 逃生门收口）：
+    日志不得冒用「强制定稿」字样（真车 52 章：跑完不落盘却被文案误导），
+    feedback 维持审稿意见口径，final_chapter 留运行日志供 replay。"""
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings, max_rounds=1)
+    state = PipelineState(task="测试章节")
+    state.polished = "润色稿。"
+
+    agent._run_loop(state, {"writer": lambda s: None}, [])
+
+    assert state.final_chapter == "润色稿。"
+    assert any("中止" in line and "replay" in line for line in state.log)
+    assert not any("强制定稿" in line for line in state.log)
+    assert state.feedback == ""                      # 不伪造审稿通过口径
+
+
 # ---------- 审稿解析失败不静默放行（0.1）----------
 def _unparseable_script():
     """writer/polisher 正常 + reviewer 返回散文（不可解析）。"""
@@ -986,6 +1002,23 @@ def test_fixer_unlocatable_quote_goes_whole(fake_llm, tmp_settings):
     assert state.issues == []
     assert state.polished == whole
     assert any("整文" in line for line in state.log)
+
+
+def test_fixer_whole_strips_mark_and_title_echo(fake_llm, tmp_settings):
+    """整文降级清洗：剥离【第N段·修复后】标记行与开头重复标题回显
+    （真车 52 章：fixer_system 复用标记协议，整文模式下模型惯性输出脏标记）。"""
+    text = "## 第五十二章 真相的重量\n\n他沿着河岸走了很久。\n\n狗在村口叫了两声。\n"
+    agent = NovelAgent(llm=fake_llm, settings=tmp_settings)
+    state = _gate_state(text)
+    state.issues = [{"quote": "", "problem": "比喻密度过高", "fix": "删减比喻"}]
+    body = "## 第五十二章 真相的重量\n\n他沿着河岸走了很久很久。\n\n狗在村口叫了两声。\n"
+    fake_llm.script = [f"## 第五十二章 真相的重量\n\n【第1段·修复后】\n{body}"]
+    agent._fixer(state)
+
+    assert state.polished == body                    # 标记行与标题回显均剥离
+    assert "【第" not in state.polished
+    assert state.polished.count("## 第五十二章") == 1
+    assert state.next_agent == "checker"
 
 
 def test_fixer_quote_not_substring_goes_whole(fake_llm, tmp_settings):

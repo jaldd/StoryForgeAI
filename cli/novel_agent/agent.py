@@ -214,6 +214,24 @@ def _split_writer_output(raw: str) -> Tuple[str, str]:
 _FIXER_MARK_RE = re.compile(r"【第(\d+)段·修复后】")
 
 
+def _clean_fixer_whole_output(new_text: str, original: str) -> str:
+    """整文修复输出清洗：剥离标记协议残留行与开头重复的标题回显。
+
+    fixer_system 复用段落标记协议（D11），整文降级模式下模型仍可能惯性输出
+    「【第N段·修复后】」标记行，并在开头回显一遍原稿标题（真车 52 章脏文本），
+    采纳前剥离，避免脏标记/重复标题写回正文。
+    """
+    lines = [ln for ln in new_text.split("\n") if not _FIXER_MARK_RE.fullmatch(ln.strip())]
+    cleaned = "\n".join(lines)
+    title = original.lstrip().split("\n", 1)[0].strip()
+    if title:
+        body = cleaned.lstrip("\n")
+        head, _, rest = body.partition("\n")
+        if head.strip() == title and rest.lstrip("\n").startswith(title):
+            cleaned = rest.lstrip("\n")
+    return cleaned
+
+
 def _parse_fixer_output(raw: str) -> Dict[int, str]:
     """解析 fixer 标记协议输出（D11），返回 {段号: 该段修复后文本}。
 
@@ -816,7 +834,7 @@ class NovelAgent:
             max_tokens=4096,
             temperature=self._temp("fixer", 0.5),
         )
-        new_text = _strip_code_fence(raw or "")
+        new_text = _clean_fixer_whole_output(_strip_code_fence(raw or ""), text)
         if not new_text.strip():
             state.log.append("[fixer] 整文修复未返回内容，保留原稿")
             return text
@@ -987,7 +1005,11 @@ class NovelAgent:
         while state.next_agent != "done":
             state.round += 1
             if state.round > self.max_rounds:
-                state.log.append(f"[system] 超过 {self.max_rounds} 轮，强制定稿")
+                # D7：强制定稿由 reviewer 逃生门统一收口；超轮只中止不落盘
+                # （结果留运行日志供 replay 人工处理），不冒用「强制定稿」字样
+                state.log.append(
+                    f"[system] 超过 {self.max_rounds} 轮，中止（结果未入库，可 replay 查看）"
+                )
                 state.final_chapter = state.polished or state.draft
                 break
 
