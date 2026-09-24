@@ -18,6 +18,8 @@ from novel_agent.prompts import (
     fixer_whole_user,
     load_exemplar,
     load_recent_human,
+    planner_system,
+    planner_user,
     reviewer_system,
     writer_system,
 )
@@ -280,6 +282,43 @@ def test_reviewer_system_rules_and_instruction_injected():
     sys_prompt = reviewer_system("测试小说", "", instruction="指令内容", rules="铁律内容")
     assert "铁律内容" in sys_prompt
     assert "指令内容" in sys_prompt
+
+
+# ---------- planner 事件锚声明（event-anchor T4，E16/D12）----------
+def test_planner_system_contains_event_anchor_requirement():
+    """E16/D12：planner_system 节拍表要求含事件锚条目（具体可执行，纯氛围不算）。"""
+    sys_prompt = planner_system("测试小说", "")
+    assert "事件锚" in sys_prompt
+    assert "纯氛围" in sys_prompt
+    # 既有四条要求保留（追加不替换）
+    for kw in ("具体可执行", "伏笔操作要指名道姓", "角色弧光推进"):
+        assert kw in sys_prompt, kw
+
+
+def test_planner_user_five_elements_anchor_first():
+    """E16/D12：无原文分支五要素、事件锚列第一；无补锚句（重写分支专属）。"""
+    user_prompt = planner_user("写第5章：异乡风起", "章纲要点：山道相遇", 3000)
+    assert "必含五要素" in user_prompt
+    assert "1. 事件锚" in user_prompt
+    assert "核心事件" in user_prompt and "纯氛围" in user_prompt
+    assert "2. 场景序列" in user_prompt
+    assert "3. 伏笔操作" in user_prompt
+    assert "4. 角色弧光推进" in user_prompt
+    assert "5. 结尾钩子" in user_prompt
+    assert "补一个合理的事件锚" not in user_prompt   # 补锚句只在重写分支
+    assert "【原文" not in user_prompt                # 无原文块
+
+
+def test_planner_user_rewrite_mode_appends_anchor_rule():
+    """E16/D12：rewrite 分支追加补锚句——原文只有状态与氛围时补锚，不照抄状态结构。"""
+    user_prompt = planner_user(
+        "重写：第5章", "章纲要点：山道相遇", 3000, source_content="原文第一段。"
+    )
+    assert "【原文（重写参考，节拍的结构基础）】" in user_prompt
+    assert "重写任务" in user_prompt
+    assert "补一个合理的事件锚" in user_prompt
+    assert "不得照抄原文的状态结构" in user_prompt
+    assert "1. 事件锚" in user_prompt                 # 五要素同样生效
 
 
 def test_fixer_system_contract():

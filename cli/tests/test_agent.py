@@ -203,11 +203,10 @@ def test_pipeline_structure_report_only(fake_llm, fake_rag, tmp_settings):
 
 
 def test_pipeline_structure_mixed_with_regular(fake_llm, fake_rag, tmp_settings):
-    """结构命中与既有检查命中并存：两路独立——常规 issue 走 fixer 闭环，结构警告每轮重复留痕。"""
+    """E15/D11 结构病章快通道：结构+常规命中 -> 常规 issue 一并 report-only，直通 reviewer，不进 fixer。"""
     fake_llm.script = [
         "【初稿】她低头。",                     # writer
-        "【润色】风起了，她低头。",               # polisher（含黑名单词）
-        "【第1段·修复后】起风了，她垂下目光。",     # fixer
+        "风起了，她低头。",                     # polisher（含黑名单词，无 meta 前缀）
         '{"pass": true, "reason": "通过"}',      # reviewer
     ]
     agent = NovelAgent(
@@ -217,12 +216,15 @@ def test_pipeline_structure_mixed_with_regular(fake_llm, fake_rag, tmp_settings)
     )
     state, record = agent.run("写第5章：异乡风起")
 
-    assert state.review_count == 1           # 只有常规 issue 消耗预算
+    assert state.review_count == 0           # 双路都不耗预算（E15）
     agents_seq = [s["agent"] for s in record["steps"]]
-    assert agents_seq == ["writer", "polisher", "checker", "fixer", "checker", "reviewer"]
-    # 结构警告每轮复检重复留痕（D9：持续可见，不去重）
-    assert len([e for e in state.log if "report-only" in e and "碎片章" in e]) == 2
-    assert state.final_chapter == "起风了，她垂下目光。"
+    assert agents_seq == ["writer", "polisher", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 3           # fixer 零调用
+    # 双路留痕：结构警告 + 常规「跳过修复」（checker 仅一轮，各一条）
+    assert any("report-only" in e and "碎片章" in e for e in state.log)
+    assert any("结构病章，跳过修复" in e and "黑名单词「风起了」" in e for e in state.log)
+    assert state.issues == []                 # 常规 issue 不进 state.issues
+    assert state.final_chapter == "风起了，她低头。"
 
 
 def test_pipeline_structure_none_rules_no_trace(fake_llm, fake_rag, tmp_settings):
@@ -248,6 +250,25 @@ def test_refine_structure_report_only(fake_llm, fake_rag, tmp_settings):
     assert state.next_agent == "done"
     assert [s["agent"] for s in record["steps"]] == ["polisher", "checker", "reviewer"]
     assert any("report-only" in e for e in state.log)
+
+
+def test_refine_structure_mixed_with_regular(fake_llm, fake_rag, tmp_settings):
+    """E15：refine 路径结构+常规命中同款快通道——常规 issue 跳过修复，直通 reviewer。"""
+    fake_llm.script = [
+        "风起了，她低头。",                     # polisher（含黑名单词，无 meta 前缀）
+        '{"pass": true, "reason": "通过"}',      # reviewer
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+        quality_rules={"blacklist": ["风起了"], "chapter_structure": {"min_chars": 500}},
+    )
+    state, record = agent.refine("这是要精修的初稿。", "精修：第5章")
+    assert state.review_count == 0
+    assert [s["agent"] for s in record["steps"]] == ["polisher", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 2           # fixer 零调用
+    assert any("碎片章" in e for e in state.log)
+    assert any("结构病章，跳过修复" in e and "黑名单词「风起了」" in e for e in state.log)
 
 
 # ---------- reviewer 第 9 维与事件锚分流（event-anchor T2，E7/E8/E14/D10）----------
@@ -2033,14 +2054,15 @@ def test_rewrite_planner_empty_fallback(fake_rag, tmp_settings):
 
 
 def test_planner_user_no_source_content_byte_identical():
-    """P16：source_content 为空时 planner_user 输出与 T8 前逐字节一致。"""
+    """P16/T4：source_content 为空时不进入重写模式——无原文块/重写指令/补锚句，默认参数一致。"""
     from novel_agent.prompts import planner_user
     task, plan, tw = "写第5章：异乡风起", "章纲要点：山道相遇", 3000
     with_src = planner_user(task, plan, tw, "")
     without_param = planner_user(task, plan, tw)             # 不传 source_content
     assert with_src == without_param                          # 默认值一致
-    assert "原文" not in with_src                             # 无原文块
+    assert "【原文" not in with_src                           # 无原文块
     assert "重写任务" not in with_src                          # 无重写模式指令
+    assert "补一个合理的事件锚" not in with_src                 # 补锚句只在重写分支（E16）
 
 
 def test_planner_beats_reach_polisher_reviewer(fake_rag, tmp_settings):

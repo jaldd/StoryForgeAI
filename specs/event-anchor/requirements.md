@@ -136,8 +136,10 @@ blacklist 管词不管章的结构；reviewer 八个维度里没有"这章有没
 4. **不做状态词语义扩展/词向量**：静态词表，确定性优先（style-repeat 非目标 2 同哲学）。
 5. **不动 ai_flavor_score 三组件、不动滚动注入/exemplar/样文路由**（style-repeat 非目标 4/6 同款边界）。
 6. **不建持久账本**：章节文件即唯一真源，嫌疑分现算（style-repeat 非目标 5 同款）。
-7. **回归基线全绿**：`cli/` 下 `python -m pytest tests/ -q` = 659 passed / 0 failed / 1 deselected
-   （2026-09-20 实测：630 基线 + 本 feature 新增 29 测）；本 feature 验收口径为**保持全绿**（已达成）。
+7. **回归基线全绿**：`cli/` 下 `python -m pytest tests/ -q` = 663 passed / 0 failed / 1 deselected
+   （2026-09-24 实测：659 基线 + T6/T4 新增 4 测；另含 3 处跨平台测试修复——Windows 换机
+   暴露的换行翻译与无盘符路径断言，Mac 行为不变，非本 feature 缺陷）；
+   本 feature 验收口径为**保持全绿**（已达成，P0 全任务收官）。
 8. **不改 `改` 命令交互、不动伏笔/角色弧光抽取**。
 9. **不开扩写许可的 fixer 变体**：按 issue 类型条件放宽 fixer 铁律 +
    `fixer_whole_user` 注入章节规划——评估为新修复机制，与「零新机制」卖点矛盾且工作量

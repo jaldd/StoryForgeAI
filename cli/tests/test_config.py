@@ -1,4 +1,5 @@
 """config 模块测试。"""
+import os
 from pathlib import Path
 
 from novel_agent.config import Settings
@@ -262,7 +263,12 @@ def test_runtime_dir_override(tmp_path):
         chroma_dir="/abs/chroma",  # 绝对
     )
     assert s.runs_path == tmp_path / "py/runs"
-    assert s.chroma_path == Path("/abs/chroma")
+    if os.name == "nt":
+        # Windows：无盘符的 "/abs/chroma" 不是绝对路径（pathlib 语义），
+        # path() 按相对路径拼到 repo_root 所在盘
+        assert s.chroma_path == Path(tmp_path.drive + "/abs/chroma")
+    else:
+        assert s.chroma_path == Path("/abs/chroma")
     assert s.working_memory_path == tmp_path / "py/runs" / "working_memory.json"
 
 

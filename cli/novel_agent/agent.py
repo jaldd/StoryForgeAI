@@ -688,6 +688,9 @@ class NovelAgent:
         - 结构检查（event-anchor D9）走 report-only 通道：显著警告 + state.log
           留痕，不进 state.issues、不消耗 review_count、不触发 fixer——结构问题
           闭环内修不好（fixer 铁律禁增删情节），正解是人工「重写」。
+        - D11 结构优先（E15）：结构命中 = 本章注定人工重写，常规 issue 的修复
+          产出必被重写覆盖 -> 一并降级 report-only（「结构病章，跳过修复」留痕），
+          直通 reviewer；结构零命中时常规闭环逐字节不变。
         """
         issues = run_checks(state.polished, self.quality_rules)
         # 1.7 跨章检查（C6）：并入同一 issues 流（打回 fixer / review_count 共享 /
@@ -698,9 +701,18 @@ class NovelAgent:
             issues += run_cross_checks(state.polished, self.recent_endings, self.quality_rules)
         # event-anchor 结构检查（D9 report-only）：每轮复检重复警告/留痕是有意为之
         # （持续可见、实现零状态，不去重）；quality_rules 为 None 时返回 []，零行为差异（E12）。
-        for issue in run_structure_checks(state.polished, self.quality_rules):
+        structure_issues = run_structure_checks(state.polished, self.quality_rules)
+        for issue in structure_issues:
             print(f"  ⚠️ 结构检查：{issue['problem']}")
             state.log.append(f"[checker] ⚠️ report-only：{issue['problem']}（建议人工重写）")
+        if structure_issues:
+            # D11 结构病章快通道（E15）：常规 issue 一并降级 report-only，直通 reviewer
+            # （不进 state.issues、不耗 review_count、不触发 fixer）。
+            for issue in issues:
+                print(f"  ⚠️ 结构病章跳过修复：{issue['problem']}")
+                state.log.append(f"[checker] ⚠️ report-only（结构病章，跳过修复）：{issue['problem']}")
+            state.next_agent = "reviewer"
+            return
         if not issues or state.review_count >= self.max_reviews:
             if issues:
                 print(f"  ⚠️ 规则检查命中 {len(issues)} 项，但打回已达上限 {self.max_reviews} 次，放行审稿")

@@ -834,7 +834,9 @@ def _mk_deai_chapter(tmp_settings):
     novel = tmp_settings.novel_path
     novel.mkdir(parents=True, exist_ok=True)
     chap = novel / "第05章-异乡风起.md"
-    chap.write_text("AI味重的稿子，一丝哀伤。\n\n他走了。\n", encoding="utf-8")
+    # write_bytes 保真换行：cli._do_deai 用 read_bytes 逐字节读，
+    # Windows 下 write_text 文本模式会把 \n 落盘成 \r\n，导致 fake_score 按文本分流错位
+    chap.write_bytes("AI味重的稿子，一丝哀伤。\n\n他走了。\n".encode("utf-8"))
     return chap
 
 

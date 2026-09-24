@@ -13,6 +13,13 @@
 E3 quote 剥句末标点与 blacklist 同口径）。
 2026-09-20 真车修订立项：E15（T6）+ E16（T4 提前）——重写三卷-31 复发独白、
 fixer 4 轮白烧复盘（约 7 次 LLM 调用全废）；实施顺序 T6 -> T4。
+进度（2026-09-24）：T6/T4 实现完成并验收——纯逻辑最小验证全过，
+全量回归 663 passed / 0 failed / 1 deselected（659 基线 + 新增 4 测：
+refine 混合快通道 1 + planner 事件锚 3；test_pipeline_structure_mixed_with_regular
+按 E15 新口径改写不计新增）。另修 3 处跨平台测试失败（Windows 换机暴露，
+非本 feature 缺陷）：deai 章节 write_text 换行翻译 -> write_bytes 保真、
+chroma_path 无盘符路径断言按 os.name 分流；Mac 上行为与原断言逐字节一致。
+P0 六任务（T1/T2/T3/T5/T6/T4）全部完成，feature 收官。
 
 ## P0（实现主干）
 
@@ -65,7 +72,7 @@ fixer 4 轮白烧复盘（约 7 次 LLM 调用全废）；实施顺序 T6 -> T4�
   按规划补事件锚重写，不要只润色状态描写」（design D9 配套）。
   验证：rewrite 的 writer user 文本含该句；run 路径（非 rewrite）不含（不加噪音）。
 
-- [ ] **T6 agent.py：结构病章快通道（E15/D11，2026-09-20 真车修订）**
+- [x] **T6 agent.py：结构病章快通道（E15/D11，2026-09-20 真车修订）**
   改动：`_checker` 内结构命中时常规 issue（run_checks / run_cross_checks）一并降级
   report-only——逐条 ⚠️ + `state.log` 留痕（前缀「结构病章，跳过修复」），直通 reviewer；
   不进 `state.issues`、不耗 `review_count`、不触发 fixer。结构零命中路径逐字节不动。
@@ -74,7 +81,7 @@ fixer 4 轮白烧复盘（约 7 次 LLM 调用全废）；实施顺序 T6 -> T4�
   T1 的 test_pipeline_structure_mixed_with_regular 按 E15 新口径改写（原「两路独立」断言作废）；
   结构零命中+常规命中 -> 既有 fixer 闭环测试不变；refine 路径同款生效。E15、E12。
 
-- [ ] **T4 prompts.py：planner 事件锚声明（E16/D12，真车证据提前）**
+- [x] **T4 prompts.py：planner 事件锚声明（E16/D12，真车证据提前）**
   改动：`planner_user` 要素清单四 -> 五要素，「事件锚」列为第一（一句话核心事件；
   纯氛围/纯状态不算）；rewrite mode_block 追加「原文只有状态与氛围、没有完整事件时，
   基于设定与前文补一个合理的事件锚，不得照抄原文的状态结构」；
