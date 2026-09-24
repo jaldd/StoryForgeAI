@@ -19,7 +19,7 @@ from .prompts import _exemplar_files
 __all__ = [
     "load_quality_rules", "split_sentences", "run_checks", "load_baseline", "ai_flavor_score",
     "extract_ending", "normalize_ending", "load_recent_endings", "compile_syntax_patterns",
-    "run_cross_checks", "scan_style_report",
+    "run_cross_checks", "run_structure_checks", "scan_style_report",
 ]
 
 _SENTENCE_DELIM = r"。！？!?；;\n"
@@ -386,6 +386,87 @@ def run_cross_checks(
     return issues
 
 
+# ---------- 结构检查（event-anchor，design §3.1，零 LLM）----------
+def _valid_lines(text: str) -> list[str]:
+    """有效行（Z1）：非空行剔除 `#` 标题行与 `---`/`***` 分隔行（extract_ending C2 同款跳过集）。"""
+    valid: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if len(s) >= 3 and set(s) <= {"-", "*"}:
+            continue  # 分隔线
+        valid.append(s)
+    return valid
+
+
+def _valid_int(cfg: dict, key: str) -> Optional[int]:
+    """阈值类型守卫（Z2）：isinstance(int) 且 >= 0 才参与比较，否则视为未配置（fail-open）。"""
+    v = cfg.get(key)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        return None
+    return v
+
+
+def run_structure_checks(text: str, rules: Optional[dict]) -> list[dict]:
+    """chapter_structure 三项结构检查 -> issues（与 run_checks 同构，E1-E4）。
+
+    口径（Z1）：有效字符数 = 有效行拼接长度（行已 strip）；对话行数 = 有效行中
+    _is_dialogue_line 命中数；密度分母 = 有效行数；状态词总命中数 = 逐词出现
+    次数之和（text.count，一词多次计多次）；E3 quote = 文本序最早含任一状态词的句子。
+    键缺失/词表空/阈值类型非法 -> 对应项跳过（E4/Z2）；rules 为 None 或 text
+    为空 -> []；有效行数为 0 -> 密度项跳过（零除守卫，该文已被 E1 按碎片章拦截）。
+    """
+    cs = (rules or {}).get("chapter_structure")
+    if not isinstance(cs, dict) or not cs or not text:
+        return []
+    issues: list[dict] = []
+
+    lines = _valid_lines(text)
+    n_lines = len(lines)
+    chars = len("".join(lines))
+    n_dialogue = sum(1 for ln in lines if _is_dialogue_line(ln))
+
+    # 1. 碎片章（E1）：quote 置空 = 全文属性（report-only 通道仅供留痕展示，D9）
+    min_chars = _valid_int(cs, "min_chars")
+    if min_chars is not None and chars < min_chars:
+        issues.append({
+            "quote": "",
+            "problem": f"碎片章：正文{chars}字（下限{min_chars}字）",
+            "fix": "本章缺少完整事件。按章节规划补事件锚，扩写为完整章节；不要只往里加字。请使用重写命令。",
+        })
+
+    # 2. 零对话独白章（E2）：体量达标但对话行不足
+    d_chars = _valid_int(cs, "dialogue_check_min_chars")
+    d_lines = _valid_int(cs, "min_dialogue_lines")
+    if (d_chars is not None and d_lines is not None
+            and chars >= d_chars and n_dialogue < d_lines):
+        issues.append({
+            "quote": lines[0][:_QUOTE_TRUNC],
+            "problem": f"零对话独白章：{chars}字仅{n_dialogue}行对话",
+            "fix": "补回场景与对话：让人物在场、让对话发生；内心独白压缩为不超过3笔的状态登记。",
+        })
+
+    # 3. 状态堆叠（E3）：状态词密度超每百行上限
+    state_words = [w for w in (cs.get("state_words") or []) if isinstance(w, str) and w]
+    density_max = _valid_int(cs, "state_density_max_per_100_lines")
+    if state_words and density_max is not None and n_lines > 0:
+        hits = sum(text.count(w) for w in state_words)
+        density = hits / n_lines * 100
+        if density > density_max:
+            first = next(
+                (s for s in split_sentences(text) if any(w in s for w in state_words)),
+                "",
+            )
+            issues.append({
+                "quote": first[:_QUOTE_TRUNC],
+                "problem": f"状态堆叠：状态词每百行{density:.0f}次（上限{density_max}次）",
+                "fix": "状态登记删至每章3笔以内，删出来的篇幅让给事件。",
+            })
+
+    return issues
+
+
 # ---------- AI 味量化（A25-A27，design §3.1.3）----------
 @dataclass(frozen=True)
 class Baseline:
@@ -496,17 +577,37 @@ def ai_flavor_score(text: str, rules: Optional[dict], baseline: Optional[Baselin
 
 
 # ---------- 1.9 风格体检（style-repeat，design §3.5，纯代码零 LLM）----------
+def _state_suspicion(text: str, state_words: list[str]) -> dict:
+    """单章嫌疑数据（纯函数，E9）：{"score", "lines", "dialogue", "state_hits"}。
+
+    score = 状态词命中数/有效行数 − 对话行数/有效行数×2（Z1 同款有效行口径）；
+    有效行数为 0（空文件/仅标题分隔行）-> score 记 0.0（零除守卫）。
+    """
+    lines = _valid_lines(text)
+    n = len(lines)
+    hits = sum(text.count(w) for w in state_words)
+    dialogue = sum(1 for ln in lines if _is_dialogue_line(ln))
+    score = (hits - dialogue * 2) / n if n else 0.0
+    return {"score": round(score, 2), "lines": n, "dialogue": dialogue, "state_hits": hits}
+
+
 def scan_style_report(dir_path: Path, rules: dict) -> dict:
-    """递归扫描 .md/.txt -> 三节报告数据（C13/C14）：收束句复读榜 / 句式命中榜 /
-    分卷字数分布。纯函数、同输入同输出。
+    """递归扫描 .md/.txt -> 四节报告数据（C13/C14 + event-anchor E9）：收束句复读榜 /
+    句式命中榜 / 分卷字数分布 / 状态章嫌疑榜。纯函数、同输入同输出。
 
     - endings：归一化结尾全局频次，count >= max_repeat+1 才上榜（降序，附文件清单）；
     - patterns：全部 pattern 的总命中数 + 超配额章清单（诊断要全貌，不是拦截）；
     - sizes：按顶层子目录分组（Z3 规避中文数字卷名字典序陷阱）+ 全局行；
+    - state_chapters：逐章嫌疑分全量降序（D7 截断在展示层）；state_words 未配置
+      -> None，配置后无文件 -> []（D8 分态：配置静默失效必须可发现）；
     - 规则键缺失 -> 对应节为空列表；目录不存在/无文件 -> files_scanned=0。
     """
     root = Path(dir_path)
-    report: dict = {"endings": [], "patterns": [], "sizes": [], "files_scanned": 0}
+    cs = (rules or {}).get("chapter_structure")
+    cs_cfg = cs if isinstance(cs, dict) else {}
+    state_words = [w for w in (cs_cfg.get("state_words") or []) if isinstance(w, str) and w]
+    report: dict = {"endings": [], "patterns": [], "sizes": [], "files_scanned": 0,
+                    "state_chapters": [] if state_words else None}
     if not root.is_dir():
         return report
     files = sorted(
@@ -528,6 +629,7 @@ def scan_style_report(dir_path: Path, rules: dict) -> dict:
     pattern_hits: dict[str, list[tuple[str, int]]] = {p.pattern: [] for p in compiled}
     pattern_total: dict[str, int] = {p.pattern: 0 for p in compiled}
     sizes: dict[str, list[int]] = {}
+    state_rows: list[dict] = []
 
     for f in files:
         try:
@@ -539,6 +641,10 @@ def scan_style_report(dir_path: Path, rules: dict) -> dict:
         group = rel.split("/", 1)[0] if "/" in rel else "(根目录)"
         sizes.setdefault(group, []).append(len(text))
 
+        if state_words:
+            row = _state_suspicion(text, state_words)
+            row["file"] = rel
+            state_rows.append(row)
         if end_cfg:
             e = normalize_ending(extract_ending(text))
             if len(e) >= min_chars:
@@ -560,6 +666,9 @@ def scan_style_report(dir_path: Path, rules: dict) -> dict:
          "over": [{"file": rel, "count": n} for rel, n in pattern_hits[p]]}
         for p in pattern_total
     ]
+    if state_words:
+        # 全量降序入报告（D7：截断在展示层）；稳定排序，同分保持跨卷章序
+        report["state_chapters"] = sorted(state_rows, key=lambda r: -r["score"])
     rows = []
     for group in sorted(sizes):
         ns = sizes[group]

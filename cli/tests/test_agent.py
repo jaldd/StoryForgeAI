@@ -182,6 +182,164 @@ def test_pipeline_checker_reject_then_pass(fake_llm, fake_rag, tmp_settings):
     assert "scores" in fs and "issues" in fs  # 富解析字段随 asdict 落 record（A4/A24）
 
 
+def test_pipeline_structure_report_only(fake_llm, fake_rag, tmp_settings):
+    """event-anchor D9：结构命中走 report-only——警告留痕、直通 reviewer，不进 fixer 不耗预算。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+        quality_rules={"chapter_structure": {"min_chars": 500}},
+    )
+    state, record = agent.run("写第5章：异乡风起")
+
+    assert state.review_count == 0            # 不消耗预算（E5）
+    assert state.next_agent == "done"
+    assert state.final_chapter                # reviewer 照常定稿
+    assert state.issues == []                 # 不进 state.issues
+    agents_seq = [s["agent"] for s in record["steps"]]
+    assert agents_seq == ["writer", "polisher", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 3           # checker 零 LLM
+    assert any("report-only" in e and "碎片章" in e for e in state.log)
+    assert any("report-only" in e for e in record["final_state"]["log"])  # 留痕随 record 落盘（E13）
+
+
+def test_pipeline_structure_mixed_with_regular(fake_llm, fake_rag, tmp_settings):
+    """结构命中与既有检查命中并存：两路独立——常规 issue 走 fixer 闭环，结构警告每轮重复留痕。"""
+    fake_llm.script = [
+        "【初稿】她低头。",                     # writer
+        "【润色】风起了，她低头。",               # polisher（含黑名单词）
+        "【第1段·修复后】起风了，她垂下目光。",     # fixer
+        '{"pass": true, "reason": "通过"}',      # reviewer
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+        quality_rules={"blacklist": ["风起了"], "chapter_structure": {"min_chars": 500}},
+    )
+    state, record = agent.run("写第5章：异乡风起")
+
+    assert state.review_count == 1           # 只有常规 issue 消耗预算
+    agents_seq = [s["agent"] for s in record["steps"]]
+    assert agents_seq == ["writer", "polisher", "checker", "fixer", "checker", "reviewer"]
+    # 结构警告每轮复检重复留痕（D9：持续可见，不去重）
+    assert len([e for e in state.log if "report-only" in e and "碎片章" in e]) == 2
+    assert state.final_chapter == "起风了，她垂下目光。"
+
+
+def test_pipeline_structure_none_rules_no_trace(fake_llm, fake_rag, tmp_settings):
+    """E12 回归护栏：quality_rules 为 None 时零结构警告零留痕（与现状一致）。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+    )
+    state, _ = agent.run("写第5章：异乡风起")
+    assert state.review_count == 0
+    assert not any("report-only" in e for e in state.log)
+
+
+def test_refine_structure_report_only(fake_llm, fake_rag, tmp_settings):
+    """refine 路径同样生效：polisher->checker(结构警告)->reviewer，不进 fixer。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+        quality_rules={"chapter_structure": {"min_chars": 500}},
+    )
+    state, record = agent.refine("这是要精修的初稿。", "精修：第5章")
+    assert state.review_count == 0
+    assert state.next_agent == "done"
+    assert [s["agent"] for s in record["steps"]] == ["polisher", "checker", "reviewer"]
+    assert any("report-only" in e for e in state.log)
+
+
+# ---------- reviewer 第 9 维与事件锚分流（event-anchor T2，E7/E8/E14/D10）----------
+def test_parse_review_full_anchor_score_key():
+    """E7/D3：scores 含「事件锚」键正常收编（1-5 整数）；越界分丢弃（A6 现状）。"""
+    parsed = parse_review_full(
+        '{"pass": false, "reason": "缺事件", "scores": {"人物一致性": 4, "事件锚": 2},'
+        ' "issues": [{"quote": "", "problem": "事件锚：全章无事件", "fix": "补事件"}]}'
+    )
+    assert parsed is not None
+    assert parsed.scores["事件锚"] == 2
+    assert parsed.issues[0]["problem"].startswith("事件锚：")
+    parsed = parse_review_full('{"pass": true, "reason": "ok", "scores": {"事件锚": 6}}')
+    assert parsed.scores == {}  # 越界丢弃，解析面零改动（E14）
+
+
+def test_reviewer_anchor_only_fail_passes_with_trace(fake_llm, fake_rag, tmp_settings):
+    """D10 仅事件锚不达标：放行留痕定稿，不进 fixer、不耗预算（E8）。"""
+    fake_llm.script = [
+        "【初稿】风起了。\n\n她低头。",
+        "【润色】风起了，林晚。\n\n她低头。",
+        '{"pass": false, "reason": "缺事件", "scores": {"事件锚": 2}, "issues": '
+        '[{"quote": "", "problem": "事件锚：删掉天气后无完整事件", "fix": "补事件锚"}]}',
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+    )
+    state, record = agent.run("写第5章：异乡风起")
+
+    assert state.review_count == 0
+    assert state.next_agent == "done"
+    assert state.final_chapter            # 放行定稿
+    assert "事件锚不达标" in state.feedback
+    assert any("report-only" in e and "事件锚" in e for e in state.log)
+    assert [s["agent"] for s in record["steps"]] == ["writer", "polisher", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 3       # 未进 fixer
+
+
+def test_reviewer_anchor_mixed_fixable_goes_to_fixer(fake_llm, fake_rag, tmp_settings):
+    """D10 混合不达标：事件锚剔除出 fixer 批次仅留痕，其余 issue 走正常闭环。"""
+    fake_llm.script = [
+        "【初稿】她低头。",
+        "【润色】风起了，她低头。",
+        '{"pass": false, "reason": "两处问题", "issues": ['
+        '{"quote": "", "problem": "事件锚：无完整事件", "fix": "补事件"},'
+        '{"quote": "她低头", "problem": "文风一致性：太直白", "fix": "更含蓄"}]}',
+        "【第1段·修复后】她沉默地低下头。",
+        '{"pass": true, "reason": "通过"}',
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+    )
+    state, record = agent.run("写第5章：异乡风起")
+
+    assert state.review_count == 1
+    assert [s["agent"] for s in record["steps"]] == \
+        ["writer", "polisher", "checker", "reviewer", "fixer", "checker", "reviewer"]
+    # fixer user prompt 只含可修复项，不含事件锚意见
+    fixer_call = fake_llm.calls[3]
+    assert "太直白" in fixer_call and "事件锚" not in fixer_call
+    assert any("report-only" in e and "事件锚" in e for e in state.log)
+    assert state.final_chapter == "她沉默地低下头。"
+
+
+def test_reviewer_anchor_only_after_recheck_passes(fake_llm, fake_rag, tmp_settings):
+    """D10 防循环：混合打回修复后复检仅余事件锚 -> 放行，不重复打回。"""
+    fake_llm.script = [
+        "【初稿】她低头。",
+        "【润色】风起了，她低头。",
+        '{"pass": false, "reason": "两处", "issues": ['
+        '{"quote": "", "problem": "事件锚：无完整事件", "fix": "补事件"},'
+        '{"quote": "她低头", "problem": "文风一致性：太直白", "fix": "更含蓄"}]}',
+        "【第1段·修复后】她沉默地低下头。",
+        '{"pass": false, "reason": "仍缺事件", "issues": '
+        '[{"quote": "", "problem": "事件锚：仍无完整事件", "fix": "补事件"}]}',
+    ]
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+    )
+    state, record = agent.run("写第5章：异乡风起")
+
+    assert state.review_count == 1          # 只有第一轮可修复项消耗预算
+    assert state.next_agent == "done"       # 复检仅余事件锚 -> 放行
+    assert "事件锚不达标" in state.feedback
+    assert [s["agent"] for s in record["steps"]] == \
+        ["writer", "polisher", "checker", "reviewer", "fixer", "checker", "reviewer"]
+    assert len(fake_llm.calls) == 5
+
+
 def test_pipeline_max_reviews_cap(fake_llm, fake_rag, tmp_settings):
     """达到打回上限强制定稿，防死循环（打回进 fixer，第二次 reviewer 直接收口）。"""
     fake_llm.script = [
@@ -1846,6 +2004,22 @@ def test_rewrite_planner_on_writer_consumes_beats(fake_rag, tmp_settings):
     assert BEATS in writer_user
     assert "请直接写正文，不要再写构思说明" in writer_user   # 不再请求构思
     assert "【已有内容（参考）】" in writer_user             # rewrite 仍有原文参考
+
+
+def test_rewrite_writer_prompt_anchor_hint(fake_llm, fake_rag, tmp_settings):
+    """event-anchor T5：rewrite 的 writer user 含事件锚提示句；run 路径不含（不加噪音）。"""
+    agent = NovelAgent(
+        llm=fake_llm, rag=fake_rag, exemplar="范文",
+        settings=tmp_settings, working_memory=WorkingMemory(),
+    )
+    agent.rewrite("旧章节内容。", "重写：第5章")
+    writer_call = fake_llm.calls[0]                          # planner 关 -> writer 首发
+    assert "补事件锚重写" in writer_call
+    assert "不要只润色状态描写" in writer_call
+
+    agent.run("写第6章：新章")
+    run_writer_call = [c for c in fake_llm.calls if "写一段新章节" in c][-1]
+    assert "补事件锚重写" not in run_writer_call             # run 路径零噪音
 
 
 def test_rewrite_planner_empty_fallback(fake_rag, tmp_settings):

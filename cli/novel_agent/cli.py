@@ -1416,6 +1416,22 @@ def _do_style_scan(args: List[str], settings: Settings) -> None:
         print(f"{row['group']:<10}{row['n']:>5}{row['min']:>8}{row['max']:>8}"
               f"{row['mean']:>9}{row['cv']:>9}")
 
+    # event-anchor E9：第四节「状态章嫌疑榜」（纯代码零 LLM）。
+    # E9/E12 拍板（2026-09-20）：未配置也固定输出提示行（与句式命中榜节同作风）。
+    print("\n--- 状态章嫌疑榜（嫌疑分=状态词命中/有效行−对话行/有效行×2，降序 Top 20）---")
+    rows = report["state_chapters"]
+    if rows is None:
+        print("状态章嫌疑榜：未配置 chapter_structure.state_words，跳过")
+    elif not rows:
+        print("（已配置 state_words，但无可计算的章节）")
+    else:
+        print(f"{'文件':<28}{'嫌疑分':>8}{'行数':>6}{'对话行':>7}{'状态词':>7}")
+        for row in rows[:20]:
+            print(f"{row['file']:<28}{row['score']:>8}{row['lines']:>6}"
+                  f"{row['dialogue']:>7}{row['state_hits']:>7}")
+        if len(rows) > 20:
+            print(f"…（共{len(rows)}章，仅列 Top 20）")
+
 
 def _do_replay(args: List[str], settings: Settings) -> None:
     if not args:
@@ -1495,7 +1511,7 @@ def _print_help() -> None:
     print("  test <run_id>    规则断言测试")
     print("  回测门禁 [条数]  历史runs跑评委回测门禁阈值（分数有缓存，命中不重烧）")
     print("  状态             查看当前写到第几章、角色状态、未回收伏笔")
-    print("  风格体检 [目录]  文风复读诊断（收束句复读榜/句式命中榜/字数分布，零 LLM）")
+    print("  风格体检 [目录]  文风复读诊断（收束句复读榜/句式命中榜/字数分布/状态章嫌疑榜，零 LLM）")
     print("  伏笔             查看未回收伏笔（编号+埋设章+描述）")
     print("  伏笔 删 <编号>    标记已回收（出列入归档，`伏笔 已回收` 可查可找回；多个编号空格分隔）")
     print("  伏笔 加 <描述>    手动补录一条（埋设章号取当前章，不被同章重写覆盖）")

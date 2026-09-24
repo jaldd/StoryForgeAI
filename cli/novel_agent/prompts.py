@@ -423,6 +423,7 @@ def reviewer_system(novel_name: str, retrieved: str, instruction: str = "", rule
 6. 伏笔一致性：有没有矛盾或遗漏
 7. 比喻密度：像/仿佛/宛如类标记词是否密集堆叠（5=克制自然，1=滥用）
 8. 视角越界：叙述是否越出当前视角人物可知的范围（5=无越界）
+9. 事件锚：删掉天气描写、身体感受、心理描写后，本章是否还剩一件完整成立的事？（纯氛围/纯心情/纯状态章 = 不通过）
 
 
 {_rules_block(rules)}{_instruction_block(instruction)}{retrieved}
@@ -430,7 +431,7 @@ def reviewer_system(novel_name: str, retrieved: str, instruction: str = "", rule
 只返回纯 JSON，格式如下，不要加任何其他文字、不要用 ```json 包裹：
 {{"pass": true/false, "reason": "总评（不超过30字）",
  "scores": {{"人物一致性": 4, "文风一致性": 3, "剧情连贯性": 4, "时间线一致性": 5,
-             "环境一致性": 4, "伏笔一致性": 5, "比喻密度": 4, "视角越界": 5}},
+             "环境一致性": 4, "伏笔一致性": 5, "比喻密度": 4, "视角越界": 5, "事件锚": 4}},
  "issues": [{{"quote": "原句逐字引用", "problem": "维度名：问题描述", "fix": "具体改法"}}]}}
 不通过时必须把所有问题一次性列全，每个问题引用原句并给出改法。通过时 issues 留空数组。
 """

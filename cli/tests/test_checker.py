@@ -13,6 +13,7 @@ from novel_agent.checker import (
     load_baseline,
     load_quality_rules,
     run_checks,
+    run_structure_checks,
     split_sentences,
 )
 
@@ -344,6 +345,7 @@ def test_load_baseline_human_text_empty_reads_exemplar_only(tmp_settings, tmp_pa
 
 # ---------- 1.7 跨章指纹（style-repeat T1：extract/normalize/load/compile）----------
 from novel_agent.checker import (
+    _state_suspicion,
     compile_syntax_patterns,
     extract_ending,
     load_recent_endings,
@@ -639,3 +641,189 @@ def test_scan_style_report_rules_missing_sections_empty(tmp_path):
     _mk_chapter(root, "第一卷-01.md", "风很轻。")
     r = scan_style_report(root, {})
     assert r["endings"] == [] and r["patterns"] == []
+
+
+# ---------- 结构检查（event-anchor T1，E1-E4 / Z1 / Z2）----------
+def test_structure_fragment_hit():
+    """E1 碎片章：有效字符数低于 min_chars，quote 恒空（全文属性）。"""
+    issues = run_structure_checks("他走了。", {"chapter_structure": {"min_chars": 500}})
+    assert len(issues) == 1
+    assert issues[0]["quote"] == ""
+    assert issues[0]["problem"] == "碎片章：正文4字（下限500字）"
+    assert "重写命令" in issues[0]["fix"]
+
+
+def test_structure_fragment_at_threshold_no_hit():
+    """恰等于阈值不报（E1 边界）。"""
+    assert run_structure_checks("他走了。", {"chapter_structure": {"min_chars": 4}}) == []
+
+
+def test_structure_no_dialogue_hit():
+    """E2 零对话独白章：体量达标但对话行不足，quote=首个有效行（原文子串）。"""
+    text = "\n".join(["他望着窗外。"] * 150)  # 900 字 0 对话
+    rules = {"chapter_structure": {"dialogue_check_min_chars": 800, "min_dialogue_lines": 2}}
+    issues = run_structure_checks(text, rules)
+    assert len(issues) == 1
+    assert issues[0]["problem"] == "零对话独白章：900字仅0行对话"
+    assert issues[0]["quote"] == "他望着窗外。" and issues[0]["quote"] in text
+
+
+def test_structure_no_dialogue_at_threshold_no_hit():
+    """对话行恰达下限不报（E2 边界）；体量不足豁免（正常短章天然不查）。"""
+    text = "\n".join(["他望着窗外。"] * 149 + ['"你来了。"她说。'])
+    rules = {"chapter_structure": {"dialogue_check_min_chars": 800, "min_dialogue_lines": 1}}
+    assert run_structure_checks(text, rules) == []
+    # 体量未达 dialogue_check_min_chars：零对话也不报
+    assert run_structure_checks("他走了。", rules) == []
+
+
+def test_structure_state_density_hit():
+    """E3 状态堆叠：密度超每百行上限，quote=文本序最早含状态词的句子（切分剥句末标点，原文子串）。"""
+    text = "\n".join(["胸口发闷。"] * 10)
+    rules = {"chapter_structure": {"state_words": ["胸口"], "state_density_max_per_100_lines": 40}}
+    issues = run_structure_checks(text, rules)
+    assert len(issues) == 1
+    assert issues[0]["problem"] == "状态堆叠：状态词每百行100次（上限40次）"
+    # split_sentences 剥句末标点：句子=「胸口发闷」（与 blacklist quote 同口径，D12 原文子串）
+    assert issues[0]["quote"] == "胸口发闷" and issues[0]["quote"] in text
+
+
+def test_structure_state_density_counts_occurrences():
+    """命中数按出现次数计（一词多次计多次，非命中行数）。"""
+    text = "\n".join(["胸口闷，胸口紧。"] * 5)  # 10 次 / 5 行 = 每百行 200
+    rules = {"chapter_structure": {"state_words": ["胸口"], "state_density_max_per_100_lines": 40}}
+    issues = run_structure_checks(text, rules)
+    assert "每百行200次" in issues[0]["problem"]
+
+
+def test_structure_state_density_at_threshold_no_hit():
+    """密度恰等于上限不报（E3 边界，严格大于才报）。"""
+    text = "\n".join(["胸口发闷。"] * 4 + ["他走了。"] * 6)  # 4/10 行 = 40/百行
+    rules = {"chapter_structure": {"state_words": ["胸口"], "state_density_max_per_100_lines": 40}}
+    assert run_structure_checks(text, rules) == []
+
+
+def test_structure_valid_lines_skip_title_and_separator():
+    """Z1 有效行口径：标题行与分隔行不计入字数与行数。"""
+    text = "# 第5章 夜行\n\n---\n\n他走了。\n"
+    issues = run_structure_checks(text, {"chapter_structure": {"min_chars": 10}})
+    assert len(issues) == 1
+    assert issues[0]["problem"] == "碎片章：正文4字（下限10字）"  # 标题/分隔未计入
+
+
+def test_structure_keys_missing_skip_independently():
+    """E4 子键独立缺省：只配 min_chars 就只查碎片章，其余不查。"""
+    text = "\n".join(["他望着窗外。"] * 150)  # 900 字 0 对话
+    rules = {"chapter_structure": {"min_chars": 500}}
+    assert run_structure_checks(text, rules) == []  # 无对话但不查（键缺）
+    # chapter_structure 整键缺失 / rules None / text 空 -> []
+    assert run_structure_checks(text, {"blacklist": ["x"]}) == []
+    assert run_structure_checks(text, None) == []
+    assert run_structure_checks("", {"chapter_structure": {"min_chars": 500}}) == []
+    # chapter_structure 非 dict（配错类型）-> 跳过不崩（Z2 fail-open）
+    assert run_structure_checks(text, {"chapter_structure": ["x"]}) == []
+
+
+def test_structure_empty_state_words_skip():
+    """E4 词表空 -> 密度项跳过；词表含非字符串项跳过该项不崩。"""
+    text = "\n".join(["胸口发闷。"] * 10)
+    rules = {"chapter_structure": {"state_words": [], "state_density_max_per_100_lines": 1}}
+    assert run_structure_checks(text, rules) == []
+    rules["chapter_structure"]["state_words"] = ["胸口", 5]
+    issues = run_structure_checks(text, rules)
+    assert len(issues) == 1 and "每百行100次" in issues[0]["problem"]
+
+
+def test_structure_invalid_threshold_types_skip():
+    """Z2 阈值类型守卫：字符串/负数/bool/浮点一律视为未配置，不崩不误判。"""
+    text = "他走了。"
+    for bad in ["500", -1, True, 3.5]:
+        rules = {"chapter_structure": {"min_chars": bad}}
+        assert run_structure_checks(text, rules) == [], f"min_chars={bad!r}"
+
+
+def test_structure_only_title_lines_zero_div_guard():
+    """零除守卫：全文仅标题/分隔行 -> E1 拦截、E3 密度跳过，不崩。"""
+    text = "# 第5章\n\n---\n\n***\n"
+    rules = {"chapter_structure": {
+        "min_chars": 500,
+        "state_words": ["胸口"], "state_density_max_per_100_lines": 40,
+    }}
+    issues = run_structure_checks(text, rules)
+    assert len(issues) == 1
+    assert issues[0]["problem"] == "碎片章：正文0字（下限500字）"
+
+
+# ---------- 状态章嫌疑榜（event-anchor T3，E9-E11 / D7 / D8）----------
+def test_state_suspicion_score_formula():
+    """E9 嫌疑分 = 状态词命中/有效行 − 对话行/有效行×2；标题/分隔行不计入。"""
+    d = _state_suspicion("\n".join(["胸口发闷。"] * 10), ["胸口"])
+    assert d == {"score": 1.0, "lines": 10, "dialogue": 0, "state_hits": 10}
+    # 8 命中 + 2 对话行：(8 - 2×2)/10 = 0.4
+    d = _state_suspicion("\n".join(["胸口发闷。"] * 8 + ['"你来了。"她说。'] * 2), ["胸口"])
+    assert d == {"score": 0.4, "lines": 10, "dialogue": 2, "state_hits": 8}
+    # 标题/分隔行不计入分母（计入则 lines=12、score≈0.83）
+    d = _state_suspicion("# 第5章 夜行\n\n---\n\n" + "\n".join(["胸口发闷。"] * 10), ["胸口"])
+    assert d["lines"] == 10 and d["score"] == 1.0
+
+
+def test_state_suspicion_zero_lines_guard():
+    """零除守卫：空文件/仅标题分隔行 -> score 记 0.0，不崩。"""
+    assert _state_suspicion("", ["胸口"]) == {"score": 0.0, "lines": 0, "dialogue": 0, "state_hits": 0}
+    d = _state_suspicion("# 第5章\n\n---\n", ["胸口"])
+    assert d["score"] == 0.0 and d["lines"] == 0
+
+
+def test_scan_state_chapters_sorted_and_fields(tmp_path):
+    """E9/D7：全量降序入报告、字段完整（file/score/lines/dialogue/state_hits）。"""
+    root = tmp_path / "正文"
+    root.mkdir()
+    (root / "a-01.md").write_text("\n".join(["胸口发闷。"] * 10), encoding="utf-8")  # 1.0
+    (root / "a-02.md").write_text('"你来了。"她说。\n' * 10, encoding="utf-8")       # -2.0
+    (root / "a-03.md").write_text("他走了。\n" * 10, encoding="utf-8")               # 0.0
+    r = scan_style_report(root, {"chapter_structure": {"state_words": ["胸口"]}})
+    rows = r["state_chapters"]
+    assert [x["file"] for x in rows] == ["a-01.md", "a-03.md", "a-02.md"]
+    assert rows[0] == {"file": "a-01.md", "score": 1.0, "lines": 10, "dialogue": 0, "state_hits": 10}
+    assert rows[2]["score"] == -2.0 and rows[2]["dialogue"] == 10
+
+
+def test_scan_state_chapters_none_vs_empty(tmp_path):
+    """D8 分态：未配置/词表空 -> None；配置后无文件 -> []。"""
+    root = tmp_path / "正文"
+    root.mkdir()
+    (root / "a-01.md").write_text("他走了。", encoding="utf-8")
+    assert scan_style_report(root, {})["state_chapters"] is None
+    assert scan_style_report(root, {"chapter_structure": {"state_words": []}})["state_chapters"] is None
+    rules = {"chapter_structure": {"state_words": ["胸口"]}}
+    empty = tmp_path / "空"
+    empty.mkdir()
+    assert scan_style_report(empty, rules)["state_chapters"] == []
+    # 目录不存在（E11 现状：files_scanned=0）分态保持
+    assert scan_style_report(tmp_path / "不存在", {})["state_chapters"] is None
+    assert scan_style_report(tmp_path / "不存在", rules)["state_chapters"] == []
+
+
+def test_scan_state_chapters_empty_file_guard(tmp_path):
+    """空文件/仅标题文件入榜不崩（score 0.0，零除守卫）。"""
+    root = tmp_path / "正文"
+    root.mkdir()
+    (root / "a-01.md").write_text("", encoding="utf-8")
+    (root / "a-02.md").write_text("# 第5章\n\n---\n", encoding="utf-8")
+    r = scan_style_report(root, {"chapter_structure": {"state_words": ["胸口"]}})
+    assert len(r["state_chapters"]) == 2
+    assert all(x["score"] == 0.0 for x in r["state_chapters"])
+
+
+def test_scan_state_chapters_zero_llm(tmp_path, monkeypatch):
+    """E10：新增节全程零 LLM 调用（monkeypatch chat 抛错，触即失败）。"""
+    root = tmp_path / "正文"
+    root.mkdir()
+    (root / "a-01.md").write_text("\n".join(["胸口发闷。"] * 10), encoding="utf-8")
+
+    def _boom(*a, **kw):
+        raise AssertionError("体检不应触 LLM")
+
+    monkeypatch.setattr("novel_agent.llm.LLMClient.chat", _boom)
+    r = scan_style_report(root, {"chapter_structure": {"state_words": ["胸口"]}})
+    assert r["state_chapters"][0]["score"] == 1.0

@@ -259,12 +259,14 @@ def test_build_agent_loads_exemplar_dir(tmp_settings, monkeypatch):
 
 
 # ---------- reviewer schema 演进与 fixer prompt（1.1 T5）----------
-def test_reviewer_system_eight_dimensions_and_schema():
-    """reviewer_system 含八维名、scores/issues/quote 键名；旧三键保留（D4）。"""
+def test_reviewer_system_nine_dimensions_and_schema():
+    """reviewer_system 含九维名（8 既有 + 事件锚）、scores 示例含事件锚键；旧三键保留（D4/E7/E14）。"""
     sys_prompt = reviewer_system("测试小说", "")
     for dim in ["人物一致性", "文风一致性", "剧情连贯性", "时间线一致性",
-                "环境一致性", "伏笔一致性", "比喻密度", "视角越界"]:
+                "环境一致性", "伏笔一致性", "比喻密度", "视角越界", "事件锚"]:
         assert dim in sys_prompt, dim
+    assert '"事件锚": 4' in sys_prompt  # scores 示例 JSON 增键（E7）
+    assert "删掉天气描写、身体感受、心理描写" in sys_prompt  # 第 9 维文案（design §3.3）
     assert '"scores"' in sys_prompt
     assert '"issues"' in sys_prompt
     for key in ("quote", "problem", "fix"):

@@ -1905,6 +1905,39 @@ def test_style_scan_cmd_explicit_dir(tmp_settings, capsys):
     assert "风格体检" in out and "1 个文件" in out
 
 
+# ---------- 状态章嫌疑榜命令输出（event-anchor T3，E9/E12 拍板口径）----------
+def test_style_scan_cmd_state_chapters_unconfigured_hint(tmp_settings, capsys):
+    """E9/E12 拍板：未配置 state_words -> 新节固定打提示行（既有三节照常）。"""
+    d = tmp_settings.human_text_full
+    d.mkdir(parents=True)
+    (d / "a-01.md").write_text("他走了。\n", encoding="utf-8")
+    cli._do_style_scan([], tmp_settings)
+    out = capsys.readouterr().out
+    assert "状态章嫌疑榜" in out
+    assert "未配置 chapter_structure.state_words" in out
+    # 既有三节不受影响（E12：体检前三节输出不变）
+    assert "收束句复读榜" in out and "句式命中榜" in out and "字数分布" in out
+
+
+def test_style_scan_cmd_state_chapters_table(tmp_settings, capsys):
+    """E9：配置词表 -> 嫌疑榜降序输出（文件/嫌疑分/行数/对话行/状态词命中）。"""
+    novel = tmp_settings.novel_path
+    novel.mkdir(parents=True, exist_ok=True)
+    (novel / "质量规则.json").write_text(json.dumps({
+        "chapter_structure": {"state_words": ["胸口"]},
+    }), encoding="utf-8")
+    d = tmp_settings.human_text_full
+    d.mkdir(parents=True)
+    (d / "a-01.md").write_text("\n".join(["胸口发闷。"] * 10), encoding="utf-8")  # 嫌疑分 1.0
+    (d / "a-02.md").write_text('"你来了。"她说。\n' * 10, encoding="utf-8")       # 嫌疑分 -2.0
+    cli._do_style_scan([], tmp_settings)
+    out = capsys.readouterr().out
+    assert "状态章嫌疑榜" in out
+    assert "a-01.md" in out and "a-02.md" in out
+    assert out.index("a-01.md") < out.index("a-02.md")  # 降序：高分在前
+    assert "未配置 chapter_structure.state_words" not in out  # 收窄：句式节本有「未配置」文案
+
+
 def test_status_shows_planner_switch(tmp_settings, capsys):
     """P12：状态命令显示 planner 开关行（两态）。"""
     cli._do_status(tmp_settings)

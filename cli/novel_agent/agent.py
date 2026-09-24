@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Settings, get_settings
-from .checker import run_checks, run_cross_checks
+from .checker import run_checks, run_cross_checks, run_structure_checks
 from .llm import LLMClient, load_profiles
 from .memory import WorkingMemory
 from .partial import Block, apply_replacements, build_context_pair, split_paragraphs
@@ -156,6 +156,16 @@ def parse_review_full(text: str) -> Optional[ReviewResult]:
         scores=scores,
         issues=issues,
     )
+
+
+# event-anchor D10：事件锚 issue 前缀判定（容忍半角冒号）
+_ANCHOR_ISSUE_PREFIXES = ("事件锚：", "事件锚:")
+
+
+def _is_anchor_issue(issue: dict) -> bool:
+    """problem 前缀「事件锚：」的 issue = 结构问题，不可段落修复（D10）。"""
+    p = str(issue.get("problem") or "").strip()
+    return p.startswith(_ANCHOR_ISSUE_PREFIXES)
 
 
 def _strip_polisher_meta(text: str) -> str:
@@ -474,6 +484,7 @@ class NovelAgent:
             user_msg = (
                 f"参考以下已有内容，自由重写一个完整章节：{state.task}。目标约{self.target_words}字。"
                 "\n你可以自行决定参考多少，结构和情节可以调整，但要保留核心意图。"
+                "\n若原文缺少完整事件（碎片章/状态章），按章节规划补事件锚重写，不要只润色状态描写。"
                 f"\n\n【已有内容（参考）】\n{state.source_content}"
                 f"{plan_block}{beats_block}"
                 f"{draft_request}"
@@ -580,6 +591,9 @@ class NovelAgent:
         富解析（1.1 A4/A24）：parse_review_full 的 scores / issues 落 state
         （asdict 自动进 run record）；打回 feedback = reason + 各 issue 的
         problem 摘要（维度名自带指路，A3）。
+        event-anchor D10 分流：事件锚 issue 是结构问题（fixer 铁律禁增删情节，
+        改不动）——仅事件锚不达标 -> 放行留痕定稿；混合不达标 -> 事件锚剔除出
+        fixer 批次仅留痕；复检仅余事件锚同款放行（防循环，零新状态）。
         审稿返回不可解析（parse_review_full 为 None）时不静默过审（0.1）：
         显著警告 + 人工确认存/弃--存则定稿留痕，弃则流程结束不定稿
         （final_chapter 保持空，cli 侧自然不保存章节，fail-closed）。
@@ -630,10 +644,30 @@ class NovelAgent:
             state.next_agent = "done"
             return
 
-        # 打回：feedback = reason + 各 issue 的 problem 摘要（A3：维度名自带指路）
+        # event-anchor D10 分流（不通过时）：事件锚 issue 剔除出修复批次仅留痕；
+        # 复检仅余事件锚时走下方放行（防循环：每章最多一轮可修复项的 fixer 循环）。
+        anchor_issues = [i for i in parsed.issues if _is_anchor_issue(i)]
+        fixable = [i for i in parsed.issues if not _is_anchor_issue(i)]
+        for i in anchor_issues:
+            problem = str(i.get("problem") or "").strip()
+            print(f"  ⚠️ {problem}（不可段落修复，仅留痕）")
+            state.log.append(f"[reviewer] ⚠️ report-only：{problem}（事件锚不达标，建议人工重写）")
+
+        if anchor_issues and not fixable:
+            # 仅事件锚不达标：放行留痕定稿（E8/D10）
+            state.feedback = f"审稿通过（事件锚不达标，建议人工重写）：{parsed.reason}"
+            state.final_chapter = state.polished
+            print(f"  ⚠️ {state.feedback}")
+            state.log.append(f"[reviewer] {state.feedback}")
+            state.next_agent = "done"
+            return
+
+        # 打回：feedback = reason + 各 issue 的 problem 摘要（A3：维度名自带指路；
+        # 事件锚已剔除，不进 fixer 意见）
+        state.issues = fixable
         summary = parsed.reason
         problems = "；".join(
-            str(i.get("problem") or "").strip() for i in parsed.issues
+            str(i.get("problem") or "").strip() for i in fixable
             if str(i.get("problem") or "").strip()
         )
         if problems:
@@ -650,7 +684,10 @@ class NovelAgent:
 
         - 与 reviewer 共享 review_count 预算（A14）；达上限放行 reviewer，
           强制定稿由 reviewer 逃生门统一收口（D7）；
-        - 打回 feedback 附命中摘要（规则名+次数，Z2），明细在 state.issues。
+        - 打回 feedback 附命中摘要（规则名+次数，Z2），明细在 state.issues；
+        - 结构检查（event-anchor D9）走 report-only 通道：显著警告 + state.log
+          留痕，不进 state.issues、不消耗 review_count、不触发 fixer——结构问题
+          闭环内修不好（fixer 铁律禁增删情节），正解是人工「重写」。
         """
         issues = run_checks(state.polished, self.quality_rules)
         # 1.7 跨章检查（C6）：并入同一 issues 流（打回 fixer / review_count 共享 /
@@ -659,6 +696,11 @@ class NovelAgent:
         # ending 项跳过、syntax 项照跑（C5 各键独立降级）。
         if self.quality_rules:
             issues += run_cross_checks(state.polished, self.recent_endings, self.quality_rules)
+        # event-anchor 结构检查（D9 report-only）：每轮复检重复警告/留痕是有意为之
+        # （持续可见、实现零状态，不去重）；quality_rules 为 None 时返回 []，零行为差异（E12）。
+        for issue in run_structure_checks(state.polished, self.quality_rules):
+            print(f"  ⚠️ 结构检查：{issue['problem']}")
+            state.log.append(f"[checker] ⚠️ report-only：{issue['problem']}（建议人工重写）")
         if not issues or state.review_count >= self.max_reviews:
             if issues:
                 print(f"  ⚠️ 规则检查命中 {len(issues)} 项，但打回已达上限 {self.max_reviews} 次，放行审稿")

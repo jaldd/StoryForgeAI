@@ -3,9 +3,9 @@
 > 对应需求：同目录 `requirements.md`（E1-E14）。
 > 前置：`specs/quality-gate/design.md`（D1-D12/Z1-Z10）、`specs/style-repeat/design.md`（D1-D9/Z1-Z8）
 > 均已实现；本文引用其决策编号与模块。
-> 行号引用基于 2026-09-19 代码（style-repeat 完成态；`run_checks` 在 checker.py:98，
-> `_is_dialogue_line` 在 checker.py:69，`scan_style_report` 在 checker.py:477，
-> `reviewer_system` 在 prompts.py:414，`_do_style_scan` 在 cli.py:1355）。
+> 行号引用基于 2026-09-20 复核（超轮中止/整文清洗修复后；`run_checks` 在 checker.py:119，
+> `_is_dialogue_line` 在 checker.py:69，`scan_style_report` 在 checker.py:499，
+> `reviewer_system` 在 prompts.py:414，`_do_style_scan` 在 cli.py:1361）。
 
 ## 0. 需求映射
 
@@ -15,6 +15,8 @@
 | E7-E8 reviewer 第 9 维 | §3.3 reviewer_system 模板 + _reviewer 分流（D10） |
 | E9-E11 状态章嫌疑榜 | §3.4 scan_style_report 第四节 + _do_style_scan 输出 |
 | E12-E14 兼容 | §4 降级哲学 + 既有留痕复用 + schema 不变 |
+| E15 结构病章快通道 | §3.2 D11（结构优先，2026-09-20 修订） |
+| E16 planner 事件锚 | §3.3 D12（T4 提前，2026-09-20 修订） |
 
 ## 1. 总体设计：三层分工，拓扑零改动
 
@@ -99,7 +101,9 @@ def run_structure_checks(text: str, rules: Optional[dict]) -> list[dict]:
     - 有效行 = 非空行中剔除 `#` 标题行与 `---`/`***` 分隔行（与 extract_ending C2 同款跳过集）；
     - 有效字符数 = 有效行拼接后去空白的长度；
     - 对话行数 = 有效行中 _is_dialogue_line 命中的行数；
-    - 非空行数 = 有效行数（密度分母）。
+    - 密度分母 = 有效行数（E3/E9 统一口径，requirements §2「有效行」）；
+    - 状态词总命中数 = 逐词出现次数之和（text.count 口径，一词多次计多次）；
+    - E3 quote = 文本序最早含任一状态词的句子（_first_sentence_with 按文本序取）。
 
     1. 碎片章（E1）：min_chars 配置且有效字符数 < min_chars
        -> issue{quote="", problem=f"碎片章：正文{有效字符数}字（下限{min_chars}字）",
@@ -119,8 +123,13 @@ def run_structure_checks(text: str, rules: Optional[dict]) -> list[dict]:
 ```
 
 - **Z1 口径统一**：三项共用一份有效行序列，一次遍历产出全部计数，与 monologue 检查同量级开销。
-- **Z2 阈值即锚点**：阈值不参与 fail-fast 校验（非负即可），非法值（负数字符串）由加载层类型不符
-  自然跳过对应项——不新增 A23 类硬错误（阈值配错最多漏判，不会误判，fail-open 方向安全）。
+- **Z2 阈值即锚点**：阈值不参与 fail-fast 校验，也不依赖加载层类型检查
+  （load_quality_rules 只校验 JSON 合法性与顶层 dict）——类型守卫落在
+  run_structure_checks 内：各阈值 isinstance(int) 且 >= 0 才参与比较，否则该项跳过
+  （min_chars 配成字符串 "500" 会在比较处 TypeError，必须守卫）。
+  不新增 A23 类硬错误（阈值配错最多漏判，不会误判，fail-open 方向安全）。
+- **零除守卫**：有效行数为 0（全文仅标题/分隔行）时 E3 密度项跳过
+  （该文已被 E1 按碎片章拦截，密度无意义）；_state_suspicion 同款守卫（score 记 0.0）。
 - **D2 碎片章只判不细分**：不尝试区分「刻意短章」与「没写成」——阈值可配就是出口；
   语义判断归 reviewer（非目标 1）。
 
@@ -140,12 +149,19 @@ def run_structure_checks(text: str, rules: Optional[dict]) -> list[dict]:
 因此结构类 issue 的处置为 **report-only**（E5）：
 
 ```python
-# _checker 内，run_checks / run_cross_checks 的 issues 维持原打回闭环（不动）。
+# _checker 内，run_checks / run_cross_checks 的 issues 维持原打回闭环（结构零命中时，不动）。
 # run_structure_checks 的命中走独立通道：
 structure_issues = run_structure_checks(state.polished, self.quality_rules)
 for issue in structure_issues:
     print(f"  ⚠️ 结构检查：{issue['problem']}")
     state.log.append(f"[checker] ⚠️ report-only：{issue['problem']}（建议人工重写）")
+if structure_issues:
+    # D11 结构优先：常规命中一并留痕，不进 fixer（E15）
+    for issue in issues:
+        print(f"  ⚠️ 结构病章跳过修复：{issue['problem']}")
+        state.log.append(f"[checker] ⚠️ report-only（结构病章，跳过修复）：{issue['problem']}")
+    state.next_agent = "reviewer"
+    return
 # 不并入 state.issues、不消耗 review_count、不触发 fixer；next_agent 照常到 reviewer
 ```
 
@@ -155,8 +171,12 @@ for issue in structure_issues:
   不去重**：口径确定（每轮必打，与 review_count 无关），实现零状态，
   避免实现时各自发明去重逻辑。
 - `quality_rules` 为 None 时函数内直返 []，调用点无需新增条件分支（E12 双降级）。
-- 结构命中与既有检查命中并存时两路独立：既有 issue 照走 fixer 闭环，
-  结构警告照打，互不干扰。
+- **D11 结构优先（E15，2026-09-20 真车修订，取代原「两路独立」口径）**：结构命中 =
+  本章注定人工重写 ⇒ 常规 issue 的 fixer 修复产出必被重写覆盖 ⇒ 一并降级 report-only
+  （警告 + state.log 留痕，前缀「结构病章，跳过修复」），直通 reviewer；reviewer 及其后
+  路径不动（D10 分流照旧，review_count 兜底）。真车证据：重写三卷-31，句式模板 9 命中
+  fixer 啃 4 轮（9→8→8）后撞 10 轮上限中止，约 7 次 LLM 调用全废。误伤代价：刻意短章的
+  表面问题（黑名单词等）仅留痕不修，人工可用 精修/改 补——误伤罕见且代价小，期望值占优。
 
 ### 3.3 reviewer 第 9 维（prompts.py reviewer_system 模板）
 
@@ -176,8 +196,8 @@ scores 示例 JSON 增 `"事件锚": <1-5>` 键（E7）；issue problem 前缀�
 - **D4 维度无条件存在**：事件锚是跨小说通用维度（每本小说都需要「章里有事发生」），
   不做配置开关——与既有八维同地位。这与 style-repeat 非目标 10（planner 不注入禁则）不冲突：
   那是散文层禁则，这是结构层验收维度。
-- **D5 planner 不动（本阶段）**：节拍层注入事件锚声明归 P1（非目标 3）；
-  本阶段 reviewer 拦截 + 体检诊断已构成闭环。
+- **D5 planner 事件锚（2026-09-20 修订：T4 提前）**：原「本阶段不动、归 P1」口径解除，
+  见 D12——真车证据（重写模式节拍照抄独白结构、writer 按节拍复刻独白）替代了原观察条件。
 - **D10 reviewer 分流（report-only 同哲学，E8）**：解析后将 issues 按 problem 前缀
   「事件锚：」分为两路——
   **仅事件锚不达标**：放行留痕（feedback 标注「事件锚不达标，建议人工重写」，
@@ -190,6 +210,14 @@ scores 示例 JSON 增 `"事件锚": <1-5>` 键（E7）；issue problem 前缀�
   无配置出口。既有逃生通道：reviewer system 已注入 NOVEL_DIR 的写作铁律
   （instruction/rules 参数），在铁律中声明「本书允许纯过渡章」即可让 reviewer 豁免；
   P1 T4（planner 声明事件锚）落地后从源头消解。
+- **D12 planner 事件锚声明（E16，T4 提前，2026-09-20）**：`planner_user` 要素清单
+  四要素 -> 五要素，「事件锚」列为第一要素（一句话：本章发生的核心事件；纯氛围/纯状态
+  不算）；`planner_system` 节拍表要求同步追加；rewrite mode_block 追加「原文只有状态与
+  氛围、没有完整事件时，基于设定与前文补一个合理的事件锚，不得照抄原文的状态结构」
+  （真车根因：节拍从独白原文提取，writer 按节拍复刻独白；T5 提示句「按规划补锚」在
+  规划无锚时循环依赖，由此解除）。消费面零改动：事件锚随节拍（state.outline）流转，
+  writer 节拍块 / polisher 意图保持 / reviewer 验收基准（第 9 维拿到具体锚点）天然消费；
+  planner 关闭（NOVEL_PLANNER=0）不受影响（P15 降级现状，writer 自行构思）。
 
 ### 3.4 状态章嫌疑榜（checker.py scan_style_report 追加 + cli 输出）
 
@@ -220,10 +248,12 @@ def _state_suspicion(text: str, state_words: list[str]) -> dict:
 
 | 场景 | 行为 |
 |---|---|
-| `chapter_structure` 键全缺 | E12：结构检查与体检新节全跳过、逐字节一致（reviewer 第 9 维按 D4 无条件生效，不属本行范围） |
+| `chapter_structure` 键全缺 | E12：结构检查零输出（逐字节一致）、体检既有三节不变；新节固定打未配置提示行（2026-09-20 拍板，与句式命中榜节同作风） |
 | 子键部分缺失 | E4：逐项独立跳过（如只配 min_chars = 只查碎片章） |
 | state_words 空表 | 密度项与嫌疑榜跳过（D8 未配置提示） |
 | 结构检查命中 | report-only：警告 + state.log 留痕，直通 reviewer，不消耗 review_count（D9） |
+| 结构命中 + 常规命中 | E15/D11：常规 issue 一并 report-only 留痕，直通 reviewer（跳过 fixer 循环） |
+| planner 关闭 | E16 不生效：writer 自行构思现状（T5 提示句仍覆盖 rewrite 路径） |
 | reviewer 仅事件锚不达标 | 放行留痕，feedback 标注建议人工重写（D10） |
 | reviewer 混合不达标 | 事件锚 issue 仅留痕；其余 issue 走正常 fixer 闭环（D10） |
 | 碎片章/零对话章修复 | 人工 `重写` 命令（E6）；闭环内修复不做（非目标 9） |
@@ -233,13 +263,17 @@ def _state_suspicion(text: str, state_words: list[str]) -> dict:
 ## 5. 测试设计（全部离线：tmp 目录 + FakeLLM）
 
 - **checker**：三项命中/边界（恰等于阈值不报）/键缺省跳过/词表空跳过/quote 为原文子串断言
-  （碎片章除外，其 quote 恒空）；有效行口径（标题行、分隔行不计入）。
+  （碎片章除外，其 quote 恒空）；有效行口径（标题行、分隔行不计入）；
+  阈值类型非法（字符串/负数）跳过不崩（Z2）；仅标题/分隔行文件的零除守卫（E3 跳过、嫌疑分 0.0）。
 - **agent 接线**：structure issue 命中 -> 不进 fixer、review_count 不变、
-  next_agent=reviewer、state.log 含警告留痕；与既有检查命中混合时两路互不干扰；
-  规则为 None 时 steps 与现状一致（E12 回归护栏）。
+  next_agent=reviewer、state.log 含警告留痕；结构+常规命中 -> 全部 report-only
+  直通 reviewer（E15/D11，T1 混合测试按新口径改写）；结构零命中+常规命中 ->
+  fixer 闭环现状不变；规则为 None 时 steps 与现状一致（E12 回归护栏）。
 - **reviewer 分流**：仅事件锚不达标 -> 放行留痕定稿；混合不达标 -> fixer 批次不含
   事件锚 issue、复检仅余事件锚时放行（防循环）；全为非事件锚问题 -> 行为与现状一致。
-- **prompts**：reviewer_system 含第 9 维文本与 scores 键；JSON 模板四键同构（E14）。
+- **prompts**：reviewer_system 含第 9 维文本与 scores 键；JSON 模板四键同构（E14）；
+  planner 五要素含事件锚、rewrite 补锚句（E16/D12，T4；既有 planner_user 无原文分支
+  的逐字节断言同步更新）。
 - **scan 报告**：嫌疑分计算（构造已知状态词/对话比的假章）；降序与字段完整；
   state_words 缺省 -> None；空目录 -> files_scanned=0（E11 现状）。
 - **harness 兼容**：旧 run 记录 replay 正常（E13）。
